@@ -20,6 +20,7 @@ T2 verifiers receive upstream stdout files through
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -261,11 +262,20 @@ class QECalcTool:
         result = self.executor.run_pw(input_file, workdir)
         if not result.success or "JOB DONE" not in (result.stdout or ""):
             raise ToolError(
-                f"pw.x failed: {result.error_message or result.stderr or 'no JOB DONE in stdout'}",
+                f"pw.x failed: {self._qe_error_snippet(result) or result.error_message or result.stderr or 'no JOB DONE in stdout'}",
                 category="execution",
                 repairable=True,
             )
         return result
+
+    @staticmethod
+    def _qe_error_snippet(result) -> Optional[str]:
+        """Extract the 'Error in routine (...)' block from pw.x stdout."""
+        stdout = result.stdout or ""
+        m = re.search(r"Error in routine\s+(\S+)\s*\(\d+\):\s*\n(.+?)\n\s*\n", stdout)
+        if m:
+            return f"{m.group(1)}: {m.group(2).strip()}"
+        return None
 
     def _run_tool(self, tool: str, input_file: Path, workdir: Path):
         runner = {"bands.x": self.executor.run_bands_x, "dos.x": self.executor.run_dos_x}
@@ -282,7 +292,9 @@ class QECalcTool:
     def _link_upstream_save(ctx: ExecutionContext, workdir: Path, prefix: str) -> None:
         """Symlink the upstream {prefix}.save into this node's workdir."""
         for dep_id in sorted(ctx.upstream):
-            dep_save = ctx.base_dir / dep_id / f"{prefix}.save"
+            # resolve() makes the link absolute — a relative base_dir would
+            # otherwise produce a symlink broken from the node workdir
+            dep_save = (ctx.base_dir / dep_id / f"{prefix}.save").resolve()
             if dep_save.exists():
                 target = workdir / f"{prefix}.save"
                 if target.exists() or target.is_symlink():
@@ -313,6 +325,13 @@ class QEParamRepairer:
         if error.category not in self.REPAIRABLE_CATEGORIES:
             return False
         params = node.params
+        # nbnd failures must not be repaired with cutoff bumps
+        if "too few bands" in str(error):
+            current = int(params.get("nbnd") or 0)
+            bumped = max(current * 2, 24)
+            params["nbnd"] = bumped
+            node.error = (node.error or "") + f" | repair: nbnd -> {bumped}"
+            return True
         current = float(params.get("ecutwfc") or 45.0)
         if current >= self.MAX_ECUT:
             return False

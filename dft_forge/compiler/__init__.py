@@ -7,6 +7,7 @@ The LLM never writes shell commands or full QE input.
 from __future__ import annotations
 
 import hashlib
+import math
 import textwrap
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -271,6 +272,7 @@ class QECompiler:
     def __init__(self, pseudo_dir: Path):
         self.pseudo_dir = Path(pseudo_dir)
         self._validate_pseudo_dir()
+        self._z_valence_cache: Dict[str, float] = {}
 
     def _validate_pseudo_dir(self) -> None:
         if not self.pseudo_dir.exists():
@@ -283,6 +285,26 @@ class QECompiler:
             if not (self.pseudo_dir / filename).exists():
                 missing.append(f"{element}: {filename}")
         return missing
+
+    def _pseudo_z_valence(self, pseudo_file: str) -> float:
+        """Valence electron count from a UPF header (cached)."""
+        cached = self._z_valence_cache.get(pseudo_file)
+        if cached is not None:
+            return cached
+        text = (self.pseudo_dir / pseudo_file).read_text(errors="ignore")
+        # UPF PP_HEADER line: e.g. "     19.00000000000      Z valence"
+        val = 0.0
+        for line in text.splitlines():
+            if "Z valence" in line:
+                for tok in line.split():
+                    try:
+                        val = float(tok)
+                        break
+                    except ValueError:
+                        continue
+                break
+        self._z_valence_cache[pseudo_file] = val
+        return val
 
     def compile_t1(
         self,
@@ -447,15 +469,18 @@ class QECompiler:
         if missing:
             raise FileNotFoundError(f"Missing pseudopotentials: {missing}")
         
-        # Determine nbnd for metals
+        # Determine nbnd from the pseudopotentials' real valence electron
+        # counts — GBRV semicore pseudos (e.g. Ga_sv with 19 valence e-)
+        # make atom-count heuristics fatally wrong ("too few bands")
         if nbnd is None:
+            nelec = sum(
+                self._pseudo_z_valence(db["pseudos"][s]) for s in atoms.symbols
+            )
+            n_occ = int(math.ceil(nelec / 2.0))
             if db["is_metal"]:
-                # For metals, use more bands than valence electrons
-                # Simple heuristic: 1.5x the number of occupied bands at Γ
-                # For now, use a generous default
-                nbnd = len(atoms) * 8
+                nbnd = max(len(atoms) * 4, n_occ + 12)
             else:
-                nbnd = len(atoms) * 4
+                nbnd = max(len(atoms) * 4, n_occ + 8)
         
         alat_bohr = get_lattice_constant_angstrom(material) * 1.8897261246
         
