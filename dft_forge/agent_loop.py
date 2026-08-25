@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -13,6 +14,120 @@ from dft_forge.tools.registry import registry
 register_default_tools()
 
 _CHAT_SKIP_TOOLS = {"help"}
+
+_ELEMENTS = {
+    "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne", "Na", "Mg", "Al", "Si", "P", "S",
+    "Cl", "Ar", "K", "Ca", "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn", "Ga",
+    "Ge", "As", "Se", "Br", "Kr", "Rb", "Sr", "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd",
+    "Ag", "Cd", "In", "Sn", "Sb", "Te", "I", "Xe", "Cs", "Ba", "La", "Ce", "Pr", "Nd", "Pm",
+    "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu", "Hf", "Ta", "W", "Re", "Os",
+    "Ir", "Pt", "Au", "Hg", "Tl", "Pb", "Bi", "Po", "At", "Rn", "Fr", "Ra", "Ac", "Th", "Pa",
+    "U", "Np", "Pu",
+}
+
+# Chinese aliases for quick material lookup in chat text
+_ZH_MATERIAL = {"硅": "Si", "铝": "Al", "氯化钠": "NaCl", "食盐": "NaCl", "氧化镁": "MgO"}
+
+
+def extract_formula(message: str) -> Optional[str]:
+    """Pull a chemical formula (e.g. CaTiO3, GaAs, NaCl) out of chat text.
+
+    Accepts any casing (catio3 → CaTiO3) as long as tokens map to real
+    element symbols. Longest match wins so GaAs is preferred over Ga/As.
+    """
+    text = message
+    for zh, en in _ZH_MATERIAL.items():
+        if zh in text:
+            return en
+    tokens = re.findall(r"[A-Za-z]{1,2}\d{0,3}(?:\s?[A-Za-z]{1,2}\d{0,3})*", text)
+    best = None
+    for tok in tokens:
+        parts = re.findall(r"[A-Za-z]{1,2}\d{0,3}", tok)
+        syms = []
+        ok = True
+        for p in parts:
+            m = re.match(r"([A-Za-z]{1,2})(\d*)", p)
+            sym, num = m.group(1), m.group(2)
+            cand = None
+            for probe in (sym.capitalize(), sym.upper()):
+                if probe in _ELEMENTS:
+                    cand = probe
+                    break
+            if cand is None:
+                ok = False
+                break
+            syms.append(cand + num)
+        if not ok or not syms or len(syms) > 4:
+            continue
+        formula = "".join(syms)
+        if best is None or len(formula) > len(best):
+            best = formula
+    return best
+
+
+def _read_text(path: Any) -> Optional[str]:
+    try:
+        return Path(str(path)).read_text()
+    except OSError:
+        return None
+
+
+def _viewer_payload_for_material(material: Any) -> Optional[Dict[str, Any]]:
+    """CIF viewer payload for a material key or raw formula (e.g. CaTiO3)."""
+    if not material or not str(material).strip():
+        return None
+    try:
+        import tempfile
+
+        from ase.io import write as ase_write
+
+        from dft_forge.compiler import MATERIAL_DB, build_atoms, formula_atoms
+
+        name = str(material).strip()
+        atoms = build_atoms(name) if name in MATERIAL_DB else formula_atoms(name)[0]
+        with tempfile.NamedTemporaryFile(suffix=".cif", mode="w+", delete=False) as tf:
+            ase_write(tf.name, atoms, format="cif")
+            cif = Path(tf.name).read_text()
+        Path(tf.name).unlink(missing_ok=True)
+        return {
+            "formula": atoms.get_chemical_formula(),
+            "cif": cif,
+            "natoms": len(atoms),
+            "source": name,
+        }
+    except Exception:
+        return None
+
+
+def _extract_charts(nodes: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Pull plottable curves + headline numbers from graph node outputs."""
+    chart: Dict[str, Any] = {}
+    for info in nodes.values():
+        outs = info.get("outputs") or {}
+        if outs.get("eigenvalues_ev"):
+            bands = {
+                "kind": "bands",
+                "eigenvalues_ev": outs["eigenvalues_ev"],
+                "fermi_ev": outs.get("fermi_ev"),
+                "band_gap_ev": outs.get("band_gap_ev"),
+                "is_metal": outs.get("is_metal"),
+                "n_bands": outs.get("n_bands"),
+                "n_kpoints": outs.get("n_kpoints"),
+            }
+            for key in ("k_axis", "k_ticks", "k_labels"):
+                if outs.get(key):
+                    bands[key] = outs[key]
+            chart["bands"] = bands
+        if outs.get("dos_curve"):
+            chart["dos"] = {"kind": "dos", **outs["dos_curve"], "fermi_ev": outs.get("fermi_ev")}
+        for k in ("energy_ry", "a_angstrom", "pressure_kbar", "max_force_ev_ang"):
+            v = outs.get(k)
+            if v is None:
+                continue
+            metrics = chart.setdefault("metrics", {})
+            if k not in metrics or (not metrics[k] and v):  # nonzero wins over nscf placeholder zeros
+                metrics[k] = v
+    return chart or None
 
 
 def _load_env_file(path: Path) -> None:
@@ -89,8 +204,12 @@ Rules:
 - Reply with ONLY one JSON object, no markdown fences:
   {{"reply": string, "steps": [{{"tool": string, "args": {{}}, "description": string}}]}}
 - Use ONLY the tool ids listed below; args keys must match exactly.
-- For a full verified calculation of a bulk material prefer graph.run with a template_id
+- ANY chemical formula works directly: pass it as inputs.material of graph.run
+  (e.g. CaTiO3, SrTiO3, GaAs). Unknown formulas are auto-built into prototype
+  structures — NEVER ask the user to import a file for a plain bulk crystal.
+- For a full verified calculation prefer graph.run with a template_id
   (t1_vc_relax = structure optimization, t2_bands = band structure, t2_dos = density of states).
+  "算 X 的能带" → one graph.run t2_bands step; combining several targets emits one step each.
 - For 2D materials (graphene/h-BN, doping, adsorption sites) use structure.build2d,
   then optionally input.build with the produced CIF path and type.
 - Site scan ("different sites/positions"): emit one structure.build2d step per site
@@ -163,12 +282,13 @@ class AgentLoop:
         elif any(k in lower for k in ["al", "铝"]):
             material_hint = "Al"
             pair_types = "Al-Al"
+        formula_hint = material_hint or extract_formula(message)
 
         # Detect compound intents
         wants_analyze = any(
             k in lower
             for k in [
-                "键长", "bond", "distance", "距离", "分析", "analyze", "info",
+                "键长", "键能", "bond", "distance", "距离", "分析", "analyze", "info",
                 "看看", "查看结构", "结构信息", "原子", "atoms", "体积", "volume",
                 "晶胞", "cell", "neighbors", "邻居", "结构", "structure",
             ]
@@ -197,15 +317,46 @@ class AgentLoop:
             wants_parse = False
             wants_verify = False
 
+        # Strong analysis words beat calculation; bare "结构" does not (能带结构 etc.)
+        strong_analyze = any(k in lower for k in ("键长", "键能", "bond", "distance", "距离", "分析", "analyze"))
+
+        # Full-calculation intent: one-shot graph.run for ANY formula — the
+        # engine auto-builds a prototype structure when the material is unknown.
+        graph_targets: List[str] = []
+        if any(k in lower for k in ("能带", "带结构", "带隙", "bands", "band")):
+            graph_targets.append("t2_bands")
+        if any(k in lower for k in ("态密度", "dos")):
+            graph_targets.append("t2_dos")
+        if any(k in lower for k in ("结构优化", "晶格常数", "弛豫", "松弛", "优化", "vc-relax", "vcrelax", "vc_relax")):
+            graph_targets.append("t1_vc_relax")
+        wants_generic_calc = any(k in lower for k in ("算", "计算", "跑", "仿真", "simulation"))
+        if (
+            not graph_targets
+            and wants_generic_calc
+            and not strong_analyze
+            and not (wants_import or wants_generate or wants_build or wants_status or wants_ledger or wants_doctor)
+        ):
+            graph_targets.append("t1_vc_relax")
+
+        if graph_targets and formula_hint and not strong_analyze and not (wants_import or wants_generate):
+            label = {"t2_bands": "能带结构", "t2_dos": "态密度", "t1_vc_relax": "结构优化"}
+            for tid in graph_targets:
+                steps.append({
+                    "tool": "graph.run",
+                    "args": {"template_id": tid, "inputs": {"material": formula_hint}},
+                    "description": f"{formula_hint} {label[tid]}",
+                })
+            return steps
+
         # Intent: analyze / bond length / structure info
         if wants_analyze:
             source = ctx.get("last_structure_file") or ctx.get("last_structure_source")
             if not source:
-                if wants_generate or material_hint:
+                if wants_generate or material_hint or formula_hint:
                     steps.append({
                         "tool": "structure.generate",
-                        "args": {"source": material_hint or "Si"},
-                        "description": f"Generate {material_hint or 'Si'} structure",
+                        "args": {"source": material_hint or formula_hint or "Si"},
+                        "description": f"Generate {material_hint or formula_hint or 'Si'} structure",
                     })
                     source = "__generated__"
                 else:
@@ -433,6 +584,9 @@ class AgentLoop:
                 data = inner or {}
                 if result.error:
                     reply_parts.append(f"{description}: 失败 - {result.error}")
+                elif isinstance(data, dict) and data.get("error") and tool_id not in ("structure.analyze",):
+                    # tool-level failure returned as payload (e.g. graph.run)
+                    reply_parts.append(f"{description}: 失败 - {data['error']}")
                 elif tool_id == "structure.import" and data.get("ok") and data.get("success"):
                     ctx["last_structure_file"] = str(session_dir / "structure.json")
                     ctx["last_structure_source"] = data.get("source") or args.get("source")
@@ -451,6 +605,12 @@ class AgentLoop:
                     ctx["last_formula"] = data.get("formula")
                     ctx["last_structure_file"] = data.get("output")
                     reply_parts.append(f"已生成结构: {data.get('formula')}（{len(data.get('species', []))} 种元素，{data.get('natoms')} 原子）\n文件: {data.get('output')}")
+                    result_dict["viewer"] = {
+                        "formula": data.get("formula"),
+                        "cif_path": data.get("output"),
+                        "cif": _read_text(data.get("output")),
+                        "natoms": data.get("natoms"),
+                    }
                 elif tool_id == "structure.build2d" and data.get("output"):
                     ctx["last_structure_source"] = data.get("output")
                     ctx["last_structure_file"] = data.get("output")
@@ -465,6 +625,10 @@ class AgentLoop:
                     result_dict["viewer"] = {
                         "formula": data.get("formula"),
                         "cif_path": data.get("output"),
+                        "cif": _read_text(data.get("output")),
+                        "cell": data.get("cell"),
+                        "sites": data.get("sites"),
+                        "natoms": data.get("natoms"),
                     }
                 elif tool_id == "graph.run" and data.get("run_id"):
                     ctx["last_run_id"] = data.get("run_id")
@@ -474,11 +638,22 @@ class AgentLoop:
                         if info.get("error"):
                             line += f" | {str(info['error'])[:100]}"
                         outs = info.get("outputs") or {}
-                        shown = {k: (round(v, 4) if isinstance(v, float) else v) for k, v in outs.items() if not str(k).endswith("stdout")}
+                        bulky = ("eigenvalues_ev", "k_axis", "k_ticks", "dos_curve")
+                        shown = {
+                            k: (round(v, 4) if isinstance(v, float) else v)
+                            for k, v in outs.items()
+                            if not str(k).endswith("stdout") and k not in bulky and not isinstance(v, list)
+                        }
                         if shown:
                             line += f" | {shown}"
                         lines.append(line)
                     reply_parts.append("\n".join(lines))
+                    chart = _extract_charts(data.get("nodes") or {})
+                    if chart:
+                        result_dict["chart"] = chart
+                    viewer = _viewer_payload_for_material((args.get("inputs") or {}).get("material"))
+                    if viewer:
+                        result_dict["viewer"] = viewer
                 elif tool_id == "input.build" and data.get("input_file"):
                     ctx["last_input_file"] = data.get("input_file")
                     ctx["last_calc_type"] = data.get("calc_type")
@@ -535,6 +710,16 @@ class AgentLoop:
             results.append(result_dict)
 
         reply = "\n".join(reply_parts) if reply_parts else "我已收到你的消息。"
+        # LLM narration: replace template-concatenated reply with natural language
+        # when a provider is configured; deterministic fallback keeps templates.
+        provider = self.llm_planner._get_provider()
+        if provider is not None and commands:
+            try:
+                narrated = self._narrate(provider, message, commands, results, ctx)
+            except Exception:
+                narrated = ""
+            if narrated:
+                reply = narrated
         return {
             "reply": reply,
             "commands": commands,
@@ -542,3 +727,40 @@ class AgentLoop:
             "ctx": ctx,
             "planner": "llm" if llm_steps is not None else "rules",
         }
+
+    def _narrate(self, provider, message, commands, results, ctx) -> str:
+        """Ask the LLM to summarize executed steps in natural Chinese."""
+        steps = []
+        for c, r in zip(commands, results):
+            data = r.get("json") if isinstance(r.get("json"), dict) else {}
+            brief = {"tool": c.get("command"), "desc": c.get("description")}
+            if r.get("error"):
+                brief["error"] = str(r["error"])[:200]
+            elif isinstance(data, dict) and data.get("error"):
+                brief["error"] = str(data["error"])[:200]
+            else:
+                flat = {}
+                for k, v in (data or {}).items():
+                    if isinstance(v, (int, float, str, bool)) and k not in ("cif", "stdout"):
+                        flat[k] = v if not isinstance(v, str) or len(v) < 80 else v[:80] + "…"
+                    elif isinstance(v, list) and k in ("species", "output_files"):
+                        flat[k] = v[:6]
+                brief["out"] = flat
+            steps.append(brief)
+        system = (
+            "你是 DFT-Forge 计算代理的播报员。根据用户请求和已执行的工具步骤，"
+            "用自然的中文回复：说明做了什么、关键数值结果（能量/带隙/原子数等）、"
+            "或失败原因与建议。铁律：所有数值必须逐字来自执行步骤数据，"
+            "禁止用教科书/记忆中的理论值替换计算值（如计算带隙 0.57 eV 就说 0.57，"
+            "绝不说成实验值或理论值）；数据里没有的数值一个都不许出现。"
+            "不要罗列工具名，结构/图表已自动展示在界面右侧无需赘述。"
+            "2-5 句话，直接输出文本。"
+        )
+        user = f"用户请求: {message}\n执行步骤: {json.dumps(steps, ensure_ascii=False, default=str)[:4000]}"
+        out = str(provider.chat(system, user)).strip()
+        return out
+
+    def reset_llm(self) -> None:
+        """Forget cached LLM provider so new env/config takes effect immediately."""
+        self.llm_planner._provider = None
+        self.llm_planner._checked = False

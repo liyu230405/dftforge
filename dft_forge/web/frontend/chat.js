@@ -1,98 +1,243 @@
-import { initViewer, renderCif, clear as clearViewer } from "./viewer.js";
+import { renderCif, clear as clearViewer, toggleReplica, toggleCellFrame } from "./viewer.js";
+import { renderCharts } from "./charts.js";
 
-const API = "/chat";
 const chat = document.getElementById("chat");
 const form = document.getElementById("form");
 const input = document.getElementById("msg");
 const sendBtn = document.getElementById("send");
 const statusEl = document.getElementById("status");
+const sessionList = document.getElementById("sessionList");
+const sessionCount = document.getElementById("sessionCount");
+const engineStatus = document.getElementById("engineStatus");
+const chartsEl = document.getElementById("charts");
+
+let sessionId = localStorage.getItem("dftforge_session") || null;
 
 function esc(s) {
   return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function setStatus(text, type = "") {
-  if (!statusEl) return;
+function setStatus(text, cls = "") {
   statusEl.textContent = text;
-  statusEl.className = `status ${type}`.trim();
+  statusEl.className = `statusline mono ${cls}`.trim();
 }
 
-function append(role, text, extra = "") {
-  const row = document.createElement("div");
-  row.className = `row ${role}`;
+/* ── message rendering ─────────────────────────────────────────────── */
+
+function appendUser(text, ts) {
+  const div = document.createElement("div");
+  div.className = "msg msg-user";
+  div.innerHTML = `<div class="bubble">${esc(text)}</div>${ts ? `<div class="msg-time">${fmtTime(ts)}</div>` : ""}`;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function appendAgent(text, commands, results, ts) {
+  const div = document.createElement("div");
+  div.className = "msg msg-agent";
   const bubble = document.createElement("div");
   bubble.className = "bubble";
-  bubble.innerHTML = esc(text) + (extra ? `<div class="meta">${esc(extra)}</div>` : "");
-  row.appendChild(bubble);
-  chat.appendChild(row);
+  bubble.textContent = text;
+  div.appendChild(bubble);
+  if (commands?.length) div.appendChild(toolTable(commands, results));
+  if (ts) {
+    const t = document.createElement("div");
+    t.className = "msg-time";
+    t.textContent = fmtTime(ts);
+    div.appendChild(t);
+  }
+  chat.appendChild(div);
   chat.scrollTop = chat.scrollHeight;
-  return row;
+  return div;
 }
 
-function renderToolCalls(row, commands, results) {
-  if (!commands || !commands.length) return;
-  const tool = document.createElement("div");
-  tool.className = "tool";
-  const lines = commands.map((c, i) => {
-    const r = results && results[i] ? results[i] : {};
-    const rc = r.returncode ?? "?";
-    const err = r.error ? ` | error=${esc(r.error)}` : "";
-    return `#${i + 1} ${c.command} (rc=${rc}${err})`;
-  }).join("\n");
-  tool.innerHTML = `<details><summary>tool calls: ${commands.length}</summary><pre>${esc(lines)}</pre></details>`;
-  row.querySelector(".bubble").appendChild(tool);
+function toolTable(commands, results) {
+  const wrap = document.createElement("div");
+  wrap.className = "msg-tools";
+  const rows = commands.map((c, i) => {
+    const r = results?.[i] || {};
+    const ok = r.error ? false : (r.returncode ?? 0) === 0 || r.json?.ok !== false;
+    const args = Object.entries(c.args || {})
+      .filter(([k, v]) => v !== null && v !== undefined && v !== "")
+      .map(([k, v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`)
+      .join("  ")
+      .slice(0, 140);
+    return `<tr>
+      <td class="t-name">${esc(c.command)}</td>
+      <td class="t-args">${esc(args)}</td>
+      <td class="${ok ? "rc-ok" : "rc-err"}">${ok ? "✓" : "✗ " + esc(r.error || "失败").slice(0, 60)}</td>
+    </tr>`;
+  }).join("");
+  wrap.innerHTML = `
+    <button class="tools-toggle" type="button">工具调用 · ${commands.length} 步</button>
+    <table class="tools-table"><thead><tr><th>工具</th><th>参数</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table>`;
+  wrap.querySelector(".tools-toggle").addEventListener("click", (e) => e.currentTarget.classList.toggle("open"));
+  return wrap;
 }
 
-function tryRenderStructure(data) {
-  const payload = data && typeof data === "object" ? data : {};
-  const candidates = [payload, payload.json, payload.data, payload.result, payload.output].filter(Boolean);
-  for (const obj of candidates) {
-    const cif = obj.cif || obj.cif_content || obj.structure || obj.atoms || obj.content;
-    if (cif && typeof cif === "string") {
-      renderCif(cif);
-      return;
+function fmtTime(ts) {
+  const d = new Date(ts * 1000);
+  return `${d.getMonth() + 1}月${d.getDate()}日 ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/* ── figures: structure + charts from tool results ─────────────────── */
+
+function applyFigures(results) {
+  for (const r of results || []) {
+    if (r.viewer?.cif) {
+      renderCif(r.viewer.cif, r.viewer);
+      const cap = document.getElementById("viewerCaption");
+      cap.textContent = `${r.viewer.formula || ""} · ${r.viewer.natoms ?? "?"} 原子 · 拖拽旋转 / 滚轮缩放`;
     }
-    if (obj && typeof obj.to_dict === "function") {
-      renderCif(JSON.stringify(obj.to_dict()));
-      return;
-    }
-  }
-  if (payload.command === "structure.import" && payload.ok) {
-    clearViewer();
+    if (r.chart) renderCharts(chartsEl, r.chart);
   }
 }
+
+/* Session restore: the structure may come from an early message while the
+   latest chart replaces the panel — walk every message, keep the newest of each. */
+function restoreFigures(messages) {
+  let viewerPayload = null, chartPayload = null;
+  for (const m of messages) {
+    for (const r of m.results || []) {
+      if (r.viewer?.cif) viewerPayload = r.viewer;
+      if (r.chart) chartPayload = r.chart;
+    }
+  }
+  if (viewerPayload) {
+    renderCif(viewerPayload.cif, viewerPayload);
+    const cap = document.getElementById("viewerCaption");
+    cap.textContent = `${viewerPayload.formula || ""} · ${viewerPayload.natoms ?? "?"} 原子 · 拖拽旋转 / 滚轮缩放`;
+  }
+  renderCharts(chartsEl, chartPayload);
+}
+
+/* ── sessions ──────────────────────────────────────────────────────── */
+
+async function refreshSessions() {
+  const res = await fetch("/api/sessions");
+  const { sessions } = await res.json();
+  sessionCount.textContent = `${sessions.length} 个会话`;
+  sessionList.innerHTML = "";
+  for (const s of sessions) {
+    const item = document.createElement("div");
+    item.className = `session-item${s.session_id === sessionId ? " active" : ""}`;
+    const d = new Date(s.updated_at * 1000);
+    const today = new Date();
+    const isToday = d.toDateString() === today.toDateString();
+    const hhmm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+    const when = isToday ? hhmm : `${d.getMonth() + 1}月${d.getDate()}日 ${hhmm}`;
+    item.innerHTML = `
+      <button class="s-del" title="删除会话">✕</button>
+      <div class="s-title" title="${esc(s.title)}">${esc(s.title)}</div>
+      <div class="s-meta">${when} · ${s.n_messages} 条</div>`;
+    item.addEventListener("click", () => loadSession(s.session_id));
+    item.querySelector(".s-del").addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (!confirm("删除该会话及其计算记录？")) return;
+      await fetch(`/api/sessions/${s.session_id}`, { method: "DELETE" });
+      if (s.session_id === sessionId) newSession();
+      refreshSessions();
+    });
+    sessionList.appendChild(item);
+  }
+}
+
+async function loadSession(id) {
+  sessionId = id;
+  localStorage.setItem("dftforge_session", id);
+  const res = await fetch(`/api/sessions/${id}`);
+  const data = await res.json();
+  chat.innerHTML = "";
+  for (const m of data.messages || []) {
+    if (m.role === "user") appendUser(m.text, m.ts);
+    else appendAgent(m.text, m.commands, m.results, m.ts);
+  }
+  if (!data.messages?.length) showWelcome();
+  restoreFigures(data.messages || []);
+  refreshSessions();
+}
+
+function newSession() {
+  sessionId = null;
+  localStorage.removeItem("dftforge_session");
+  chat.innerHTML = "";
+  showWelcome();
+  renderCharts(chartsEl, null);
+  clearViewer();
+  refreshSessions();
+}
+
+function showWelcome() {
+  const w = document.createElement("div");
+  w.className = "welcome";
+  w.innerHTML = `
+    <h2>开始一次计算</h2>
+    <p>用一句话描述需求，代理会规划工具、生成输入、驱动 pw.x 计算并验证结果。结构与图表自动出现在右侧。</p>
+    <div class="suggestions">
+      <button class="suggestion">帮我算 GaAs 的结构优化</button>
+      <button class="suggestion">算 Si 的能带结构</button>
+      <button class="suggestion">构建 4×4 石墨烯并掺一个氮原子</button>
+      <button class="suggestion">看看 NaCl 的结构</button>
+    </div>`;
+  for (const b of w.querySelectorAll(".suggestion")) {
+    b.addEventListener("click", () => { input.value = b.textContent; send(); });
+  }
+  chat.appendChild(w);
+}
+
+/* ── send loop ─────────────────────────────────────────────────────── */
 
 async function send() {
   const text = input.value.trim();
   if (!text) return;
   input.value = "";
   sendBtn.disabled = true;
-  setStatus("thinking...");
-  append("user", text);
+  setStatus("思考与规划中…", "busy");
+  const welcome = chat.querySelector(".welcome");
+  if (welcome) welcome.remove();
+  appendUser(text);
+
   try {
-    const res = await fetch(API, {
+    const res = await fetch("/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text }),
+      body: JSON.stringify({ message: text, session_id: sessionId }),
     });
     const data = await res.json();
-    const row = append("agent", data.reply || "(empty reply)");
-    renderToolCalls(row, data.commands, data.results);
-    tryRenderStructure(data);
-    setStatus("ready", "success");
+    sessionId = data.session_id;
+    localStorage.setItem("dftforge_session", sessionId);
+    appendAgent(data.reply, data.commands, data.results);
+    applyFigures(data.results);
+    setStatus("就绪");
+    refreshSessions();
   } catch (e) {
-    append("agent", "请求失败：" + e.message);
-    setStatus("error", "error");
+    appendAgent("请求失败：" + e.message);
+    setStatus("错误", "error");
   } finally {
     sendBtn.disabled = false;
     input.focus();
   }
 }
 
+/* ── init ──────────────────────────────────────────────────────────── */
+
 export function initChat() {
-  form.addEventListener("submit", (e) => {
-    e.preventDefault();
-    send();
+  form.addEventListener("submit", (e) => { e.preventDefault(); send(); });
+  document.getElementById("newSession").addEventListener("click", newSession);
+  document.getElementById("toggleReplica").addEventListener("change", (e) => toggleReplica(e.target.checked));
+  document.getElementById("toggleCell").addEventListener("change", (e) => toggleCellFrame(e.target.checked));
+
+  fetch("/doctor").then((r) => r.json()).then((d) => {
+    const hasQe = Boolean(d.qe_binary);
+    engineStatus.className = `masthead-status ${hasQe ? "ok" : "warn"}`;
+    engineStatus.innerHTML = `<span class="dot"></span>${hasQe ? "pw.x 已就绪" : "QE 未检出 · 离线模式"}`;
+  }).catch(() => {
+    engineStatus.className = "masthead-status warn";
+    engineStatus.innerHTML = '<span class="dot"></span>后端未知状态';
   });
-  setTimeout(() => initViewer(), 0);
+
+  const urlSession = new URLSearchParams(location.search).get("session");
+  if (urlSession) sessionId = urlSession;
+  if (sessionId) loadSession(sessionId).catch(() => newSession());
+  else newSession();
 }

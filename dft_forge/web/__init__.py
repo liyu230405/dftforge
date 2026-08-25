@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -36,8 +38,112 @@ agent_loop = AgentLoop()
 WEB_SESSION_CTX: Dict[str, Dict[str, Any]] = {}
 
 CLI = [sys.executable, "-m", "dft_forge.cli"]
-WEB_WORKDIR = Path("/tmp/dft-forge-web")
+WEB_WORKDIR = Path(os.environ.get("DFT_FORGE_WEB_WORKDIR", "/tmp/dft-forge-web"))
 WEB_WORKDIR.mkdir(parents=True, exist_ok=True)
+
+ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+_LLM_ENV_KEYS = ("DFT_FORGE_LLM_PROVIDER", "DFT_FORGE_LLM_BASE_URL", "DFT_FORGE_LLM_MODEL", "DFT_FORGE_LLM_API_KEY")
+
+
+def _mask(secret: str) -> str:
+    if len(secret) <= 8:
+        return "*" * len(secret)
+    return f"{secret[:4]}…{secret[-4:]}"
+
+
+def _update_env_file(values: Dict[str, str]) -> None:
+    """Persist DFT_FORGE_LLM_* settings into .env, preserving unrelated lines."""
+    lines: List[str] = []
+    if ENV_FILE.exists():
+        lines = ENV_FILE.read_text().splitlines()
+    seen = set()
+    out: List[str] = []
+    for line in lines:
+        m = re.match(r"(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
+        key = m.group(1) if m else None
+        if key in values:
+            seen.add(key)
+            out.append(f"{key}={values[key]}")
+        else:
+            out.append(line)
+    for key, val in values.items():
+        if key not in seen:
+            out.append(f"{key}={val}")
+    ENV_FILE.write_text("\n".join(out) + "\n")
+
+
+class ConfigRequest(BaseModel):
+    provider: Optional[str] = None
+    base_url: Optional[str] = None
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+
+
+def _config_state() -> Dict[str, Any]:
+    provider = os.environ.get("DFT_FORGE_LLM_PROVIDER", "dummy").lower()
+    key = os.environ.get("DFT_FORGE_LLM_API_KEY", "")
+    ready = provider in ("openai", "openai_compatible", "openai-compatible") and bool(key)
+    return {
+        "provider": provider,
+        "base_url": os.environ.get("DFT_FORGE_LLM_BASE_URL", ""),
+        "model": os.environ.get("DFT_FORGE_LLM_MODEL", ""),
+        "has_api_key": bool(key),
+        "api_key_hint": _mask(key) if key else "",
+        "llm_ready": ready,
+    }
+
+
+@app.get("/api/config")
+def get_config() -> Dict[str, Any]:
+    return _config_state()
+
+
+@app.post("/api/config")
+def save_config(req: ConfigRequest) -> Dict[str, Any]:
+    updates: Dict[str, str] = {}
+    if req.provider is not None:
+        updates["DFT_FORGE_LLM_PROVIDER"] = req.provider
+    if req.base_url is not None:
+        updates["DFT_FORGE_LLM_BASE_URL"] = req.base_url.strip()
+    if req.model is not None:
+        updates["DFT_FORGE_LLM_MODEL"] = req.model.strip()
+    if req.api_key is not None:
+        updates["DFT_FORGE_LLM_API_KEY"] = req.api_key.strip()
+    if updates:
+        _update_env_file(updates)
+        os.environ.update(updates)
+        agent_loop.reset_llm()
+    return _config_state()
+
+
+def _session_file(session_id: str) -> Path:
+    return WEB_WORKDIR / session_id / "session.json"
+
+
+def _load_session(session_id: str) -> Dict[str, Any]:
+    """Session memory: {ctx, messages}. Reloaded from disk so restarts survive."""
+    if session_id in WEB_SESSION_CTX:
+        return WEB_SESSION_CTX[session_id]
+    sf = _session_file(session_id)
+    if sf.exists():
+        try:
+            data = json.loads(sf.read_text())
+            WEB_SESSION_CTX[session_id] = data
+            return data
+        except (OSError, ValueError):
+            pass
+    fresh = {"ctx": {}, "messages": [], "created_at": time.time(), "title": ""}
+    WEB_SESSION_CTX[session_id] = fresh
+    return fresh
+
+
+def _save_session(session_id: str) -> None:
+    session = WEB_SESSION_CTX.get(session_id)
+    if session is None:
+        return
+    sf = _session_file(session_id)
+    sf.parent.mkdir(parents=True, exist_ok=True)
+    sf.write_text(json.dumps(session, ensure_ascii=False, default=str))
 
 FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
 app.mount("/frontend", StaticFiles(directory=FRONTEND_DIR), name="frontend")
@@ -103,15 +209,71 @@ def index() -> FileResponse:
     return FileResponse(FRONTEND_DIR / "app.html")
 
 
+@app.get("/api/sessions")
+def list_sessions() -> Dict[str, Any]:
+    sessions = []
+    for sf in sorted(WEB_WORKDIR.glob("*/session.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            data = json.loads(sf.read_text())
+        except (OSError, ValueError):
+            continue
+        if not data.get("messages"):
+            continue  # never show empty/aborted sessions
+        sessions.append({
+            "session_id": sf.parent.name,
+            "title": data.get("title") or "未命名会话",
+            "n_messages": len(data["messages"]),
+            "updated_at": sf.stat().st_mtime,
+        })
+    return {"sessions": sessions}
+
+
+@app.get("/api/sessions/{session_id}")
+def get_session(session_id: str) -> Dict[str, Any]:
+    session = _load_session(session_id)
+    return {
+        "session_id": session_id,
+        "title": session.get("title") or "",
+        "messages": session.get("messages", []),
+        "ctx": session.get("ctx", {}),
+    }
+
+
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: str) -> Dict[str, Any]:
+    WEB_SESSION_CTX.pop(session_id, None)
+    d = WEB_WORKDIR / session_id
+    if d.exists():
+        shutil.rmtree(d, ignore_errors=True)
+    return {"deleted": session_id}
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
     session_id = req.session_id or str(uuid.uuid4())
     session_dir = WEB_WORKDIR / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
 
-    ctx = WEB_SESSION_CTX.setdefault(session_id, {})
+    session = _load_session(session_id)
+    ctx = session.setdefault("ctx", {})
+    messages = session.setdefault("messages", [])
+    if not session.get("title"):
+        session["title"] = req.message.strip()[:40]
+
     result = await agent_loop.run(req.message.strip(), session_dir, ctx=ctx)
     ctx.update(result.get("ctx") or {})
+
+    messages.append({"role": "user", "text": req.message.strip(), "ts": time.time()})
+    messages.append({
+        "role": "agent",
+        "text": result["reply"],
+        "commands": result["commands"],
+        "results": result["results"],
+        "ts": time.time(),
+    })
+    session["updated_at"] = time.time()
+    _save_session(session_id)
+
     return ChatResponse(
         session_id=session_id,
         reply=result["reply"],

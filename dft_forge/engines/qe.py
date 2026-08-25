@@ -24,7 +24,9 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from dft_forge.compiler import QECompiler
+import numpy as np
+
+from dft_forge.compiler import MATERIAL_DB, QECompiler
 from dft_forge.executor import Executor, FakeExecutor
 from dft_forge.parser import QEParser
 from dft_forge.runtime.run import ExecutionContext, NodeRun, ToolError
@@ -50,9 +52,29 @@ class QECalcTool:
         params = node.params
         calc = str(params.get("calc", "scf"))
         material = str(params.get("material", ""))
-        if not material:
+        structure = params.get("structure")
+        atoms = None
+        if structure:
+            from dft_forge.compiler import read_structure
+
+            atoms = read_structure(structure)
+            if not material or material.lower() in ("", "si"):
+                # Si is the template default; a real structure overrides it
+                material = Path(str(structure)).stem.replace(" ", "_")
+        elif material and material not in MATERIAL_DB and Path(material).suffix.lower() in (".cif", ".poscar", ".xyz"):
+            # material param itself pointing at a structure file
+            from dft_forge.compiler import read_structure
+
+            atoms = read_structure(material)
+            material = Path(material).stem.replace(" ", "_")
+        elif material and material not in MATERIAL_DB:
+            # unknown material key: try formula → prototype (e.g. CaTiO3)
+            from dft_forge.compiler import formula_atoms
+
+            atoms, _proto = formula_atoms(material)
+        if not material and atoms is None:
             raise ToolError("qe node missing 'material' param", category="config")
-        prefix = str(params.get("prefix", material.lower()))
+        prefix = str(params.get("prefix", re.sub(r"[^A-Za-z0-9]", "_", material.lower())[:24] or "calc"))
         workdir = ctx.node_workdir(node.node_id)
         workdir.mkdir(parents=True, exist_ok=True)
 
@@ -60,20 +82,20 @@ class QECalcTool:
             self._link_upstream_save(ctx, workdir, prefix)
 
         if calc == "vc-relax":
-            return self._run_vc_relax(material, prefix, params, workdir)
+            return self._run_vc_relax(material, prefix, params, workdir, atoms)
         if calc == "scf":
-            return self._run_scf(material, prefix, params, workdir)
+            return self._run_scf(material, prefix, params, workdir, atoms)
         if calc == "nscf":
-            return self._run_nscf(material, prefix, params, workdir)
+            return self._run_nscf(material, prefix, params, workdir, atoms)
         if calc == "bands":
-            return self._run_bands(material, prefix, params, workdir)
+            return self._run_bands(material, prefix, params, workdir, atoms)
         if calc == "dos":
-            return self._run_dos(material, prefix, params, workdir)
+            return self._run_dos(material, prefix, params, workdir, atoms)
         raise ToolError(f"unknown qe calc type '{calc}'", category="config")
 
     # ── Calc implementations ─────────────────────────────────────────────────
 
-    def _run_vc_relax(self, material, prefix, params, workdir) -> Dict[str, Any]:
+    def _run_vc_relax(self, material, prefix, params, workdir, atoms=None) -> Dict[str, Any]:
         input_file = workdir / f"{prefix}_vcrelax.in"
         self.compiler.compile_t1(
             material,
@@ -82,6 +104,7 @@ class QECalcTool:
             ecutwfc=params.get("ecutwfc"),
             ecutrho=params.get("ecutrho"),
             kpoints=tuple(params["kpoints"]) if params.get("kpoints") else None,
+            atoms=atoms,
         )
         result = self._run_pw(input_file, workdir)
         xml = workdir / f"{prefix}.xml"
@@ -104,7 +127,7 @@ class QECalcTool:
             "stdout_file": str(input_file.with_suffix(".out")),
         }
 
-    def _run_scf(self, material, prefix, params, workdir) -> Dict[str, Any]:
+    def _run_scf(self, material, prefix, params, workdir, atoms=None) -> Dict[str, Any]:
         input_file = workdir / f"{prefix}_scf.in"
         self.compiler.compile_scf(
             material,
@@ -115,6 +138,7 @@ class QECalcTool:
             kpoints=tuple(params["kpoints"]) if params.get("kpoints") else None,
             conv_thr=float(params.get("conv_thr", 1.0e-8)),
             nbnd=params.get("nbnd"),
+            atoms=atoms,
         )
         result = self._run_pw(input_file, workdir)
         parsed = QEParser.parse_scf(result.stdout)
@@ -132,7 +156,7 @@ class QECalcTool:
             "stdout_file": str(input_file.with_suffix(".out")),
         }
 
-    def _run_nscf(self, material, prefix, params, workdir) -> Dict[str, Any]:
+    def _run_nscf(self, material, prefix, params, workdir, atoms=None) -> Dict[str, Any]:
         input_file = workdir / f"{prefix}_nscf.in"
         self.compiler.compile_scf(
             material,
@@ -145,6 +169,7 @@ class QECalcTool:
             conv_thr=float(params.get("conv_thr", 1.0e-8)),
             nbnd=params.get("nbnd"),
             nkpoints_bands=int(params.get("nkpoints_bands", 60)),
+            atoms=atoms,
         )
         result = self._run_pw(input_file, workdir)
         parsed = QEParser.parse_scf(result.stdout)
@@ -161,13 +186,14 @@ class QECalcTool:
             "stdout_file": str(input_file.with_suffix(".out")),
         }
 
-    def _run_bands(self, material, prefix, params, workdir) -> Dict[str, Any]:
+    def _run_bands(self, material, prefix, params, workdir, atoms=None) -> Dict[str, Any]:
         input_file = workdir / f"{prefix}_bands.in"
         self.compiler.compile_bands_input(
             material,
             input_file,
             prefix=prefix,
             nkpoints=int(params.get("nkpoints_bands", 100)),
+            atoms=atoms,
         )
         result = self._run_tool("bands.x", input_file, workdir)
         bands_xml = self._locate_bands_xml(workdir, prefix)
@@ -191,14 +217,30 @@ class QECalcTool:
                 category="verification",
                 repairable=True,
             )
-        return {
+        outputs = {
             "n_bands": parsed.n_bands,
             "n_kpoints": parsed.n_kpoints,
             "band_gap_ev": parsed.band_gap_ev,
             "is_metal": parsed.is_metal,
+            "fermi_ev": parsed.fermi_energy_ev,
         }
+        # plotting axis from the same bandpath the nscf sampling used
+        try:
+            from dft_forge.compiler import build_atoms
 
-    def _run_dos(self, material, prefix, params, workdir) -> Dict[str, Any]:
+            src = atoms if atoms is not None else build_atoms(material)
+            bp = src.cell.bandpath(npoints=max(10, int(params.get("nkpoints_bands", 100))))
+            x, X, labels = bp.get_linear_kpoint_axis()
+            outputs["k_axis"] = [round(float(v), 4) for v in x]
+            outputs["k_ticks"] = [round(float(v), 4) for v in X]
+            outputs["k_labels"] = [("Γ" if str(l).upper() in ("G", "GAMMA") else str(l)) for l in labels]
+        except Exception:
+            pass
+        if parsed.eigenvalues is not None:
+            outputs["eigenvalues_ev"] = np.round(parsed.eigenvalues, 4).tolist()
+        return outputs
+
+    def _run_dos(self, material, prefix, params, workdir, atoms=None) -> Dict[str, Any]:
         input_file = workdir / f"{prefix}_dos.in"
         self.compiler.compile_dos_input(
             material,
@@ -206,6 +248,7 @@ class QECalcTool:
             prefix=prefix,
             deltae=float(params.get("dos_deltae", 0.01)),
             fwhm=float(params.get("dos_fwhm", 0.05)),
+            atoms=atoms,
         )
         result = self._run_tool("dos.x", input_file, workdir)
         dos_file = workdir / f"{prefix}.dos"
@@ -230,11 +273,17 @@ class QECalcTool:
                 category="verification",
                 repairable=True,
             )
-        return {
+        outputs = {
             "n_energy_points": parsed.n_energy_points,
             "dos_at_fermi": parsed.dos_at_fermi,
             "fermi_ev": parsed.fermi_energy_ev,
         }
+        if parsed.energies is not None and parsed.dos is not None:
+            outputs["dos_curve"] = {
+                "energies_ev": np.round(parsed.energies, 4).tolist(),
+                "dos": np.round(parsed.dos, 3).tolist(),
+            }
+        return outputs
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 

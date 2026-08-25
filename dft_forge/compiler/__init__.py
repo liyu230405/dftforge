@@ -171,6 +171,184 @@ def build_atoms(material: str) -> Atoms:
         raise ValueError(f"Material '{material}' structure not implemented")
 
 
+# ── Generic structures (any CIF/POSCAR via ASE) ───────────────────────────────
+
+BOHR_PER_ANG = 1.8897261246
+DEFAULT_PSEUDO_DIR = Path(__file__).resolve().parents[2] / "assets" / "pseudos"
+
+
+def read_structure(path) -> Atoms:
+    """Read a structure file (CIF/POSCAR/...) into ASE Atoms.
+
+    A cell with one axis much longer than the other two is treated as a
+    2D slab: periodicity along the vacuum axis is turned off so band
+    paths stay in-plane.
+    """
+    from ase.io import read as ase_read
+
+    p = Path(str(path))
+    if not p.exists():
+        raise FileNotFoundError(f"structure file not found: {path}")
+    atoms = ase_read(str(p))
+    lengths = sorted(atoms.cell.cellpar()[:3])
+    if lengths[-1] > 2.0 * lengths[-2] and lengths[-1] > 12.0:
+        longest = int(np.argmax(atoms.cell.cellpar()[:3]))
+        pbc = [True, True, True]
+        pbc[longest] = False
+        atoms.pbc = pbc
+    return atoms
+
+
+def profile_from_atoms(atoms: Atoms, pseudo_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """MATERIAL_DB-shaped profile for an arbitrary Atoms object.
+
+    Species map onto the GBRV ``{Element}.upf`` library; ibrav=0 with the
+    cell emitted explicitly. The k-mesh adapts to cell size and collapses
+    to 1 along vacuum axes.
+    """
+    from ase.data import atomic_masses, chemical_symbols
+
+    pseudo_dir = Path(pseudo_dir) if pseudo_dir else DEFAULT_PSEUDO_DIR
+    species = sorted(set(atoms.get_chemical_symbols()))
+    pseudos: Dict[str, str] = {}
+    for el in species:
+        found = next((c for c in (f"{el}.upf", f"{el}.UPF") if (pseudo_dir / c).exists()), None)
+        if found is None:
+            raise FileNotFoundError(f"no GBRV pseudopotential for element '{el}' in {pseudo_dir}")
+        pseudos[el] = found
+    masses = [float(atomic_masses[chemical_symbols.index(el)]) for el in species]
+    lengths = atoms.cell.cellpar()[:3]
+    k = [1 if L > 12.0 else max(1, min(8, round(24.0 / L))) for L in lengths]
+    return {
+        "ibrav": 0,
+        "nspecies": len(species),
+        "species": species,
+        "masses": masses,
+        "pseudos": pseudos,
+        "occupations": "smearing",
+        "smearing": "mv",
+        "degauss": 0.01,
+        "ecutwfc_default": 40.0,
+        "ecutrho_default": 320.0,
+        "kpoints_default": (k[0], k[1], k[2], 1, 1, 1),
+        "is_metal": True,
+        "_alat_bohr": float(max(lengths)) * BOHR_PER_ANG,
+    }
+
+
+# ── Formula → prototype structure ─────────────────────────────────────────────
+
+# experimental cubic lattice constants (Å) for common ABO3 perovskites
+PEROVSKITE_A: Dict[str, float] = {
+    "CaTiO3": 3.827, "SrTiO3": 3.905, "BaTiO3": 4.006, "KTaO3": 3.983,
+    "KNbO3": 4.021, "PbTiO3": 3.969, "SrZrO3": 4.101, "BaZrO3": 4.193,
+    "LaAlO3": 3.791, "LaFeO3": 3.930, "SrCoO3": 3.829, "BaSnO3": 4.116,
+    "SrSnO3": 4.034, "CaZrO3": 4.020, "PbZrO3": 4.155, "LaCrO3": 3.887,
+    "YAlO3": 3.792, "NaTaO3": 3.929, "AgNbO3": 3.953, "BiFeO3": 3.965,
+}
+_III_V = {"B", "Al", "Ga", "In", "Tl"}
+_V_VI = {"N", "P", "As", "Sb", "Bi"}
+_DIAMOND_ELS = {"C", "Si", "Ge", "Sn"}
+_BCC_ELS = {"Fe", "Cr", "W", "Mo", "V", "Nb", "Ta", "K", "Na", "Li"}
+_HCP_ELS = {"Mg", "Zn", "Ti", "Zr", "Co", "Be", "Ru", "Os", "Sc", "Y", "Hf", "Re"}
+
+
+def _cov_radius(el: str) -> float:
+    from ase.data import chemical_symbols, covalent_radii
+
+    return float(covalent_radii[chemical_symbols.index(el)])
+
+
+def formula_atoms(formula: str) -> Tuple[Atoms, str]:
+    """Build a starting structure for any chemical formula via prototype matching.
+
+    Prototypes: ABO3 perovskite, AB zincblende/rocksalt, AB2/A2B fluorite,
+    elemental diamond/fcc/bcc/hcp. Lattice constants come from experiment
+    where tabulated, else from covalent-radius estimates — vc-relax then
+    refines the cell, so these only need to be physically sensible.
+
+    Returns (Atoms, prototype_name).
+    """
+    from pymatgen.core import Composition
+
+    comp = Composition(str(formula)).as_dict()
+    els = sorted(comp, key=lambda e: -comp[e])
+    nums = [int(round(comp[e])) for e in els]
+    if any(n <= 0 for n in nums):
+        raise ValueError(f"cannot parse formula: {formula}")
+
+    # elemental
+    if len(els) == 1:
+        el = els[0]
+        if el in _DIAMOND_ELS:
+            a = 8.0 / math.sqrt(3.0) * _cov_radius(el)
+            cell = np.eye(3) * a
+            pos = [[0, 0, 0], [0.25, 0.25, 0.25], [0.5, 0.5, 0], [0.75, 0.75, 0],
+                   [0.5, 0, 0.5], [0.75, 0.25, 0.75], [0, 0.5, 0.5], [0.25, 0.75, 0.75]]
+            return Atoms(el * 8, scaled_positions=pos, cell=cell, pbc=True), "diamond"
+        if el in _BCC_ELS:
+            a = 4.0 / math.sqrt(3.0) * _cov_radius(el)
+            cell = np.eye(3) * a
+            return Atoms(el * 2, scaled_positions=[[0, 0, 0], [0.5, 0.5, 0.5]], cell=cell, pbc=True), "bcc"
+        if el in _HCP_ELS:
+            r = _cov_radius(el)
+            a = 2.0 * r
+            c = 1.633 * a
+            cell = [[a, 0, 0], [-a / 2, a * math.sqrt(3) / 2, 0], [0, 0, c]]
+            pos = [[1/3, 2/3, 0.25], [2/3, 1/3, 0.75]]
+            return Atoms(el * 2, scaled_positions=pos, cell=cell, pbc=True), "hcp"
+        a = 2.0 * math.sqrt(2.0) * _cov_radius(el)  # fcc default for metals
+        cell = np.eye(3) * a
+        pos = [[0, 0, 0], [0.5, 0.5, 0], [0.5, 0, 0.5], [0, 0.5, 0.5]]
+        return Atoms(el * 4, scaled_positions=pos, cell=cell, pbc=True), "fcc"
+
+    # ABO3 perovskite: one A-site cation, one B-site, three O
+    if len(els) == 3 and "O" in els and sorted(nums) == [1, 1, 3] and comp.get("O") == 3:
+        a_site = _perovskite_a_site(els, comp)
+        b_site = next(e for e in els if e != "O" and e != a_site)
+        a = PEROVSKITE_A.get(str(formula).replace(" ", ""), 1.414 * (_cov_radius(a_site) + _cov_radius("O")) * 1.02)
+        cell = np.eye(3) * a
+        pos = [[0.5, 0.5, 0.5], [0, 0, 0], [0.5, 0, 0], [0, 0.5, 0], [0, 0, 0.5]]
+        syms = [a_site, b_site, "O", "O", "O"]
+        return Atoms(syms, scaled_positions=pos, cell=cell, pbc=True), "perovskite"
+
+    # AB binary
+    if len(els) == 2 and nums[0] == 1 and nums[1] == 1:
+        e1, e2 = els
+        if (e1 in _III_V and e2 in _V_VI) or (e2 in _III_V and e1 in _V_VI):
+            a = 4.0 / math.sqrt(3.0) * (_cov_radius(e1) + _cov_radius(e2))
+            cell = np.eye(3) * a
+            pos = [[0, 0, 0], [0.25, 0.25, 0.25]]
+            return Atoms(e1 + e2, scaled_positions=pos, cell=cell, pbc=True), "zincblende"
+        a = 2.0 * (_cov_radius(e1) + _cov_radius(e2)) * 1.15  # rocksalt
+        cell = np.eye(3) * a
+        pos = [[0, 0, 0], [0.5, 0.5, 0.5]]
+        return Atoms(e1 + e2, scaled_positions=pos, cell=cell, pbc=True), "rocksalt"
+
+    # AB2 / A2B fluorite-type
+    if len(els) == 2 and sorted(nums) == [1, 2]:
+        a_el = els[nums.index(1)]
+        b_el = els[nums.index(2)]
+        a = 4.0 / math.sqrt(3.0) * (_cov_radius(a_el) + _cov_radius(b_el)) * 1.02
+        cell = np.eye(3) * a
+        pos = [[0, 0, 0], [0.75, 0.75, 0.75], [0.25, 0.25, 0.25],
+               [0.75, 0.25, 0.25], [0.25, 0.75, 0.25], [0.25, 0.25, 0.75],
+               [0.25, 0.75, 0.75], [0.75, 0.25, 0.75], [0.75, 0.75, 0.25]]
+        syms = [a_el] + [b_el] * 8
+        return Atoms(syms, scaled_positions=pos, cell=cell, pbc=True), "fluorite"
+
+    raise ValueError(
+        f"no structure prototype for '{formula}' (supports: elemental, AB, ABO3, AB2). "
+        "Provide a CIF file or use structure.build2d for 2D systems."
+    )
+
+
+def _perovskite_a_site(els, comp) -> str:
+    """A-site = the larger-cation (non-O) element of an ABO3 formula."""
+    cations = [e for e in els if e != "O"]
+    return max(cations, key=_cov_radius)
+
+
 # ── K-point generation ────────────────────────────────────────────────────────
 
 def get_kpoints(material: str, kpoints_override: Optional[Tuple] = None) -> Tuple:
@@ -211,17 +389,17 @@ def get_high_symmetry_path(material: str) -> Tuple[np.ndarray, List[str]]:
 
 
 def get_bandpath_segments(material: str) -> List[List[Tuple[str, tuple]]]:
-    """High-symmetry k-path as a list of continuous segments.
+    """High-symmetry k-path segments for a MATERIAL_DB material."""
+    return bandpath_segments_from_atoms(build_atoms(material))
+
+
+def bandpath_segments_from_atoms(atoms: Atoms) -> List[List[Tuple[str, tuple]]]:
+    """High-symmetry k-path as a list of continuous segments for any Atoms.
 
     Each segment is a list of (label, (kx, ky, kz)) pairs in fractional
-    coordinates of the material's input cell. Uses ASE's Bravais-lattice
-    aware bandpath (version-robust, no seekpath dependency).
+    coordinates of the cell. Uses ASE's Bravais-lattice aware bandpath
+    (version-robust, no seekpath dependency).
     """
-    db = MATERIAL_DB.get(material)
-    if not db:
-        raise ValueError(f"Unknown material: {material}")
-
-    atoms = build_atoms(material)
     bp = atoms.cell.bandpath()
     special = bp.special_points
     segments: List[List[Tuple[str, tuple]]] = []
@@ -233,31 +411,27 @@ def get_bandpath_segments(material: str) -> List[List[Tuple[str, tuple]]]:
             if label in ("|", "$"):
                 continue
             if label not in special:
-                raise ValueError(f"unknown special point '{label}' for {material}")
+                raise ValueError(f"unknown special point '{label}' for cell")
             k = special[label]
             chain.append((label, (float(k[0]), float(k[1]), float(k[2]))))
         if len(chain) >= 2:
             segments.append(chain)
     if not segments:
-        raise ValueError(f"could not build k-path for {material}")
+        raise ValueError("could not build k-path for cell")
     return segments
 
 
 _LABEL_MAP = {"G": "GAMMA"}
 
 
-def get_bandpath_kpoints(material: str, npoints: int = 100) -> np.ndarray:
+def get_bandpath_kpoints(material: str, npoints: int = 100, atoms: Optional[Atoms] = None) -> np.ndarray:
     """Explicit k-point list along the high-symmetry path, (N, 3) fractional.
 
     Handles path discontinuities correctly (jumps are preserved, not
     interpolated across), unlike a naive crystal_b segment rendering.
     """
-    db = MATERIAL_DB.get(material)
-    if not db:
-        raise ValueError(f"Unknown material: {material}")
-
-    atoms = build_atoms(material)
-    return np.asarray(atoms.cell.bandpath(npoints=max(10, npoints)).kpts)
+    a = atoms if atoms is not None else build_atoms(material)
+    return np.asarray(a.cell.bandpath(npoints=max(10, npoints)).kpts)
 
 
 # ── QE input generator ────────────────────────────────────────────────────────
@@ -306,6 +480,16 @@ class QECompiler:
         self._z_valence_cache[pseudo_file] = val
         return val
 
+    def _resolve(self, material: str, atoms: Optional[Atoms]) -> Tuple[Dict[str, Any], Atoms, float]:
+        """Material profile + atoms + alat(bohr), from MATERIAL_DB or a raw structure."""
+        if atoms is not None:
+            db = profile_from_atoms(atoms, self.pseudo_dir)
+            return db, atoms, db["_alat_bohr"]
+        if material not in MATERIAL_DB:
+            raise ValueError(f"Unknown material: {material}. Known: {list(MATERIAL_DB.keys())}")
+        db = MATERIAL_DB[material]
+        return db, build_atoms(material), get_lattice_constant_angstrom(material) * BOHR_PER_ANG
+
     def compile_t1(
         self,
         material: str,
@@ -321,11 +505,12 @@ class QECompiler:
         cell_dynamics: str = "bfgs",
         nstep: int = 200,
         cell_optimization: bool = True,
+        atoms: Optional[Atoms] = None,
     ) -> str:
         """Compile a T1 vc-relax input file.
         
         Args:
-            material: Material key in MATERIAL_DB
+            material: Material key in MATERIAL_DB (label only when atoms is given)
             output_path: Where to write the .in file
             prefix: QE prefix (defaults to material lowercased)
             ecutwfc: Wavefunction cutoff in Ry
@@ -335,20 +520,17 @@ class QECompiler:
             pressure_threshold: Pressure threshold kbar
             conv_thr: SCF convergence threshold
             cell_dynamics: Cell dynamics algorithm
+            atoms: Optional ASE Atoms from a structure file (overrides material)
         
         Returns:
             The generated input file content as string
         """
-        if material not in MATERIAL_DB:
-            raise ValueError(f"Unknown material: {material}")
-        
-        db = MATERIAL_DB[material]
-        atoms = build_atoms(material)
+        db, atoms, alat_bohr = self._resolve(material, atoms)
         
         prefix = prefix or material.lower()
         ecutwfc = ecutwfc if ecutwfc is not None else db["ecutwfc_default"]
         ecutrho = ecutrho if ecutrho is not None else db["ecutrho_default"]
-        kpoints = get_kpoints(material, kpoints)
+        kpoints = tuple(kpoints) if kpoints else tuple(db.get("kpoints_default", (4, 4, 4, 1, 1, 1)))
         
         # Check pseudos
         missing = self._check_pseudos(db["pseudos"])
@@ -368,7 +550,6 @@ class QECompiler:
         lines.append("")
         lines.append("&SYSTEM")
         lines.append(f"  ibrav = {db['ibrav']}")
-        alat_bohr = get_lattice_constant_angstrom(material) * 1.8897261246
         lines.append(f"  celldm(1) = {alat_bohr:.6f}")
         lines.append(f"  nat = {len(atoms)}")
         lines.append(f"  ntyp = {db['nspecies']}")
@@ -448,21 +629,19 @@ class QECompiler:
         conv_thr: float = 1.0e-8,
         nbnd: Optional[int] = None,
         nkpoints_bands: int = 60,
+        atoms: Optional[Atoms] = None,
     ) -> str:
         """Compile a generic SCF or NSCF input file.
         
-        Used for T2 bands/DOS steps.
+        Used for T2 bands/DOS steps. Pass ``atoms`` to compile from an
+        arbitrary structure instead of a MATERIAL_DB material.
         """
-        if material not in MATERIAL_DB:
-            raise ValueError(f"Unknown material: {material}")
-        
-        db = MATERIAL_DB[material]
-        atoms = build_atoms(material)
+        db, atoms, alat_bohr = self._resolve(material, atoms)
         
         prefix = prefix or material.lower()
         ecutwfc = ecutwfc if ecutwfc is not None else db["ecutwfc_default"]
         ecutrho = ecutrho if ecutrho is not None else db["ecutrho_default"]
-        kpoints = get_kpoints(material, kpoints)
+        kpoints = tuple(kpoints) if kpoints else tuple(db.get("kpoints_default", (4, 4, 4, 1, 1, 1)))
         
         # Check pseudos
         missing = self._check_pseudos(db["pseudos"])
@@ -481,9 +660,7 @@ class QECompiler:
                 nbnd = max(len(atoms) * 4, n_occ + 12)
             else:
                 nbnd = max(len(atoms) * 4, n_occ + 8)
-        
-        alat_bohr = get_lattice_constant_angstrom(material) * 1.8897261246
-        
+
         lines = []
         lines.append("&CONTROL")
         lines.append(f'  calculation = "{calculation}"')
@@ -537,7 +714,7 @@ class QECompiler:
         # K_POINTS — SCF uses a uniform grid; NSCF runs the high-symmetry
         # band path so bands.x can post-process the same k-points
         if calculation == "nscf":
-            kpts_path = get_bandpath_kpoints(material, npoints=nkpoints_bands)
+            kpts_path = get_bandpath_kpoints(material, npoints=nkpoints_bands, atoms=atoms)
             lines.append("K_POINTS crystal")
             lines.append(f"  {len(kpts_path)}")
             # QE 7.x requires the weight column; equal weights for band paths
@@ -563,32 +740,33 @@ class QECompiler:
         kpath: Optional[Tuple] = None,
         klabels: Optional[List[str]] = None,
         nkpoints: int = 100,
+        atoms: Optional[Atoms] = None,
     ) -> str:
         """Compile a bands.x post-processing input file.
 
         Generates a high-symmetry k-path input suitable for bands.x.
 
         Args:
-            material: Material key in MATERIAL_DB
+            material: Material key in MATERIAL_DB (label only when atoms is given)
             output_path: Where to write the .in file
             prefix: QE prefix (must match SCF/NSCF prefix)
             kpath: Override k-points as (N, 3) array in crystal coords
             klabels: Override k-point labels (one per k-point)
             nkpoints: Number of interpolated points between high-symmetry points
+            atoms: Optional ASE Atoms from a structure file (overrides material)
 
         Returns:
             The generated input file content as string
         """
-        if material not in MATERIAL_DB:
+        if atoms is None and material not in MATERIAL_DB:
             raise ValueError(f"Unknown material: {material}")
-
-        db = MATERIAL_DB[material]
         prefix = prefix or material.lower()
 
         # Labeled high-symmetry points from ASE's Bravais-aware bandpath;
         # npoints=0 tells bands.x to reuse the exact pw.x nscf k-point list
         if kpath is None or klabels is None:
-            segments = get_bandpath_segments(material)
+            src = atoms if atoms is not None else build_atoms(material)
+            segments = bandpath_segments_from_atoms(src)
             flat: List = []
             for seg in segments:
                 for pt in seg:
@@ -630,11 +808,12 @@ class QECompiler:
         deltae: float = 0.01,
         fwhm: float = 0.05,
         ngauss: int = 1,
+        atoms: Optional[Atoms] = None,
     ) -> str:
         """Compile a dos.x post-processing input file.
 
         Args:
-            material: Material key in MATERIAL_DB
+            material: Material key in MATERIAL_DB (label only when atoms is given)
             output_path: Where to write the .in file
             prefix: QE prefix (must match SCF/NSCF prefix)
             emin: Minimum energy in eV (None = auto)
@@ -642,14 +821,14 @@ class QECompiler:
             deltae: Energy grid step in eV
             fwhm: Broadening width in eV
             ngauss: Broadening type (1=Gaussian, 0=Methfessel-Paxton)
+            atoms: Optional ASE Atoms (accepted for symmetry with other compilers)
 
         Returns:
             The generated input file content as string
         """
-        if material not in MATERIAL_DB:
+        if atoms is None and material not in MATERIAL_DB:
             raise ValueError(f"Unknown material: {material}")
 
-        db = MATERIAL_DB[material]
         prefix = prefix or material.lower()
 
         lines = []

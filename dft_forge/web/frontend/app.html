@@ -1,33 +1,108 @@
 <!doctype html>
+<!--
+  THESIS: A QE computation session rendered as a journal supplementary page:
+  contents column, article body (conversation), figure panel — refusing the
+  dark cyber-terminal default this category always ships.
+  OWN-WORLD: paper #F8F6F1, ink #1F1B16, scholarly blue #22527A, hairlines
+  #D9D2C4, double-rule headers, serif display (Source Serif 4) over system
+  UI body, mono reserved for data. Table-voiced tool calls.
+  STORY: researcher speaks; replies read as article paragraphs with a tools
+  table; the figure panel fills with a rotatable structure, then band/DOS
+  charts as calculations land.
+  FIRST VIEWPORT: three columns from load — contents (sessions), body
+  (welcome + suggestions), figures (structure viewer with cell frame,
+  metrics, charts). Composer pinned to the body column's foot.
+  FORM: journal supplementary page, light; the mode is Operate.
+  FINISH: unreviewed and undocumented is unfinished; this build ends with
+  the finish review, the verdict, DESIGN.md, and every shipping raster
+  carrying its provenance.
+-->
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>DFT-Forge Chat</title>
+  <title>DFT-Forge · 计算会话</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Spline+Sans+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/frontend/style.css">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/3Dmol.js/2.0.3/3Dmol-min.js"></script>
+  <script src="/frontend/vendor/3Dmol-min.js"></script>
 </head>
 <body>
-  <div class="shell">
-    <div class="header">
-      <h1>DFT-Forge Chat</h1>
-      <div class="badge">agent-friendly CLI 前端原型</div>
-    </div>
-    <div class="body">
-      <div id="chat" class="chat">
-        <div class="empty">试着说：导入结构、构建 vc-relax 输入、提交计算、查看状态、查看账本、环境诊断</div>
+  <div class="app">
+    <header class="masthead">
+      <div class="masthead-inner">
+        <h1 class="masthead-title">DFT&#8209;Forge</h1>
+        <p class="masthead-sub">第一性原理计算代理 · <span class="mono">Quantum ESPRESSO</span></p>
+        <div class="masthead-status" id="engineStatus"><span class="dot"></span>检查环境…</div>
+        <button class="btn-settings" id="btnSettings" type="button" title="配置 LLM API">⚙ LLM</button>
       </div>
-      <div class="viewer">
-        <header>Structure Viewer</header>
-        <div id="viewer3d"></div>
-      </div>
+    </header>
+
+    <div class="columns" id="columns">
+      <aside class="col-contents" id="colContents">
+        <div class="col-head">
+          <span>会话目录</span>
+          <span class="head-actions">
+            <button class="btn-new" id="newSession" type="button" title="新建会话">＋新建</button>
+            <button class="btn-fold" id="foldLeft" type="button" title="折叠会话栏">⟨</button>
+          </span>
+        </div>
+        <nav class="session-list" id="sessionList" aria-label="历史会话"></nav>
+        <div class="contents-foot mono" id="sessionCount">0 个会话</div>
+      </aside>
+
+      <main class="col-body">
+        <section class="dialogue" id="chat" aria-live="polite"></section>
+        <form class="composer" id="form">
+          <input id="msg" autocomplete="off" placeholder="描述你的计算需求，例如：帮我算 Si 的能带结构" aria-label="输入消息" />
+          <button id="send" type="submit">发送</button>
+        </form>
+        <div class="statusline mono" id="status">就绪</div>
+      </main>
+
+      <aside class="col-figures" id="colFigures">
+        <div class="col-head"><span>结构</span>
+          <span class="fig-actions">
+            <label class="toggle mono"><input type="checkbox" id="toggleCell" checked />晶胞框</label>
+            <label class="toggle mono"><input type="checkbox" id="toggleReplica" />邻胞 2×2</label>
+            <button class="btn-fold" id="foldRight" type="button" title="折叠图表栏">⟩</button>
+          </span>
+        </div>
+        <div class="fig-structure">
+          <div id="viewer3d"></div>
+          <div class="fig-caption" id="viewerCaption">尚无结构 — 让我“生成 Si 的结构”或“构建 4×4 石墨烯”</div>
+          <div class="legend mono" id="atomLegend"></div>
+        </div>
+        <div class="col-head fig-sep"><span>计算结果</span></div>
+        <div class="fig-charts" id="charts">
+          <div class="fig-empty">完成一次计算后，能带、态密度与关键数值出现在这里</div>
+        </div>
+      </aside>
     </div>
-    <div id="status" class="status">ready</div>
-    <form id="form" class="composer">
-      <input id="msg" autocomplete="off" placeholder="输入材料计算请求..." />
-      <button id="send" type="submit">发送</button>
-    </form>
   </div>
+
+  <dialog id="settingsDlg" class="settings-dlg">
+    <form id="settingsForm" method="dialog">
+      <h3>LLM 接入设置</h3>
+      <p class="cfg-intro">填入任意 OpenAI 兼容服务的密钥后，代理将用大模型理解需求、规划计算，并以自然语言汇报结果。</p>
+      <label class="cfg-field">API 地址
+        <input id="cfgBaseUrl" placeholder="https://api.openai.com/v1" autocomplete="off" />
+      </label>
+      <label class="cfg-field">模型
+        <input id="cfgModel" placeholder="gpt-4o-mini / deepseek-chat / qwen-plus" autocomplete="off" />
+      </label>
+      <label class="cfg-field">API Key
+        <input id="cfgApiKey" type="password" placeholder="sk-…（仅存本地 .env）" autocomplete="new-password" />
+      </label>
+      <p class="cfg-hint" id="cfgHint">未配置 — 当前使用内置规则规划。</p>
+      <div class="cfg-actions">
+        <span class="cfg-error mono" id="cfgError"></span>
+        <button type="button" class="cfg-btn ghost" id="cfgClose">取消</button>
+        <button type="button" class="cfg-btn" id="cfgSave">保存</button>
+      </div>
+    </form>
+  </dialog>
   <script type="module" src="/frontend/app.js"></script>
 </body>
 </html>

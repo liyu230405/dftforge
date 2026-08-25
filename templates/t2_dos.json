@@ -5,7 +5,8 @@
     "material": "Si",
     "ecutwfc": null,
     "kpoints": null,
-    "nbnd": null
+    "nbnd": null,
+    "structure": null
   },
   "outputs": {
     "scf_energy_ry": "${nodes.scf.outputs.energy_ry}",
@@ -19,7 +20,8 @@
         "calc": "scf",
         "material": "${inputs.material}",
         "ecutwfc": "${inputs.ecutwfc}",
-        "kpoints": "${inputs.kpoints}"
+        "kpoints": "${inputs.kpoints}",
+        "structure": "${inputs.structure}"
       },
       "depends_on": [],
       "max_repair_attempts": 2
@@ -31,9 +33,12 @@
         "calc": "nscf",
         "material": "${inputs.material}",
         "ecutwfc": "${inputs.ecutwfc}",
-        "nbnd": "${inputs.nbnd}"
+        "nbnd": "${inputs.nbnd}",
+        "structure": "${inputs.structure}"
       },
-      "depends_on": ["scf"],
+      "depends_on": [
+        "scf"
+      ],
       "max_repair_attempts": 2
     },
     {
@@ -43,9 +48,13 @@
         "calc": "dos",
         "material": "${inputs.material}",
         "scf_stdout": "${nodes.scf.outputs.stdout_file}",
-        "nscf_stdout": "${nodes.nscf.outputs.stdout_file}"
+        "nscf_stdout": "${nodes.nscf.outputs.stdout_file}",
+        "structure": "${inputs.structure}"
       },
-      "depends_on": ["scf", "nscf"],
+      "depends_on": [
+        "scf",
+        "nscf"
+      ],
       "max_repair_attempts": 1
     }
   ]

@@ -222,7 +222,13 @@ def cmd_structure_generate(args: argparse.Namespace) -> int:
         atoms = ase_bulk("Al", "fcc", a=4.05)
         formula = atoms.get_chemical_formula()
     else:
-        return _error_response(f"Unsupported generated structure: {source}")
+        try:
+            from dft_forge.compiler import formula_atoms
+
+            atoms, _proto = formula_atoms(source)
+            formula = atoms.get_chemical_formula()
+        except Exception as exc:  # noqa: BLE001
+            return _error_response(f"Unsupported generated structure: {source} ({exc})")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ase_write(str(output_path), atoms)

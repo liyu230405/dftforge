@@ -163,12 +163,14 @@ def _structure_analyze(args: dict) -> dict:
     from dft_forge.cli import cmd_structure_analyze
     import argparse
     # clamp: LLMs invent destructive values (e.g. min_nn=4 rejects every
-    # real bond); sane nearest-neighbour checks live in [0.3, 2.0] Å
-    min_nn = min(max(float(args.get("min_nn", 0.8) or 0.8), 0.3), 2.0)
+    # real bond — C-C is 1.42 Å); this is a validity floor, not a physics
+    # threshold, so cap it below the shortest real bonds (H2 0.74 Å)
+    min_nn = min(max(float(args.get("min_nn", 0.8) or 0.8), 0.3), 1.2)
+    fractional = str(args.get("fractional", False)).lower() in ("true", "1", "yes")
     ns = argparse.Namespace(
         source=args.get("source", ""),
         format=args.get("format"),
-        fractional=args.get("fractional", False),
+        fractional=fractional,
         min_nn=min_nn,
         pair_types=args.get("pair_types"),
         output=args.get("output"),

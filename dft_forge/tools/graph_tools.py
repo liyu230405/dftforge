@@ -40,10 +40,14 @@ def _get_engine(workdir: Optional[str] = None):
 
 def _pick_executor():
     from dft_forge.executor import FakeExecutor, LocalExecutor
+    import shutil
 
     qe_bin = os.environ.get("DFT_FORGE_QE_BIN")
     if qe_bin and Path(qe_bin).is_dir():
         return LocalExecutor(qe_bin_dir=Path(qe_bin))
+    pw = shutil.which("pw.x")
+    if pw:
+        return LocalExecutor(qe_bin_dir=Path(pw).parent)
     return FakeExecutor()
 
 

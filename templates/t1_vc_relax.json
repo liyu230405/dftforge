@@ -4,7 +4,8 @@
   "inputs": {
     "material": "Si",
     "ecutwfc": null,
-    "kpoints": null
+    "kpoints": null,
+    "structure": null
   },
   "outputs": {
     "energy_ry": "${nodes.vc_relax.outputs.energy_ry}",
@@ -18,7 +19,8 @@
         "calc": "vc-relax",
         "material": "${inputs.material}",
         "ecutwfc": "${inputs.ecutwfc}",
-        "kpoints": "${inputs.kpoints}"
+        "kpoints": "${inputs.kpoints}",
+        "structure": "${inputs.structure}"
       },
       "depends_on": [],
       "max_repair_attempts": 2

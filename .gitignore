@@ -26,3 +26,9 @@ input_tmp.in
 gaas_relax/
 gaas_vc_relax/
 env_diagnosis.json
+
+# local debug graph runs
+nacl_calc/
+si_bands_calc/
+work/
+.impeccable/
