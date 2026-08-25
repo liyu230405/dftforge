@@ -23,14 +23,14 @@ class TestDummyLLMProvider:
         response = provider.plan(LLMRequest(prompt="Compute band structure for Al"))
         assert response.workflow.task_type == "T2"
         assert response.workflow.material == "Al"
-        assert len(response.workflow.steps) == 3
+        assert [s.step_type for s in response.workflow.steps] == ["scf", "bands_nscf"]
 
     def test_plan_dos(self):
         provider = DummyLLMProvider()
         response = provider.plan(LLMRequest(prompt="Compute DOS for MgO"))
         assert response.workflow.task_type == "T2"
         assert response.workflow.material == "MgO"
-        assert len(response.workflow.steps) == 3
+        assert [s.step_type for s in response.workflow.steps] == ["scf", "dos_nscf"]
 
 
 class TestPlanner:

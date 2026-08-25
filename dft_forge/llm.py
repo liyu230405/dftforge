@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -51,25 +52,30 @@ class DummyLLMProvider(LLMProvider):
         prompt = request.prompt.lower()
         available_materials = list(request.available_materials or ["Si", "Al", "MgO"])
         task_type = "T1"
-        material = available_materials[0]
-        for candidate in available_materials:
-            if candidate.lower() in prompt:
+        material = None
+        # Longest names first; word-boundary match so "In" does not match
+        # "optimization" and "Si" does not match "gaas".
+        for candidate in sorted(available_materials, key=len, reverse=True):
+            if re.search(
+                rf"(?<![a-z0-9]){re.escape(candidate.lower())}(?![a-z0-9])",
+                prompt,
+            ):
                 material = candidate
                 break
+        if material is None:
+            return LLMResponse(error="no known material mentioned in prompt")
 
         if "band" in prompt:
             task_type = "T2"
             steps = [
                 StepIR(step_id="scf", step_type="scf", prefix=material.lower()),
                 StepIR(step_id="nscf", step_type="bands_nscf", prefix=material.lower(), depends_on=["scf"]),
-                StepIR(step_id="bands", step_type="bands", prefix=material.lower(), depends_on=["nscf"]),
             ]
         elif "dos" in prompt:
             task_type = "T2"
             steps = [
                 StepIR(step_id="scf", step_type="scf", prefix=material.lower()),
                 StepIR(step_id="nscf", step_type="dos_nscf", prefix=material.lower(), depends_on=["scf"]),
-                StepIR(step_id="dos", step_type="dos", prefix=material.lower(), depends_on=["nscf"]),
             ]
         else:
             steps = [

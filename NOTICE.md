@@ -20,3 +20,17 @@ DFT-Forge depends on the following open-source packages:
 - **NumPy**, **SciPy**, **h5py**, **matplotlib** — scientific computing
 
 No code from CatGo or SilicoLab is copied or imported.
+
+## Pseudopotential Library
+
+`assets/pseudos/gbrv/` contains the GBRV ultrasoft pseudopotentials
+(USPP, PBE, v1.5) from https://www.physics.rutgers.edu/gbrv/
+(SHA256-verified tarball `all_pbe_UPF_v1.5.tar.gz`). License: GNU Public
+License. Please cite:
+
+- K.F. Garrity, J.W. Bennett, K.M. Rabe, D. Vanderbilt,
+  Comput. Mater. Sci. 81, 446 (2014). DOI: 10.1016/j.commatsci.2013.08.053
+
+Material structures in `dft_forge/catalog/library.py` are derived from
+Materials Project ground-state cells (58 MP-verified entries, M1 set);
+each entry records its `mp_id`.

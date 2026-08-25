@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from dft_forge.catalog import get_task_spec, list_tasks
+from dft_forge.catalog import get_task_spec, list_materials, list_tasks
 from dft_forge.compiler import QECompiler, build_atoms
 from dft_forge.executor import Executor, FakeExecutor, LocalExecutor
 from dft_forge.ledger import EvidenceLedger
@@ -68,11 +68,23 @@ class Agent:
         if task_id:
             return self._run_known_task(task_id, workdir, out=out)
 
-        workflow = self.planner.plan_from_prompt(
-            prompt,
-            available_materials=list_tasks(),
-            available_calcs=["scf", "vc-relax", "bands", "dos"],
-        )
+        try:
+            workflow = self.planner.plan_from_prompt(
+                prompt,
+                available_materials=list_materials(),
+                available_calcs=["scf", "vc-relax", "bands", "dos"],
+            )
+        except (RuntimeError, ValueError) as exc:
+            return SolveResult(
+                status="unsupported",
+                task_id="unplanned",
+                workflow=None,
+                result=None,
+                evidence=None,
+                recovery_actions=[],
+                ledger_rows=0,
+                error=str(exc),
+            )
         return self._run_workflow(workflow, workdir, out=out)
 
     def _run_known_task(self, task_id: str, workdir: Path, *, out: Optional[Path]) -> SolveResult:
@@ -117,20 +129,44 @@ class Agent:
     def _run_workflow(self, workflow: WorkflowIR, workdir: Path, *, out: Optional[Path]) -> SolveResult:
         task_id = workflow.task_id or "unknown"
         try:
-            task_spec = get_task_spec(task_id)
+            get_task_spec(task_id)
         except ValueError:
-            return SolveResult(
-                status="unsupported",
-                task_id=task_id,
-                workflow=workflow,
-                result=None,
-                evidence=None,
-                recovery_actions=[],
-                ledger_rows=0,
-                error="Planned task is not in the supported catalog",
-            )
+            registered = self._register_library_task(workflow)
+            if registered is None:
+                return SolveResult(
+                    status="unsupported",
+                    task_id=task_id,
+                    workflow=workflow,
+                    result=None,
+                    evidence=None,
+                    recovery_actions=[],
+                    ledger_rows=0,
+                    error=f"Material '{workflow.material}' is not in the material library",
+                )
+            task_id = registered
 
         return self._run_known_task(task_id, workdir, out=out)
+
+    @staticmethod
+    def _register_library_task(workflow: WorkflowIR) -> Optional[str]:
+        """Register a library-material workflow as a runnable task, return its id."""
+        from dft_forge.catalog import MATERIALS, TASKS, build_library_task_spec
+        from dft_forge.catalog.library import LIBRARY_MATERIALS
+
+        material = workflow.material
+        if material not in MATERIALS and material not in LIBRARY_MATERIALS:
+            return None
+        subtype = None
+        for step in workflow.steps:
+            if step.step_type == "bands_nscf":
+                subtype = "bands"
+                break
+            if step.step_type == "dos_nscf":
+                subtype = "dos"
+                break
+        spec = build_library_task_spec(material, task_type=workflow.task_type, subtype=subtype)
+        TASKS[spec["task_id"]] = spec
+        return spec["task_id"]
 
     def _maybe_record_ledger(self, task_id: str, result: Dict[str, Any]) -> None:
         if not self.ledger:

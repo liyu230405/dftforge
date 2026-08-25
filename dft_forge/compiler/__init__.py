@@ -83,8 +83,18 @@ MATERIAL_DB: Dict[str, Dict[str, Any]] = {
     },
 }
 
+from dft_forge.catalog.library import LIBRARY_MATERIALS  # noqa: E402
+
+MATERIAL_DB.update(LIBRARY_MATERIALS)
+
 
 # ── Structure builder ─────────────────────────────────────────────────────────
+
+def get_lattice_constant_angstrom(material: str) -> float:
+    """Scale length for a material (built-in or library), in Angstrom."""
+    db = MATERIAL_DB[material]
+    return db["lattice_constant_angstrom"] if "lattice_constant_angstrom" in db else db["cellpar"][0]
+
 
 def build_atoms(material: str) -> Atoms:
     """Build ASE Atoms object for a known material.
@@ -98,8 +108,21 @@ def build_atoms(material: str) -> Atoms:
         raise ValueError(f"Unknown material: {material}. Known: {list(MATERIAL_DB.keys())}")
 
     db = MATERIAL_DB[material]
-    a_angstrom = db["lattice_constant_angstrom"]
+    a_angstrom = get_lattice_constant_angstrom(material)
     a_bohr = a_angstrom * 1.8897261246
+
+    if "cellpar" in db and "sites" in db:
+        # Library material: exact MP cell + fractional sites.
+        # Cell lengths are converted to Bohr to match the built-in convention
+        # (CELL_PARAMETERS are emitted in alat units of celldm(1) in Bohr).
+        from ase.cell import Cell
+
+        a, b, c, alpha, beta, gamma = db["cellpar"]
+        cell = Cell.fromcellpar([a * 1.8897261246, b * 1.8897261246, c * 1.8897261246, alpha, beta, gamma])
+        symbols = [s[0] for s in db["sites"]]
+        positions = [s[1] for s in db["sites"]]
+        atoms = Atoms(symbols=symbols, scaled_positions=positions, cell=cell, pbc=True)
+        return atoms
 
     if material == "Si":
         # Diamond structure: primitive 2-atom cell
@@ -171,7 +194,7 @@ def get_high_symmetry_path(material: str) -> Tuple[np.ndarray, List[str]]:
     if not db:
         raise ValueError(f"Unknown material: {material}")
     
-    a = db["lattice_constant_angstrom"]
+    a = get_lattice_constant_angstrom(material)
     sg = db["space_group"]
     
     # Build primitive structure
@@ -273,7 +296,7 @@ class QECompiler:
         lines.append("")
         lines.append("&SYSTEM")
         lines.append(f"  ibrav = {db['ibrav']}")
-        alat_bohr = db["lattice_constant_angstrom"] * 1.8897261246
+        alat_bohr = get_lattice_constant_angstrom(material) * 1.8897261246
         lines.append(f"  celldm(1) = {alat_bohr:.6f}")
         lines.append(f"  nat = {len(atoms)}")
         lines.append(f"  ntyp = {db['nspecies']}")
@@ -321,11 +344,10 @@ class QECompiler:
         # CELL_PARAMETERS: only for ibrav=0 (free cell)
         # For ibrav != 0, QE derives the cell from celldm(1) and bravais-lattice index
         if db["ibrav"] == 0:
-            # atoms.cell is in Angstrom, so divide by lattice_constant_angstrom to get alat units
+            # Cell vectors are in Bohr; express them in alat units (alat = celldm(1) in Bohr)
             lines.append("CELL_PARAMETERS (alat=1.0)")
-            a_angstrom = db["lattice_constant_angstrom"]
             for vec in atoms.cell:
-                lines.append(f"  {vec[0]/a_angstrom:.8f}  {vec[1]/a_angstrom:.8f}  {vec[2]/a_angstrom:.8f}")
+                lines.append(f"  {vec[0]/alat_bohr:.8f}  {vec[1]/alat_bohr:.8f}  {vec[2]/alat_bohr:.8f}")
             lines.append("")
         
         # K_POINTS
@@ -384,7 +406,7 @@ class QECompiler:
             else:
                 nbnd = len(atoms) * 4
         
-        alat_bohr = db["lattice_constant_angstrom"] * 1.8897261246
+        alat_bohr = get_lattice_constant_angstrom(material) * 1.8897261246
         
         lines = []
         lines.append("&CONTROL")

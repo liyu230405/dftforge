@@ -13,6 +13,8 @@ import numpy as np
 
 from dft_forge.protocol.schemas import MaterialProfile, TaskSpec
 
+from dft_forge.catalog.library import LIBRARY_MATERIALS
+
 # ── Built-in materials ───────────────────────────────────────────────────────
 
 MATERIALS: Dict[str, Dict[str, Any]] = {
@@ -71,18 +73,30 @@ MATERIALS: Dict[str, Dict[str, Any]] = {
 
 
 def get_material_profile(material: str) -> MaterialProfile:
-    """Get a MaterialProfile for a known material."""
-    if material not in MATERIALS:
-        raise ValueError(f"Unknown material: {material}. Known: {list(MATERIALS.keys())}")
-    
-    db = MATERIALS[material]
+    """Get a MaterialProfile for a known or library material."""
+    db = None
+    if material in MATERIALS:
+        db = MATERIALS[material]
+    elif material in LIBRARY_MATERIALS:
+        db = LIBRARY_MATERIALS[material]
+    if db is None:
+        raise ValueError(
+            f"Unknown material: {material}. Known: {sorted(set(MATERIALS) | set(LIBRARY_MATERIALS))[:20]} ..."
+        )
+
+    if "cellpar" in db:
+        a_angstrom = db["cellpar"][0]
+        natoms = len(db["sites"])
+    else:
+        a_angstrom = db["lattice_constant_angstrom"]
+        natoms = db["natoms_primitive"]
     return MaterialProfile(
         formula=db["formula"],
         structure_type=db["structure_type"],
         space_group=db["space_group"],
         ibrav=db["ibrav"],
-        lattice_constant_bohr=db["lattice_constant_angstrom"] * 1.8897261246,
-        natoms=db["natoms_primitive"],
+        lattice_constant_bohr=a_angstrom * 1.8897261246,
+        natoms=natoms,
         nspecies=db["nspecies"],
         species=db["species"],
         masses=db["masses"],
@@ -90,7 +104,7 @@ def get_material_profile(material: str) -> MaterialProfile:
         occupations=db["occupations"],
         smearing=db["smearing"],
         degauss=db["degauss"],
-        charge=db["charge"],
+        charge=db["charge"] if "charge" in db else 0,
         is_metal=db["is_metal"],
     )
 
@@ -374,6 +388,70 @@ def build_dynamic_task_spec(
     )
 
 
+def build_library_task_spec(
+    material: str,
+    *,
+    task_type: str = "T1",
+    subtype: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build a TASKS-style dict for a library material on demand.
+
+    Parameters follow the built-in task conventions with heuristics from the
+    material's library entry (ecut, kpoints, metal smearing).
+    """
+    if material not in LIBRARY_MATERIALS and material not in MATERIALS:
+        raise ValueError(f"Unknown material: {material}")
+    db = MATERIALS.get(material) or LIBRARY_MATERIALS[material]
+    is_metal = db["is_metal"]
+    ecutwfc = db.get("ecutwfc_default", 45.0)
+    ecutrho = db.get("ecutrho_default", ecutwfc * 8.0)
+    kpoints = db.get("kpoints_default", (6, 6, 6, 1, 1, 1))
+    natoms = len(db["sites"]) if "sites" in db else db["natoms_primitive"]
+    nbnd = natoms * 8 if is_metal else natoms * 4
+
+    if task_type == "T1":
+        return {
+            "task_id": f"T1_{material}_vcrelax",
+            "task_type": "T1",
+            "material": material,
+            "description": f"{material} ({db.get('structure_type', '')}) vc-relax optimization",
+            "parameters": {
+                "ecutwfc": ecutwfc,
+                "ecutrho": ecutrho,
+                "kpoints": list(kpoints),
+                "conv_thr": 1.0e-8,
+                "cell_optimization": False,
+                "nstep": 200,
+            },
+        }
+
+    if task_type == "T2":
+        params = {
+            "subtype": subtype or "bands",
+            "ecutwfc": ecutwfc,
+            "ecutrho": ecutrho,
+            "kpoints_scf": list(kpoints),
+            "kpoints_nscf": list(kpoints),
+            "conv_thr": 1.0e-8,
+            "nbnd": nbnd,
+        }
+        if (subtype or "bands") == "bands":
+            params["nkpoints_bands"] = 100
+        else:
+            params["dos_deltae"] = 0.01
+            params["dos_fwhm"] = 0.05
+        return {
+            "task_id": f"T2_{material}_{subtype or 'bands'}",
+            "task_type": "T2",
+            "material": material,
+            "description": f"{material} {subtype or 'bands'} (SCF + NSCF)",
+            "parameters": params,
+        }
+
+    raise ValueError(f"Unsupported task_type: {task_type}")
+
+
 def list_materials() -> List[str]:
-    """List all registered material IDs, including dynamic ones."""
-    return sorted(MATERIALS.keys())
+    """List all registered material IDs, including library and dynamic ones."""
+    combined = set(MATERIALS.keys()) | set(LIBRARY_MATERIALS.keys())
+    return sorted(combined)

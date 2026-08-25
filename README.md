@@ -166,6 +166,26 @@ The LLM is only asked to emit a JSON `WorkflowIR`; the reply is schema-validated
 (materials, step types, dependencies) before anything is executed, and an invalid
 reply triggers one repair round. If planning fails, nothing runs.
 
+## Material Library
+
+57 ready-to-run materials (3 hand-tuned built-ins + 54 MP-verified library
+entries) covering elemental semiconductors, III-V / II-VI compounds, alkali
+halides, simple and transition metals, and simple oxides:
+
+- Structures: Materials Project ground-state cells (cell parameters + fractional
+  sites), rebuilt exactly via ASE — including hexagonal (wurtzite/hcp) and
+  low-symmetry cells.
+- Pseudopotentials: GBRV USPP PBE v1.5 (65 elements, SHA256-verified). Element
+  symlinks live at `assets/pseudos/<Element>.upf`.
+- Any library material works from natural language end to end, e.g.
+  `agent.solve_from_prompt("optimize NaCl structure")` plans, registers a task
+  on the fly, runs pw.x, and verifies convergence.
+- Regenerate the library after updating the source YAML:
+  `python scripts/gen_material_library.py <m1_resolved.yaml>`.
+
+Cutoffs/k-points defaults are heuristic per material family (harder first-row
+elements get higher ecut; metals get denser k-meshes and stronger smearing).
+
 ## License and Third-Party Notices
 
 - DFT-Forge code in this repository is provided under the repository root license.
