@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+
+# Secrets
+.env
+*.key
+
+# Runtime artifacts (QE runs, ledgers, reports)
+*.db
+work/
+outputs/
+reports/
+data/
+dashboard/
+CRASH
+input_tmp.in
+*.save/
+*.wfc*
+*.xml.tmp

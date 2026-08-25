@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DFT-Forge Chat</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/3Dmol.js/2.0.3/3Dmol-min.js"></script>
+  <style>
+    :root { font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body { display: flex; align-items: center; justify-content: center; background: #0f172a; color: #e2e8f0; }
+    .shell { width: 100%; max-width: 1100px; height: 92vh; display: flex; flex-direction: column; background: #111827; border: 1px solid #334155; border-radius: 16px; overflow: hidden; }
+    .header { padding: 14px 18px; border-bottom: 1px solid #334155; display: flex; align-items: center; justify-content: space-between; }
+    .header h1 { font-size: 16px; margin: 0; }
+    .badge { font-size: 12px; color: #94a3b8; }
+    .body { flex: 1; display: flex; min-height: 0; }
+    .chat { flex: 1; overflow: auto; padding: 18px; display: flex; flex-direction: column; gap: 12px; }
+    .row { display: flex; gap: 12px; }
+    .row.user { justify-content: flex-end; }
+    .bubble { max-width: 78%; padding: 10px 12px; border-radius: 12px; font-size: 14px; line-height: 1.55; white-space: pre-wrap; }
+    .row.user .bubble { background: #2563eb; color: white; border-bottom-right-radius: 4px; }
+    .row.agent .bubble { background: #0f172a; border: 1px solid #334155; color: #e2e8f0; border-bottom-left-radius: 4px; }
+    .meta { font-size: 11px; color: #94a3b8; margin-top: 6px; }
+    .tool { font-size: 12px; color: #fbbf24; margin-top: 8px; }
+    .tool summary { cursor: pointer; }
+    .tool pre { margin: 6px 0 0; padding: 8px; background: #0b1220; border: 1px solid #223; border-radius: 8px; overflow: auto; }
+    .viewer { width: 380px; border-left: 1px solid #334155; background: #0b1220; display: flex; flex-direction: column; }
+    .viewer header { padding: 10px 12px; border-bottom: 1px solid #334155; font-size: 12px; color: #94a3b8; }
+    #viewer3d { flex: 1; min-height: 0; }
+    .composer { border-top: 1px solid #334155; padding: 12px; display: flex; gap: 10px; }
+    .composer input { flex: 1; padding: 10px 12px; border-radius: 10px; border: 1px solid #334155; background: #0b1220; color: #e2e8f0; outline: none; }
+    .composer button { padding: 10px 14px; border-radius: 10px; border: 0; background: #2563eb; color: white; font-weight: 600; cursor: pointer; }
+    .composer button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .empty { color: #94a3b8; font-size: 13px; text-align: center; margin-top: 18vh; }
+    .status { font-size: 12px; color: #94a3b8; }
+    .status.error { color: #f87171; }
+    .status.success { color: #4ade80; }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="header">
+      <h1>DFT-Forge Chat</h1>
+      <div class="badge">agent-friendly CLI 前端原型</div>
+    </div>
+    <div class="body">
+      <div id="chat" class="chat">
+        <div class="empty">试着说：导入结构、构建 vc-relax 输入、提交计算、查看状态、查看账本、环境诊断</div>
+      </div>
+      <div class="viewer">
+        <header>Structure Viewer</header>
+        <div id="viewer3d"></div>
+      </div>
+    </div>
+    <form id="form" class="composer">
+      <input id="msg" autocomplete="off" placeholder="输入材料计算请求..." />
+      <button id="send" type="submit">发送</button>
+    </form>
+  </div>
+
+  <script>
+    const API = "/chat";
+    const chat = document.getElementById("chat");
+    const form = document.getElementById("form");
+    const input = document.getElementById("msg");
+    const sendBtn = document.getElementById("send");
+
+    let viewer = null;
+
+    function initViewer() {
+      const el = document.getElementById("viewer3d");
+      if (!el || viewer) return;
+      viewer = $3Dmol.createViewer(el, { backgroundColor: "#0b1220" });
+      viewer.render();
+    }
+
+    function renderCif(cif) {
+      if (!viewer) initViewer();
+      viewer.removeAllModels();
+      viewer.addModel(cif, "cif");
+      viewer.setStyle({}, { sphere: { colorscheme: "Jmol" } });
+      viewer.zoomTo();
+      viewer.render();
+    }
+
+    function esc(s) {
+      return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    function append(role, text, extra = "") {
+      const row = document.createElement("div");
+      row.className = `row ${role}`;
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.innerHTML = esc(text) + (extra ? `<div class="meta">${esc(extra)}</div>` : "");
+      row.appendChild(bubble);
+      chat.appendChild(row);
+      chat.scrollTop = chat.scrollHeight;
+      return row;
+    }
+
+    async function send() {
+      const text = input.value.trim();
+      if (!text) return;
+      input.value = "";
+      sendBtn.disabled = true;
+      append("user", text);
+      try {
+        const res = await fetch(API, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: text }),
+        });
+        const data = await res.json();
+        const row = append("agent", data.reply || "(empty reply)");
+        if (data.commands && data.commands.length) {
+          const tool = document.createElement("div");
+          tool.className = "tool";
+          const cmds = data.commands.map((c, i) => `#${i+1} ${c.command} ${JSON.stringify(c).slice(1, -1)}`).join("\n");
+          tool.innerHTML = `<details><summary>tool calls: ${data.commands.length}</summary><pre>${esc(cmds)}</pre></details>`;
+          row.querySelector(".bubble").appendChild(tool);
+        }
+      } catch (e) {
+        append("agent", "请求失败：" + e.message);
+      } finally {
+        sendBtn.disabled = false;
+        input.focus();
+      }
+    }
+
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      send();
+    });
+
+    setTimeout(initViewer, 0);
+  </script>
+</body>
+</html>

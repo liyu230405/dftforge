@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DFT-Forge Chat</title>
+  <link rel="stylesheet" href="/frontend/style.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/3Dmol.js/2.0.3/3Dmol-min.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <div class="header">
+      <h1>DFT-Forge Chat</h1>
+      <div class="badge">agent-friendly CLI 前端原型</div>
+    </div>
+    <div class="body">
+      <div id="chat" class="chat">
+        <div class="empty">试着说：导入结构、构建 vc-relax 输入、提交计算、查看状态、查看账本、环境诊断</div>
+      </div>
+      <div class="viewer">
+        <header>Structure Viewer</header>
+        <div id="viewer3d"></div>
+      </div>
+    </div>
+    <div id="status" class="status">ready</div>
+    <form id="form" class="composer">
+      <input id="msg" autocomplete="off" placeholder="输入材料计算请求..." />
+      <button id="send" type="submit">发送</button>
+    </form>
+  </div>
+  <script type="module" src="/frontend/app.js"></script>
+</body>
+</html>
