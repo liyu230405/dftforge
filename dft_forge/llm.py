@@ -220,6 +220,10 @@ class OpenAICompatProvider(LLMProvider):
         parts.append("Return the JSON workflow now.")
         return "\n".join(parts)
 
+    def chat(self, system: str, user: str) -> str:
+        """Public raw chat call for agent planners."""
+        return self._chat(system, user)
+
     def plan(self, request: LLMRequest) -> LLMResponse:
         system = _WORKFLOW_SYSTEM_PROMPT
         user = self._build_user_message(request)

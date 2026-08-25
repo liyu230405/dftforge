@@ -63,7 +63,15 @@ def _graph_run(args: dict) -> dict:
     except ValueError as exc:
         return {"error": str(exc)}
     nodes = {
-        nid: {"state": n.state.value, "error": n.error}
+        nid: {
+            "state": n.state.value,
+            "error": n.error,
+            "outputs": (
+                {k: (v.item() if hasattr(v, "item") else v) for k, v in n.outputs.items()}
+                if n.state.value == "succeeded"
+                else None
+            ),
+        }
         for nid, n in run.nodes.items()
     }
     return {"run_id": run.run_id, "state": run.state.value, "nodes": nodes}

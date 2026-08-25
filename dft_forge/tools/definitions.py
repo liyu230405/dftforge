@@ -138,14 +138,38 @@ def _structure_generate(args: dict) -> dict:
     return _call_cmd(cmd_structure_generate, ns)
 
 
+def _structure_build2d(args: dict) -> dict:
+    from dft_forge.cli import cmd_structure_build2d
+    import argparse
+    dopants = args.get("dopants") or []
+    ns = argparse.Namespace(
+        kind=args.get("kind", "graphene"),
+        supercell=args.get("supercell", "1x1"),
+        vacancy=args.get("vacancy"),
+        dopant=[f"{d['element']}@{d['index']}" for d in dopants] or None,
+        adsorb=(
+            f"{args['adsorb']['element']}@{args['adsorb'].get('site', 'top')}"
+            if args.get("adsorb")
+            else None
+        ),
+        height=args.get("height", 1.5),
+        vacuum=args.get("vacuum", 15.0),
+        output=args.get("output"),
+    )
+    return _call_cmd(cmd_structure_build2d, ns)
+
+
 def _structure_analyze(args: dict) -> dict:
     from dft_forge.cli import cmd_structure_analyze
     import argparse
+    # clamp: LLMs invent destructive values (e.g. min_nn=4 rejects every
+    # real bond); sane nearest-neighbour checks live in [0.3, 2.0] Å
+    min_nn = min(max(float(args.get("min_nn", 0.8) or 0.8), 0.3), 2.0)
     ns = argparse.Namespace(
         source=args.get("source", ""),
         format=args.get("format"),
         fractional=args.get("fractional", False),
-        min_nn=args.get("min_nn", 0.8),
+        min_nn=min_nn,
         pair_types=args.get("pair_types"),
         output=args.get("output"),
     )
@@ -168,6 +192,45 @@ def register_default_tools() -> None:
                 "required": ["source"],
             },
             execute_fn=_structure_generate,
+        ),
+        ToolEntry(
+            id="structure.build2d",
+            name="Build 2D Material",
+            description=(
+                "Build a 2D material (graphene or h-BN monolayer) with optional supercell, "
+                "doping, vacancy, and adsorbate on top/bridge/hollow site. "
+                "Example: {kind: 'graphene', supercell: '4x4', dopants: [{index: 0, element: 'N'}], "
+                "adsorb: {element: 'O', site: 'hollow'}}"
+            ),
+            category="structure",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["graphene", "bn"]},
+                    "supercell": {"type": "string", "description": "e.g. '3x3' or '4x4'"},
+                    "vacancy": {"type": "integer", "description": "atom index to remove"},
+                    "dopants": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"index": {"type": "integer"}, "element": {"type": "string"}},
+                        },
+                    },
+                    "adsorb": {
+                        "type": "object",
+                        "properties": {
+                            "element": {"type": "string"},
+                            "site": {"type": "string", "enum": ["top", "bridge", "hollow"]},
+                            "height": {"type": "number"},
+                        },
+                    },
+                    "height": {"type": "number"},
+                    "vacuum": {"type": "number"},
+                    "output": {"type": "string"},
+                },
+                "required": ["kind"],
+            },
+            execute_fn=_structure_build2d,
         ),
         ToolEntry(
             id="structure.import",

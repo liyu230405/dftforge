@@ -21,3 +21,8 @@ input_tmp.in
 *.save/
 *.wfc*
 *.xml.tmp
+
+# runtime artifacts from chat workdir experiments
+gaas_relax/
+gaas_vc_relax/
+env_diagnosis.json

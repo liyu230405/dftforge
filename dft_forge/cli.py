@@ -235,6 +235,55 @@ def cmd_structure_generate(args: argparse.Namespace) -> int:
         "natoms": len(atoms),
         "species": sorted({sym for sym in atoms.get_chemical_symbols()}),
     }
+    # JSON always goes to stdout — _success_response would clobber the CIF
+    # written above when args.output is set
+    data["ok"] = True
+    print(_json_dumps(data))
+    return 0
+
+
+def cmd_structure_build2d(args: argparse.Namespace) -> int:
+    from ase.io import write as ase_write
+
+    from dft_forge.structure_builder import BuildResult, StructureBuildError, build_2d
+
+    dopants = []
+    for spec in args.dopant or []:
+        try:
+            element, index = spec.split("@", 1)
+            dopants.append({"element": element.strip(), "index": int(index)})
+        except ValueError:
+            return _error_response(f"bad dopant spec {spec!r} (expected ELEMENT@INDEX, e.g. N@0)")
+
+    adsorbate = None
+    if args.adsorb:
+        try:
+            element, site = args.adsorb.split("@", 1)
+            adsorbate = {"element": element.strip(), "site": site.strip().lower()}
+        except ValueError:
+            return _error_response(f"bad adsorb spec {args.adsorb!r} (expected ELEMENT@SITE, e.g. O@hollow)")
+
+    try:
+        result: BuildResult = build_2d(
+            args.kind,
+            supercell=args.supercell,
+            vacancy_index=args.vacancy,
+            dopants=dopants,
+            adsorbate=adsorbate,
+            height=args.height,
+            vacuum=args.vacuum,
+        )
+    except StructureBuildError as exc:
+        return _error_response(str(exc))
+
+    output_path = Path(args.output) if args.output else Path.cwd() / f"{args.kind}_{args.supercell}.cif"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ase_write(str(output_path), result.atoms)
+
+    data = result.to_dict()
+    data["command"] = "structure.build2d"
+    data["ok"] = True
+    data["output"] = str(output_path)
     print(_json_dumps(data))
     return 0
 
@@ -885,6 +934,16 @@ def main() -> int:
     gen.add_argument("source", help="Material name, e.g. NaCl, MgO, Si, Al")
     gen.add_argument("--output", default=None)
 
+    b2d = struct_sub.add_parser("build2d", help="Build a 2D material (graphene/h-BN) with supercell/doping/adsorbate")
+    b2d.add_argument("kind", help="graphene | bn")
+    b2d.add_argument("--supercell", default="1x1", help="Supercell spec, e.g. 3x3")
+    b2d.add_argument("--vacancy", type=int, default=None, help="Atom index to remove")
+    b2d.add_argument("--dopant", action="append", default=None, metavar="ELEMENT@INDEX", help="e.g. N@0 (repeatable)")
+    b2d.add_argument("--adsorb", default=None, metavar="ELEMENT@SITE", help="e.g. O@hollow (site: top|bridge|hollow)")
+    b2d.add_argument("--height", type=float, default=1.5, help="Adsorbate height above site (Å)")
+    b2d.add_argument("--vacuum", type=float, default=15.0)
+    b2d.add_argument("--output", default=None, help="Output CIF path")
+
     ana = struct_sub.add_parser("analyze", help="Analyze structure: formula, cell, pair distances, bond lengths")
     ana.add_argument("source", help="Path to structure file or inline content")
     ana.add_argument("--format", default=None, choices=["cif", "poscar", "xyz", "qe_input", "explicit"])
@@ -998,6 +1057,8 @@ def main() -> int:
                 return cmd_structure_validate(args)
             if args.structure_command == "generate":
                 return cmd_structure_generate(args)
+            if args.structure_command == "build2d":
+                return cmd_structure_build2d(args)
             if args.structure_command == "analyze":
                 return cmd_structure_analyze(args)
             return _error_response("Unknown structure command")

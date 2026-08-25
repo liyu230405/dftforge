@@ -52,7 +52,8 @@ class TestWebBackend:
         assert data["commands"][0]["command"] == "structure.generate"
         assert data["commands"][1]["command"] == "structure.analyze"
         assert data["commands"][0]["args"]["source"] == "NaCl"
-        assert data["commands"][1]["args"]["source"] == "__generated__"
+        # "__generated__" is substituted with the real CIF path at dispatch
+        assert data["commands"][1]["args"]["source"].endswith("generated.cif")
         assert data["commands"][1]["args"]["pair_types"] == "Na-Cl"
         assert len(data["results"]) == 2
         assert data["results"][0]["tool_id"] == "structure.generate"

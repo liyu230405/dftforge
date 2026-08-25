@@ -12,16 +12,129 @@ from dft_forge.tools.registry import registry
 
 register_default_tools()
 
+_CHAT_SKIP_TOOLS = {"help"}
+
+
+def _load_env_file(path: Path) -> None:
+    """Load 'export KEY=VALUE' lines from .env without overwriting real env."""
+    if not path.exists():
+        return
+    import os
+    import re
+
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line)
+        if not m:
+            continue
+        key, val = m.group(1), m.group(2).strip().strip("'\"")
+        if key not in os.environ:
+            os.environ[key] = val
+
+
+class LLMPlanner:
+    """LLM-based planner: natural language → tool-call steps.
+
+    Falls back (returns None) on any error so AgentLoop can use rules.
+    """
+
+    def __init__(self, registry_obj):
+        self.registry = registry_obj
+        self._provider = None
+        self._checked = False
+
+    def _get_provider(self):
+        if self._checked:
+            return self._provider
+        self._checked = True
+        import os
+
+        if os.environ.get("DFT_FORGE_LLM_PROVIDER", "dummy").lower() not in ("openai", "openai_compatible", "openai-compatible"):
+            return None
+        if not os.environ.get("DFT_FORGE_LLM_API_KEY"):
+            return None
+        try:
+            from dft_forge.llm import get_llm_provider
+
+            provider = get_llm_provider()
+            self._provider = provider if hasattr(provider, "chat") else None
+        except Exception:
+            self._provider = None
+        return self._provider
+
+    def _catalog(self) -> str:
+        from dft_forge.compiler import MATERIAL_DB
+
+        lines = []
+        for t in self.registry.list_all():
+            if t.id in _CHAT_SKIP_TOOLS:
+                continue
+            props = t.input_schema.get("properties", {}) if isinstance(t.input_schema, dict) else {}
+            args = ", ".join(f"{k}:{v.get('type', '?')}" for k, v in props.items())
+            lines.append(f"- {t.id} | args: {args} | {t.description}")
+        lines.append(f"Available bulk materials: {', '.join(sorted(MATERIAL_DB))}")
+        return "\n".join(lines)
+
+    def plan(self, message: str, ctx: Dict[str, Any]):
+        """Returns (steps, direct_reply) or (None, None) to fall back to rules."""
+        provider = self._get_provider()
+        if provider is None:
+            return None, None
+        system = f"""You are the planner of DFT-Forge, a DFT computation agent (Quantum ESPRESSO).
+Convert the user's request into a JSON plan of tool calls.
+
+Rules:
+- Reply with ONLY one JSON object, no markdown fences:
+  {{"reply": string, "steps": [{{"tool": string, "args": {{}}, "description": string}}]}}
+- Use ONLY the tool ids listed below; args keys must match exactly.
+- For a full verified calculation of a bulk material prefer graph.run with a template_id
+  (t1_vc_relax = structure optimization, t2_bands = band structure, t2_dos = density of states).
+- For 2D materials (graphene/h-BN, doping, adsorption sites) use structure.build2d,
+  then optionally input.build with the produced CIF path and type.
+- Site scan ("different sites/positions"): emit one structure.build2d step per site
+  (top/bridge/hollow), each with its own output path.
+- Chit-chat / questions about you: empty steps, answer in "reply".
+- descriptions in Chinese. At most 8 steps.
+
+Tools:
+{self._catalog()}"""
+        ctx_summary = {k: ctx.get(k) for k in ("last_structure_source", "last_formula", "last_input_file", "last_job_id") if ctx.get(k)}
+        user = f"Context: {json.dumps(ctx_summary, ensure_ascii=False)}\nUser: {message}"
+        try:
+            raw = provider.chat(system, user)
+            data = json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
+        except Exception:
+            return None, None
+        if not isinstance(data, dict):
+            return None, None
+        known = {t.id for t in self.registry.list_all()}
+        steps = []
+        for s in (data.get("steps") or [])[:8]:
+            if not isinstance(s, dict) or s.get("tool") not in known:
+                return None, None
+            steps.append({
+                "tool": s["tool"],
+                "args": s.get("args") or {},
+                "description": str(s.get("description", ""))[:120],
+            })
+        reply = str(data.get("reply") or "").strip()
+        return steps, (reply if reply and not steps else None)
+
 
 class AgentLoop:
-    """Rule-based planner + executor over the tool registry.
+    """Planner + executor over the tool registry.
 
-    Keeps light session context so follow-up messages can reuse the
-    last structure, input file, and job id.
+    Tries the LLM planner first (if configured via DFT_FORGE_LLM_* env);
+    falls back to deterministic rules. Keeps light session context so
+    follow-up messages can reuse the last structure, input file, and job id.
     """
 
     def __init__(self, registry_obj=None):
         self.registry = registry_obj or registry
+        _load_env_file(Path(__file__).resolve().parent.parent / ".env")
+        self.llm_planner = LLMPlanner(self.registry)
 
     def list_tools(self) -> List[Dict[str, Any]]:
         return [t.to_dict() for t in self.registry.list_all()]
@@ -209,7 +322,16 @@ class AgentLoop:
 
     async def run(self, message: str, session_dir: Path, ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         ctx = dict(ctx or {})
-        steps = self.plan(message, ctx)
+        llm_steps, llm_reply = self.llm_planner.plan(message, ctx)
+        if llm_reply is not None:
+            return {
+                "reply": llm_reply,
+                "commands": [],
+                "results": [],
+                "session_id": ctx.get("session_id", str(uuid.uuid4())),
+                "planner": "llm",
+            }
+        steps = llm_steps if llm_steps is not None else self.plan(message, ctx)
         commands: List[Dict[str, Any]] = []
         results: List[Dict[str, Any]] = []
         reply_parts: List[str] = []
@@ -258,11 +380,21 @@ class AgentLoop:
             if tool_id == "structure.import":
                 args["output"] = str(session_dir / "structure.json")
             elif tool_id == "structure.generate":
-                args.setdefault("output", str(session_dir / "generated.cif"))
+                args["output"] = str(session_dir / "generated.cif")
+            elif tool_id == "structure.build2d":
+                kind = str(args.get("kind", "2d")).replace("/", "_")
+                sc = str(args.get("supercell", "1x1")).replace("x", "_")
+                site = str((args.get("adsorb") or {}).get("site", "")).replace("/", "_")
+                args["output"] = str(session_dir / f"{kind}_{sc}{'_' + site if site else ''}.cif")
+            elif tool_id == "structure.analyze" and str(args.get("output", "")).endswith(".json"):
+                args["output"] = str(session_dir / "structure_analysis.json")
             elif tool_id == "structure.analyze" and args.get("source") == "__generated__":
                 args["source"] = ctx.get("last_structure_source") or args.get("source")
             elif tool_id == "input.build":
                 args["output"] = str(session_dir / "input.in")
+            elif tool_id == "graph.run":
+                if not str(args.get("workdir") or "").strip():
+                    args["workdir"] = str(session_dir / "graphs")
             elif tool_id == "job.submit":
                 args["input"] = str(session_dir / "input.in")
                 args["output"] = str(session_dir / "job_result.json")
@@ -279,7 +411,18 @@ class AgentLoop:
 
             try:
                 result = await self.registry.call(tool_id, args)
-                inner = result.data.get("json") if isinstance(result.data, dict) else result.data
+                inner = None
+                if isinstance(result.data, dict):
+                    if "json" in result.data:
+                        inner = result.data["json"]  # _call_cmd wrapper
+                    elif "returncode" not in result.data:
+                        inner = result.data  # graph tools return raw payloads
+                if inner is None and str(args.get("output", "")).endswith(".json"):
+                    # commands with --output write JSON to file only; stdout is empty
+                    try:
+                        inner = json.loads(Path(args["output"]).read_text())
+                    except (OSError, ValueError):
+                        pass
                 result_dict: Dict[str, Any] = {
                     "tool_id": result.tool_id,
                     "returncode": 0 if result.error is None else 1,
@@ -303,10 +446,39 @@ class AgentLoop:
                         f"已导入结构: {data.get('formula')} | atoms={data.get('natoms')} species={data.get('nspecies')}"
                     )
                     result_dict["viewer"] = viewer_payload
-                elif tool_id == "structure.generate" and data.get("ok") and data.get("output"):
+                elif tool_id == "structure.generate" and data.get("output"):
                     ctx["last_structure_source"] = data.get("output")
                     ctx["last_formula"] = data.get("formula")
-                    reply_parts.append(f"已生成结构: {data.get('formula')} -> {data.get('output')}")
+                    ctx["last_structure_file"] = data.get("output")
+                    reply_parts.append(f"已生成结构: {data.get('formula')}（{len(data.get('species', []))} 种元素，{data.get('natoms')} 原子）\n文件: {data.get('output')}")
+                elif tool_id == "structure.build2d" and data.get("output"):
+                    ctx["last_structure_source"] = data.get("output")
+                    ctx["last_structure_file"] = data.get("output")
+                    ctx["last_formula"] = data.get("formula")
+                    lines = [
+                        f"已构建2D结构: {data.get('formula')} — {data.get('description')}",
+                        f"原子数: {data.get('natoms')} | 最小原子间距: {data.get('min_distance')} Å | 真空层已含",
+                        f"可用吸附位点: top / bridge / hollow（坐标见 JSON）",
+                        f"文件: {data.get('output')}",
+                    ]
+                    reply_parts.append("\n".join(lines))
+                    result_dict["viewer"] = {
+                        "formula": data.get("formula"),
+                        "cif_path": data.get("output"),
+                    }
+                elif tool_id == "graph.run" and data.get("run_id"):
+                    ctx["last_run_id"] = data.get("run_id")
+                    lines = [f"图计算完成: {data.get('state')}  (运行ID: {data.get('run_id')})"]
+                    for nid, info in (data.get("nodes") or {}).items():
+                        line = f"  节点 {nid}: {info.get('state')}"
+                        if info.get("error"):
+                            line += f" | {str(info['error'])[:100]}"
+                        outs = info.get("outputs") or {}
+                        shown = {k: (round(v, 4) if isinstance(v, float) else v) for k, v in outs.items() if not str(k).endswith("stdout")}
+                        if shown:
+                            line += f" | {shown}"
+                        lines.append(line)
+                    reply_parts.append("\n".join(lines))
                 elif tool_id == "input.build" and data.get("input_file"):
                     ctx["last_input_file"] = data.get("input_file")
                     ctx["last_calc_type"] = data.get("calc_type")
@@ -332,15 +504,22 @@ class AgentLoop:
                 elif tool_id == "structure.analyze":
                     analysis = data.get("analysis") or {}
                     formula = analysis.get("formula") or data.get("formula") or ctx.get("last_formula")
-                    pair_distances = analysis.get("pair_distances") or {}
-                    min_pair = analysis.get("minimum_distance_pair")
-                    min_dist = analysis.get("minimum_distance_angstrom")
-                    lines = [f"结构分析: {formula} | atoms={analysis.get('natoms')} species={analysis.get('nspecies')}"]
-                    if min_pair and min_dist is not None:
-                        lines.append(f"最短距离: {min_dist:.4f} Å ({'-'.join(min_pair)})")
-                    for pair, info in pair_distances.items():
-                        lines.append(f"{pair}: count={info.get('count')} min={info.get('min_angstrom')} Å max={info.get('max_angstrom')} Å")
-                    reply_parts.append("\n".join(lines))
+                    if not analysis:
+                        why = data.get("error") or data.get("message") or "结构解析失败（格式或校验问题）"
+                        reply_parts.append(f"结构分析失败: {why}")
+                    else:
+                        pair_distances = analysis.get("pair_distances") or {}
+                        min_pair = analysis.get("minimum_distance_pair")
+                        min_dist = analysis.get("minimum_distance_angstrom")
+                        lines = [f"结构分析: {formula} | atoms={analysis.get('natoms')} species={analysis.get('nspecies')}"]
+                        if min_pair and min_dist is not None:
+                            lines.append(f"最短距离: {min_dist:.4f} Å ({'-'.join(min_pair)})")
+                        for pair, info in pair_distances.items():
+                            lines.append(f"{pair}: count={info.get('count')} min={info.get('min_angstrom')} Å max={info.get('max_angstrom')} Å")
+                        src = args.get("source") if args.get("source") != "__generated__" else ctx.get("last_structure_source")
+                        if src:
+                            lines.append(f"文件: {src}")
+                        reply_parts.append("\n".join(lines))
                 else:
                     reply_parts.append(f"{description}: 完成")
             except Exception as exc:  # noqa: BLE001
@@ -361,4 +540,5 @@ class AgentLoop:
             "commands": commands,
             "results": results,
             "ctx": ctx,
+            "planner": "llm" if llm_steps is not None else "rules",
         }
