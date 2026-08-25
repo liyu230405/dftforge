@@ -120,12 +120,12 @@ class TestVerifyT2Bands:
      JOB DONE.
 """
         nscf_stdout = """
-     convergence has been achieved in   5    iterations
      !
      !    total energy              =     -7.83958234 Ry
      !
-     convergence threshold = 1.0E-8
      number of k points = 512
+     the Fermi energy is     6.5397 ev
+     End of band structure calculation
      JOB DONE.
 """
         # Create bands.xml
@@ -187,12 +187,12 @@ class TestVerifyT2DOS:
      JOB DONE.
 """
         nscf_stdout = """
-     convergence has been achieved in   5    iterations
      !
      !    total energy              =     -7.83958234 Ry
      !
-     convergence threshold = 1.0E-8
      number of k points = 512
+     the Fermi energy is     6.5397 ev
+     End of band structure calculation
      JOB DONE.
 """
         # Create dos.dat

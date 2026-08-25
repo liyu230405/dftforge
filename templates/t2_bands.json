@@ -1,0 +1,56 @@
+{
+  "template_id": "t2_bands",
+  "description": "Band structure: scf -> nscf -> bands.x with cross-node verification",
+  "inputs": {
+    "material": "Si",
+    "ecutwfc": null,
+    "kpoints": null,
+    "nbnd": null,
+    "nkpoints_bands": 100
+  },
+  "outputs": {
+    "scf_energy_ry": "${nodes.scf.outputs.energy_ry}",
+    "n_bands": "${nodes.bands.outputs.n_bands}",
+    "band_gap_ev": "${nodes.bands.outputs.band_gap_ev}"
+  },
+  "nodes": [
+    {
+      "id": "scf",
+      "tool": "qe",
+      "params": {
+        "calc": "scf",
+        "material": "${inputs.material}",
+        "ecutwfc": "${inputs.ecutwfc}",
+        "kpoints": "${inputs.kpoints}"
+      },
+      "depends_on": [],
+      "max_repair_attempts": 2
+    },
+    {
+      "id": "nscf",
+      "tool": "qe",
+      "params": {
+        "calc": "nscf",
+        "material": "${inputs.material}",
+        "ecutwfc": "${inputs.ecutwfc}",
+        "nbnd": "${inputs.nbnd}",
+        "nkpoints_bands": "${inputs.nkpoints_bands}"
+      },
+      "depends_on": ["scf"],
+      "max_repair_attempts": 2
+    },
+    {
+      "id": "bands",
+      "tool": "qe",
+      "params": {
+        "calc": "bands",
+        "material": "${inputs.material}",
+        "nkpoints_bands": "${inputs.nkpoints_bands}",
+        "scf_stdout": "${nodes.scf.outputs.stdout_file}",
+        "nscf_stdout": "${nodes.nscf.outputs.stdout_file}"
+      },
+      "depends_on": ["scf", "nscf"],
+      "max_repair_attempts": 1
+    }
+  ]
+}

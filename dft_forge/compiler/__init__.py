@@ -186,27 +186,77 @@ def get_kpoints(material: str, kpoints_override: Optional[Tuple] = None) -> Tupl
 
 def get_high_symmetry_path(material: str) -> Tuple[np.ndarray, List[str]]:
     """Get high-symmetry k-path for band structure calculations (T2).
-    
+
     Returns (kpoints_array, labels) where kpoints_array is (N, 3) in
     fractional coordinates of the primitive cell.
     """
     db = MATERIAL_DB.get(material)
     if not db:
         raise ValueError(f"Unknown material: {material}")
-    
+
     a = get_lattice_constant_angstrom(material)
     sg = db["space_group"]
-    
+
     # Build primitive structure
     struct = build_atoms(material)
-    
+
     # Use seekpath for high-symmetry path
     kpath = KPathSeek(struct).kpath
-    
+
     kpoints = kpath["kpoints"]
     labels = kpath["path"][0]  # First path segment
-    
+
     return kpoints, labels
+
+
+def get_bandpath_segments(material: str) -> List[List[Tuple[str, tuple]]]:
+    """High-symmetry k-path as a list of continuous segments.
+
+    Each segment is a list of (label, (kx, ky, kz)) pairs in fractional
+    coordinates of the material's input cell. Uses ASE's Bravais-lattice
+    aware bandpath (version-robust, no seekpath dependency).
+    """
+    db = MATERIAL_DB.get(material)
+    if not db:
+        raise ValueError(f"Unknown material: {material}")
+
+    atoms = build_atoms(material)
+    bp = atoms.cell.bandpath()
+    special = bp.special_points
+    segments: List[List[Tuple[str, tuple]]] = []
+    for seg in str(bp.path).split(","):
+        if not seg:
+            continue
+        chain: List[Tuple[str, tuple]] = []
+        for label in seg:
+            if label in ("|", "$"):
+                continue
+            if label not in special:
+                raise ValueError(f"unknown special point '{label}' for {material}")
+            k = special[label]
+            chain.append((label, (float(k[0]), float(k[1]), float(k[2]))))
+        if len(chain) >= 2:
+            segments.append(chain)
+    if not segments:
+        raise ValueError(f"could not build k-path for {material}")
+    return segments
+
+
+_LABEL_MAP = {"G": "GAMMA"}
+
+
+def get_bandpath_kpoints(material: str, npoints: int = 100) -> np.ndarray:
+    """Explicit k-point list along the high-symmetry path, (N, 3) fractional.
+
+    Handles path discontinuities correctly (jumps are preserved, not
+    interpolated across), unlike a naive crystal_b segment rendering.
+    """
+    db = MATERIAL_DB.get(material)
+    if not db:
+        raise ValueError(f"Unknown material: {material}")
+
+    atoms = build_atoms(material)
+    return np.asarray(atoms.cell.bandpath(npoints=max(10, npoints)).kpts)
 
 
 # ── QE input generator ────────────────────────────────────────────────────────
@@ -375,6 +425,7 @@ class QECompiler:
         kpoints: Optional[Tuple] = None,
         conv_thr: float = 1.0e-8,
         nbnd: Optional[int] = None,
+        nkpoints_bands: int = 60,
     ) -> str:
         """Compile a generic SCF or NSCF input file.
         
@@ -450,16 +501,28 @@ class QECompiler:
             lines.append(f"  {sym}  {pos[0]:.8f}  {pos[1]:.8f}  {pos[2]:.8f}")
         lines.append("")
         
-        # CELL_PARAMETERS
-        lines.append("CELL_PARAMETERS (alat=1.0)")
-        for vec in atoms.cell:
-            lines.append(f"  {vec[0]/alat_bohr:.8f}  {vec[1]/alat_bohr:.8f}  {vec[2]/alat_bohr:.8f}")
-        lines.append("")
+        # CELL_PARAMETERS — only for ibrav=0; for ibrav != 0 QE derives the
+        # cell from celldm(1) and emitting both is a fatal "redundant data" error
+        if db["ibrav"] == 0:
+            lines.append("CELL_PARAMETERS (alat=1.0)")
+            for vec in atoms.cell:
+                lines.append(f"  {vec[0]/alat_bohr:.8f}  {vec[1]/alat_bohr:.8f}  {vec[2]/alat_bohr:.8f}")
+            lines.append("")
         
-        # K_POINTS — for NSCF/bands, this is overridden by the caller
-        lines.append("K_POINTS automatic")
-        lines.append(f"  {kpoints[0]} {kpoints[1]} {kpoints[2]}  {kpoints[3]} {kpoints[4]} {kpoints[5]}")
-        lines.append("")
+        # K_POINTS — SCF uses a uniform grid; NSCF runs the high-symmetry
+        # band path so bands.x can post-process the same k-points
+        if calculation == "nscf":
+            kpts_path = get_bandpath_kpoints(material, npoints=nkpoints_bands)
+            lines.append("K_POINTS crystal")
+            lines.append(f"  {len(kpts_path)}")
+            # QE 7.x requires the weight column; equal weights for band paths
+            for k in kpts_path:
+                lines.append(f"  {k[0]:.8f}  {k[1]:.8f}  {k[2]:.8f}  1.0")
+            lines.append("")
+        else:
+            lines.append("K_POINTS automatic")
+            lines.append(f"  {kpoints[0]} {kpoints[1]} {kpoints[2]}  {kpoints[3]} {kpoints[4]} {kpoints[5]}")
+            lines.append("")
         
         content = "\n".join(lines)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -497,23 +560,17 @@ class QECompiler:
         db = MATERIAL_DB[material]
         prefix = prefix or material.lower()
 
-        # Get high-symmetry path from seekpath if not provided
+        # Labeled high-symmetry points from ASE's Bravais-aware bandpath;
+        # npoints=0 tells bands.x to reuse the exact pw.x nscf k-point list
         if kpath is None or klabels is None:
-            try:
-                kpath_arr, klabels_list = get_high_symmetry_path(material)
-                if kpath is None:
-                    kpath = kpath_arr
-                if klabels is None:
-                    klabels = klabels_list
-            except Exception:
-                # Fallback: simple Gamma -> X -> M -> Gamma path for cubic
-                kpath = [
-                    [0.0, 0.0, 0.0],
-                    [0.5, 0.0, 0.5],
-                    [0.5, 0.5, 0.5],
-                    [0.0, 0.0, 0.0],
-                ]
-                klabels = ["GAMMA", "X", "M", "GAMMA"]
+            segments = get_bandpath_segments(material)
+            flat: List = []
+            for seg in segments:
+                for pt in seg:
+                    if not flat or flat[-1][1] != pt[1]:
+                        flat.append(pt)
+            kpath = [coords for _label, coords in flat]
+            klabels = [_LABEL_MAP.get(label, label) for label, _coords in flat]
 
         lines = []
         lines.append("&bands")
@@ -529,7 +586,7 @@ class QECompiler:
                 f"  {kp[0]:.8f}  {kp[1]:.8f}  {kp[2]:.8f}  {label}"
             )
         lines.append("")
-        lines.append(f"{nkpoints}")
+        lines.append("0")
         lines.append("")
 
         content = "\n".join(lines)

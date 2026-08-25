@@ -1,22 +1,24 @@
 # DFT-Forge
 
-**Deterministic Quantum ESPRESSO Scientific Computing Agent**
+**General-purpose scientific computation agent** — a CatGo-inspired graph runtime with Quantum ESPRESSO as its first engine.
 
 > "LLM 只决定做什么；确定性程序决定输入文件如何生成、程序如何运行、结果如何解析和是否可信。"
 
 ## What is DFT-Forge?
 
-DFT-Forge is an agent-friendly CLI and web toolchain for Quantum ESPRESSO (QE) DFT calculations. It is designed to be used by coding agents, chat UIs, and researchers who want structured, inspectable, and recoverable materials-computation workflows:
+DFT-Forge is an agent-friendly CLI and web toolchain for scientific computing workflows. It is designed to be used by coding agents, chat UIs, and researchers who want structured, inspectable, and recoverable computation workflows:
 
+- **Graph runtime** (CatGo-style): JSON-declared DAG templates, node/run state machines, dependency-driven scheduling, crash-safe SQLite persistence, repair & retry.
+- **Engine-agnostic core**: the runtime knows nothing about DFT; QE is one engine (`engines/qe.py`). New engines (VASP/ABINIT/LAMMPS/…) plug in as tools.
+- **User-supplied compute (BYOC)**: local, SSH, or HPC schedulers (SLURM/PBS) — the LLM never generates shell/SSH/scheduler strings.
 - **Agent-friendly CLI**: every command does one thing and outputs JSON.
-- **Deterministic compiler**: generates QE input files using ASE/pymatgen/spglib/seekpath.
-- **Deterministic executor**: runs QE with resource limits and full output preservation.
-- **Deterministic parser**: extracts physical quantities from stdout/XML.
-- **Deterministic verifier**: checks physical convergence, not just exit codes.
+- **Deterministic kernels**: compiler (input generation), executor, parser, verifier — no LLM in the execution path.
 - **Evidence ledger**: SQLite-backed audit trail of runs, failures, and recovery actions.
 - **Tool registry + MCP server**: structured tools that external agents can call.
 
 This project is independent and written from scratch. It does not copy benchmark runners from other repos as its core identity; those repos are used only as external references.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full layered design and the "adding a new engine" guide.
 
 ## Quick Start
 
@@ -52,34 +54,41 @@ python -m dft_forge.web
 ```
 dft-forge/
 ├── dft_forge/
-│   ├── protocol/        # TaskSpec, WorkflowIR, PlanPatch, EvidenceBundle (schemas)
-│   ├── compiler/        # Deterministic QE input generation
-│   ├── executor.py      # Pluggable executor abstraction
-│   ├── parser.py        # QE stdout/XML parsing
-│   ├── verifier.py      # Physical convergence checks
-│   ├── catalog/         # Material profiles and task definitions
-│   ├── runner.py        # Deterministic task execution
-│   ├── recovery.py      # Failure classification and bounded recovery
-│   ├── ledger.py        # SQLite evidence ledger
-│   ├── structure.py     # Structure import/validation
-│   ├── llm.py           # LLM provider abstraction
-│   ├── planner.py       # WorkflowIR generation
-│   ├── agent.py         # Agent solve loop
-│   ├── tools/           # Tool registry and tool definitions
-│   ├── mcp/             # MCP server for external agents
-│   ├── web/             # FastAPI chat backend + frontend
-│   └── cli.py           # Agent-friendly CLI entry points
-├── assets/pseudos/      # Pseudopotential files
-├── tests/               # Pytest test suite
-├── scripts/             # Utility scripts
-├── outputs/             # Experiment outputs
-└── work/                # Working files
+│   ├── runtime/        # Graph runtime core (engine-agnostic): states, graph
+│   │                   # templates, scheduler, SQLite store, GraphEngine facade
+│   ├── hpc/            # BYOC compute layer: runner abstraction, SLURM/PBS
+│   │                   # schedulers, sbatch/qsub script rendering
+│   ├── engines/        # Node tools per engine (qe.py: vc-relax/scf/nscf/bands/dos)
+│   ├── protocol/       # TaskSpec, WorkflowIR, PlanPatch, EvidenceBundle (schemas)
+│   ├── compiler/       # Deterministic QE input generation
+│   ├── executor.py     # Pluggable executor abstraction
+│   ├── parser.py       # QE stdout/XML parsing
+│   ├── verifier.py     # Physical convergence checks
+│   ├── catalog/        # Material profiles and task definitions
+│   ├── runner.py       # Deterministic task execution
+│   ├── recovery.py     # Failure classification and bounded recovery
+│   ├── ledger.py       # SQLite evidence ledger
+│   ├── structure.py    # Structure import/validation
+│   ├── llm.py          # LLM provider abstraction
+│   ├── planner.py      # WorkflowIR generation
+│   ├── agent.py        # Agent solve loop
+│   ├── tools/          # Tool registry and tool definitions
+│   ├── mcp/            # MCP server for external agents
+│   ├── web/            # FastAPI chat backend + frontend
+│   └── cli.py          # Agent-friendly CLI entry points
+├── templates/          # Graph templates (JSON DAGs): t1_vc_relax, t2_bands, t2_dos
+├── assets/pseudos/     # Pseudopotential files
+├── tests/              # Pytest test suite (300 tests)
+├── scripts/            # Utility scripts
+├── outputs/            # Experiment outputs
+└── work/               # Working files
 ```
 
 ## Supported Ranges
 
 ### Materials
-- Built-in materials: Si, Al, MgO
+- Library: 57 materials (MP structures + hand-tuned Si/Al/NaCl/MgO), GBRV USPP PBE v1.5 pseudopotentials for 65 elements
+- Dynamic generation for arbitrary formulas via ASE prototypes
 - User-provided structures: CIF, POSCAR/CONTCAR, XYZ, QE input, explicit lattice+coordinates
 
 ### Calculations

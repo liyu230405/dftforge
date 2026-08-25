@@ -197,6 +197,44 @@ class ScientificVerifier:
         
         return report
 
+    def verify_nscf(self, stdout: str) -> ConvergenceReport:
+        """Verify NSCF (band-structure) run: single diagonalization, no SCF loop.
+
+        Success markers: 'End of band structure calculation' + 'JOB DONE.'
+        plus a Fermi energy (metals) or highest occupied level (insulators).
+        """
+        report = ConvergenceReport(passed=True)
+
+        if not stdout or len(stdout) < 50:
+            report.passed = False
+            report.failure_reasons.append("No stdout provided")
+            report.checks["nscf"] = {"pass": False}
+            report.summary = "NSCF NOT ok: no output"
+            return report
+
+        band_calc_done = "End of band structure calculation" in stdout
+        job_done = "JOB DONE" in stdout
+        has_fermi = ("the Fermi energy is" in stdout) or ("highest occupied, lowest unoccupied level" in stdout) or ("highest occupied level" in stdout)
+
+        if not band_calc_done:
+            report.passed = False
+            report.failure_reasons.append("NSCF diagonalization did not complete")
+        if not has_fermi:
+            report.passed = False
+            report.failure_reasons.append("No Fermi/highest-occupied energy in NSCF output")
+
+        report.checks["nscf"] = {
+            "pass": report.passed,
+            "band_calc_done": band_calc_done,
+            "job_done": job_done,
+            "fermi_ev": QEParser.parse_scf(stdout).fermi_energy_ev,
+        }
+        report.summary = (
+            "NSCF diagonalization completed" if report.passed
+            else "NSCF failed: " + "; ".join(report.failure_reasons)
+        )
+        return report
+
     def verify_t2_bands(
         self,
         scf_stdout: str,
@@ -214,11 +252,11 @@ class ScientificVerifier:
         report.checks["scf"] = scf_report.checks.get("scf", {})
         
         # Check NSCF
-        nscf_report = self.verify_scf(nscf_stdout)
+        nscf_report = self.verify_nscf(nscf_stdout)
         if not nscf_report.passed:
             report.passed = False
-            report.failure_reasons.append("NSCF stage did not converge")
-        report.checks["nscf"] = nscf_report.checks.get("scf", {})
+            report.failure_reasons.append("NSCF stage did not pass")
+        report.checks["nscf"] = nscf_report.checks.get("nscf", {})
         
         # Check bands.xml exists
         if not bands_xml.exists():

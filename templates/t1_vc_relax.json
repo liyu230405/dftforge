@@ -1,0 +1,27 @@
+{
+  "template_id": "t1_vc_relax",
+  "description": "Structure optimization (pw.x vc-relax) for any library material",
+  "inputs": {
+    "material": "Si",
+    "ecutwfc": null,
+    "kpoints": null
+  },
+  "outputs": {
+    "energy_ry": "${nodes.vc_relax.outputs.energy_ry}",
+    "a_angstrom": "${nodes.vc_relax.outputs.a_angstrom}"
+  },
+  "nodes": [
+    {
+      "id": "vc_relax",
+      "tool": "qe",
+      "params": {
+        "calc": "vc-relax",
+        "material": "${inputs.material}",
+        "ecutwfc": "${inputs.ecutwfc}",
+        "kpoints": "${inputs.kpoints}"
+      },
+      "depends_on": [],
+      "max_repair_attempts": 2
+    }
+  ]
+}

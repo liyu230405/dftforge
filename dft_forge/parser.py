@@ -231,60 +231,86 @@ class QEParser:
 
     @staticmethod
     def parse_bands(xml_path: Path) -> ParsedBands:
-        """Parse band structure from QE bands XML output."""
+        """Parse band structure from QE XML (works with QE 6.x and 7.x schemas).
+
+        QE 7.x: no nks/nbnd attributes on <band_structure>, eigenvalues and
+        fermi_energy in Hartree atomic units.
+        """
         result = ParsedBands()
-        
+        HA_TO_EV = 27.211386245988
+
         if not xml_path.exists():
             return result
-        
+
         try:
             tree = ET.parse(xml_path)
             root = tree.getroot()
             ns = {'qes': 'http://www.quantum-espresso.org/ns/qes/qes-1.0'}
-            
-            # Get band structure data
-            bs_elem = root.find('.//qes:band_structure', ns)
-            if bs_elem is not None:
-                # Number of bands and kpoints
-                nks = int(bs_elem.get('nks', 0))
-                nbnd = int(bs_elem.get('nbnd', 0))
-                result.n_kpoints = nks
-                result.n_bands = nbnd
-                
-                # Parse eigenvalues
-                eigenvalues = []
-                for ks_elem in bs_elem.findall('qes:ks_energies', ns):
-                    evals = []
-                    for e in ks_elem.findall('qes:eigenvalues', ns):
-                        vals = [float(x) for x in e.text.split()] if e.text else []
-                        evals.append(vals)
-                    if evals:
-                        eigenvalues.append(evals[0])
-                
-                if eigenvalues:
-                    result.eigenvalues = np.array(eigenvalues) * RY_TO_EV
-                    
-                    # Find Fermi level from highest occupied at Gamma
-                    # Simple heuristic: find gap or identify metallic
-                    if len(eigenvalues) > 0:
-                        all_evals = result.eigenvalues.flatten()
-                        # Sort and look for gaps
-                        sorted_evals = np.sort(all_evals)
-                        # Fermi level ≈ highest occupied band
-                        result.fermi_energy_ev = sorted_evals[len(sorted_evals) // 2]
-                        
-                        # Check for band gap (simple check: look for gap > 0.1 eV)
-                        diffs = np.diff(sorted_evals)
-                        large_gaps = np.where(diffs > 0.1)[0]
-                        if len(large_gaps) > 0:
-                            result.band_gap_ev = float(diffs[large_gaps[0]])
-                        else:
-                            result.is_metal = True
-                            result.band_gap_ev = 0.0
-        
+
+            def find_all(elem, local: str):
+                # QE 7.x emits only the root with the qes: prefix; children
+                # are namespace-less — try both spellings
+                found = elem.findall(f'.//{{{ns["qes"]}}}{local}')
+                if found:
+                    return found
+                return elem.findall(f'.//{local}')
+
+            def find_one(elem, local: str):
+                found = find_all(elem, local)
+                return found[0] if found else None
+
+            bs_elem = find_one(root, 'band_structure')
+            if bs_elem is None:
+                return result
+
+            # Parse eigenvalues (Hartree in QE 6.x/7.x data-file-schema)
+            eigenvalues = []
+            for ks_elem in find_all(bs_elem, 'ks_energies'):
+                for e in find_all(ks_elem, 'eigenvalues'):
+                    vals = [float(x) for x in e.text.split()] if e.text else []
+                    if vals:
+                        eigenvalues.append(vals)
+
+            if not eigenvalues:
+                return result
+
+            result.eigenvalues = np.array(eigenvalues) * HA_TO_EV
+            result.n_kpoints = int(bs_elem.get('nks', 0)) or len(eigenvalues)
+            result.n_bands = int(bs_elem.get('nbnd', 0)) or len(eigenvalues[0])
+
+            # Fermi level from XML (Hartree) — fallback: highest occupied
+            fermi_elem = find_one(root, 'fermi_energy')
+            hoc_elem = find_one(root, 'highestOccupiedLevel')
+            fermi_ev = None
+            if fermi_elem is not None and fermi_elem.text:
+                fermi_ev = float(fermi_elem.text) * HA_TO_EV
+            elif hoc_elem is not None and hoc_elem.text:
+                fermi_ev = float(hoc_elem.text) * HA_TO_EV
+
+            all_evals = result.eigenvalues.flatten()
+            if fermi_ev is None:
+                fermi_ev = float(np.max(all_evals) / 2.0)
+            result.fermi_energy_ev = fermi_ev
+
+            # Gap via Fermi level: VBM = max eval <= fermi, CBM = min eval > fermi
+            occupied = all_evals[all_evals <= fermi_ev + 1e-9]
+            empty = all_evals[all_evals > fermi_ev + 1e-9]
+            if len(occupied) == 0 or len(empty) == 0:
+                result.band_gap_ev = 0.0
+                result.is_metal = False
+            else:
+                vbm = float(np.max(occupied))
+                cbm = float(np.min(empty))
+                if cbm > vbm:
+                    result.band_gap_ev = cbm - vbm
+                    result.is_metal = False
+                else:
+                    result.band_gap_ev = 0.0
+                    result.is_metal = True
+
         except Exception:
             pass
-        
+
         return result
 
     @staticmethod
@@ -376,10 +402,17 @@ class QEParser:
     def _compute_cell_constants(
         cell_vectors: np.ndarray, ibrav: int = 0
     ) -> tuple:
-        """Compute lattice constants from Cartesian cell vectors."""
+        """Compute lattice constants from Cartesian cell vectors.
+
+        For ibrav=0 (free cell) the input is often a primitive fcc/bcc cell;
+        detect it from vector angles so `a` matches the conventional cubic
+        lattice constant users expect (e.g. NaCl rock-salt ~5.6 A, not 4.0 A).
+        """
         if ibrav in (1, 2, 3):  # Cubic
             if ibrav == 2:  # FCC: conventional cubic constant = norm * sqrt(2)
                 alat = np.linalg.norm(cell_vectors[0]) * np.sqrt(2)
+            elif ibrav == 3:  # BCC: conventional cubic constant = norm * sqrt(4/3)
+                alat = np.linalg.norm(cell_vectors[0]) * 2.0 / np.sqrt(3.0)
             else:
                 alat = np.linalg.norm(cell_vectors[0])
             return (alat, alat, alat)
@@ -387,11 +420,45 @@ class QEParser:
             a = np.linalg.norm(cell_vectors[0])
             c = np.linalg.norm(cell_vectors[2])
             return (a, a, c)
+        elif ibrav == 0:
+            angles = QEParser._cell_angles_deg(cell_vectors)
+            if angles is not None:
+                a_n = np.linalg.norm(cell_vectors[0])
+                b_n = np.linalg.norm(cell_vectors[1])
+                c_n = np.linalg.norm(cell_vectors[2])
+                lengths_equal = (
+                    abs(a_n - b_n) / a_n < 0.02 and abs(a_n - c_n) / a_n < 0.02
+                )
+                if lengths_equal:
+                    # fcc primitive: all inter-vector angles 60 deg
+                    if all(abs(ang - 60.0) < 2.0 for ang in angles):
+                        conv = a_n * np.sqrt(2)
+                        return (conv, conv, conv)
+                    # bcc primitive: all inter-vector angles ~109.47 deg
+                    if all(abs(ang - 109.47) < 2.0 for ang in angles):
+                        conv = a_n * 2.0 / np.sqrt(3.0)
+                        return (conv, conv, conv)
+            a = np.linalg.norm(cell_vectors[0])
+            b = np.linalg.norm(cell_vectors[1])
+            c = np.linalg.norm(cell_vectors[2])
+            return (a, b, c)
         else:
             a = np.linalg.norm(cell_vectors[0])
             b = np.linalg.norm(cell_vectors[1])
             c = np.linalg.norm(cell_vectors[2])
             return (a, b, c)
+
+    @staticmethod
+    def _cell_angles_deg(cell_vectors: np.ndarray) -> Optional[tuple]:
+        """Inter-vector angles (alpha, beta, gamma) in degrees, or None if degenerate."""
+        a1, a2, a3 = cell_vectors
+        norms = [np.linalg.norm(v) for v in (a1, a2, a3)]
+        if min(norms) < 1e-8:
+            return None
+        alpha = np.degrees(np.arccos(np.clip(np.dot(a2, a3) / (norms[1] * norms[2]), -1, 1)))
+        beta = np.degrees(np.arccos(np.clip(np.dot(a1, a3) / (norms[0] * norms[2]), -1, 1)))
+        gamma = np.degrees(np.arccos(np.clip(np.dot(a1, a2) / (norms[0] * norms[1]), -1, 1)))
+        return (alpha, beta, gamma)
 
     @staticmethod
     def save_parsed(result: Any, output_file: Path) -> None:

@@ -1,0 +1,52 @@
+{
+  "template_id": "t2_dos",
+  "description": "Density of states: scf -> nscf -> dos.x",
+  "inputs": {
+    "material": "Si",
+    "ecutwfc": null,
+    "kpoints": null,
+    "nbnd": null
+  },
+  "outputs": {
+    "scf_energy_ry": "${nodes.scf.outputs.energy_ry}",
+    "dos_at_fermi": "${nodes.dos.outputs.dos_at_fermi}"
+  },
+  "nodes": [
+    {
+      "id": "scf",
+      "tool": "qe",
+      "params": {
+        "calc": "scf",
+        "material": "${inputs.material}",
+        "ecutwfc": "${inputs.ecutwfc}",
+        "kpoints": "${inputs.kpoints}"
+      },
+      "depends_on": [],
+      "max_repair_attempts": 2
+    },
+    {
+      "id": "nscf",
+      "tool": "qe",
+      "params": {
+        "calc": "nscf",
+        "material": "${inputs.material}",
+        "ecutwfc": "${inputs.ecutwfc}",
+        "nbnd": "${inputs.nbnd}"
+      },
+      "depends_on": ["scf"],
+      "max_repair_attempts": 2
+    },
+    {
+      "id": "dos",
+      "tool": "qe",
+      "params": {
+        "calc": "dos",
+        "material": "${inputs.material}",
+        "scf_stdout": "${nodes.scf.outputs.stdout_file}",
+        "nscf_stdout": "${nodes.nscf.outputs.stdout_file}"
+      },
+      "depends_on": ["scf", "nscf"],
+      "max_repair_attempts": 1
+    }
+  ]
+}

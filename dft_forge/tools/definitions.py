@@ -333,3 +333,7 @@ def register_default_tools() -> None:
 
     for tool in tools:
         registry.register(tool)
+
+    from dft_forge.tools.graph_tools import register_graph_tools
+
+    register_graph_tools(registry)
