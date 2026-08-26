@@ -229,7 +229,8 @@ class QECalcTool:
             from dft_forge.compiler import build_atoms
 
             src = atoms if atoms is not None else build_atoms(material)
-            bp = src.cell.bandpath(npoints=max(10, int(params.get("nkpoints_bands", 100))))
+            pbc = tuple(bool(b) for b in src.pbc) if len(src.pbc) == 3 else None
+            bp = src.cell.bandpath(npoints=max(10, int(params.get("nkpoints_bands", 100))), pbc=pbc)
             x, X, labels = bp.get_linear_kpoint_axis()
             outputs["k_axis"] = [round(float(v), 4) for v in x]
             outputs["k_ticks"] = [round(float(v), 4) for v in X]

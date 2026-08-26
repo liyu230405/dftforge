@@ -215,6 +215,15 @@ class TestCompileDOSInput:
         assert "degauss = 0.05" in content
         assert "DeltaE = 0.01" in content
 
+    def test_compile_dos_input_trailing_newline(self, tmp_path, pseudo_dir):
+        # QE 7.5 dos.x aborts with "reading dos namelist" when the file
+        # ends with "/" and no final newline
+        compiler = QECompiler(pseudo_dir=pseudo_dir)
+        out_file = tmp_path / "si_dos.in"
+        content = compiler.compile_dos_input("Si", out_file, prefix="si")
+        assert content.endswith("/\n")
+        assert out_file.read_text().endswith("/\n")
+
     def test_compile_dos_input_with_range(self, tmp_path, pseudo_dir):
         compiler = QECompiler(pseudo_dir=pseudo_dir)
         out_file = tmp_path / "al_dos.in"

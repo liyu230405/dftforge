@@ -159,6 +159,19 @@ def _structure_build2d(args: dict) -> dict:
     return _call_cmd(cmd_structure_build2d, ns)
 
 
+def _structure_dope(args: dict) -> dict:
+    from dft_forge.cli import cmd_structure_dope
+    import argparse
+    ns = argparse.Namespace(
+        source=args.get("source", ""),
+        element=args.get("element", ""),
+        supercell=args.get("supercell", "2x2x2"),
+        index=int(args.get("index", 0) or 0),
+        output=args.get("output"),
+    )
+    return _call_cmd(cmd_structure_dope, ns)
+
+
 def _structure_analyze(args: dict) -> dict:
     from dft_forge.cli import cmd_structure_analyze
     import argparse
@@ -199,16 +212,20 @@ def register_default_tools() -> None:
             id="structure.build2d",
             name="Build 2D Material",
             description=(
-                "Build a 2D material (graphene or h-BN monolayer) with optional supercell, "
-                "doping, vacancy, and adsorbate on top/bridge/hollow site. "
-                "Example: {kind: 'graphene', supercell: '4x4', dopants: [{index: 0, element: 'N'}], "
-                "adsorb: {element: 'O', site: 'hollow'}}"
+                "Build a 2D monolayer with optional supercell, doping, vacancy, and "
+                "adsorbate on top/bridge/hollow site. Kinds: graphene, bn (h-BN), "
+                "mos2, ws2, mose2, wse2, mote2, wte2 (TMD monolayers). "
+                "Example: {kind: 'mos2', supercell: '2x2', dopants: [{index: 0, element: 'Re'}], "
+                "adsorb: {element: 'H', site: 'top'}}"
             ),
             category="structure",
             input_schema={
                 "type": "object",
                 "properties": {
-                    "kind": {"type": "string", "enum": ["graphene", "bn"]},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["graphene", "bn", "mos2", "ws2", "mose2", "wse2", "mote2", "wte2"],
+                    },
                     "supercell": {"type": "string", "description": "e.g. '3x3' or '4x4'"},
                     "vacancy": {"type": "integer", "description": "atom index to remove"},
                     "dopants": {
@@ -233,6 +250,28 @@ def register_default_tools() -> None:
                 "required": ["kind"],
             },
             execute_fn=_structure_build2d,
+        ),
+        ToolEntry(
+            id="structure.dope",
+            name="Dope Bulk Crystal",
+            description=(
+                "Dope a bulk crystal: build supercell of source (material name, formula "
+                "like CaTiO3, or CIF path), substitute one atom with the dopant element. "
+                "Example: {source: 'Si', element: 'P', supercell: '2x2x2'}"
+            ),
+            category="structure",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "material name, formula, or structure file path"},
+                    "element": {"type": "string", "description": "dopant element, e.g. P"},
+                    "supercell": {"type": "string", "description": "e.g. '2x2x2' (larger = lower concentration)"},
+                    "index": {"type": "integer", "description": "atom index to substitute"},
+                    "output": {"type": "string"},
+                },
+                "required": ["source", "element"],
+            },
+            execute_fn=_structure_dope,
         ),
         ToolEntry(
             id="structure.import",

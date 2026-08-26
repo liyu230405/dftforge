@@ -32,3 +32,4 @@ nacl_calc/
 si_bands_calc/
 work/
 .impeccable/
+.DS_Store

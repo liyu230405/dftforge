@@ -73,6 +73,29 @@ def _read_text(path: Any) -> Optional[str]:
         return None
 
 
+def _viewer_payload_from_file(path: Any) -> Optional[Dict[str, Any]]:
+    """CIF viewer payload from a structure file path."""
+    cif = _read_text(path)
+    if not cif:
+        return None
+    natoms = None
+    formula = None
+    try:
+        from ase.io import read as ase_read
+
+        atoms = ase_read(str(path))
+        natoms = len(atoms)
+        formula = atoms.get_chemical_formula()
+    except Exception:
+        pass
+    return {
+        "formula": formula or Path(str(path)).stem,
+        "cif": cif,
+        "natoms": natoms,
+        "source": str(path),
+    }
+
+
 def _viewer_payload_for_material(material: Any) -> Optional[Dict[str, Any]]:
     """CIF viewer payload for a material key or raw formula (e.g. CaTiO3)."""
     if not material or not str(material).strip():
@@ -218,13 +241,24 @@ Rules:
   {{"reply": string, "steps": [{{"tool": string, "args": {{}}, "description": string}}]}}
 - Use ONLY the tool ids listed below; args keys must match exactly.
 - ANY chemical formula works directly: pass it as inputs.material of graph.run
-  (e.g. CaTiO3, SrTiO3, GaAs). Unknown formulas are auto-built into prototype
-  structures — NEVER ask the user to import a file for a plain bulk crystal.
+  (e.g. CaTiO3, SrTiO3, GaAs, MoS2). Unknown formulas are auto-built into
+  prototype structures — NEVER ask the user to import a file for a plain
+  bulk crystal. Bulk MoS2/WS2/MoSe2/WSe2 build the real 2H layered crystal.
 - For a full verified calculation prefer graph.run with a template_id
   (t1_vc_relax = structure optimization, t2_bands = band structure, t2_dos = density of states).
   "算 X 的能带" → one graph.run t2_bands step; combining several targets emits one step each.
-- For 2D materials (graphene/h-BN, doping, adsorption sites) use structure.build2d,
-  then optionally input.build with the produced CIF path and type.
+- 2D monolayers (单层/monolayer/二维/2D intent, or 石墨烯/graphene, 氮化硼/h-BN,
+  MoS2/WS2/MoSe2/WSe2 单层): FIRST structure.build2d with kind 'graphene'|'bn'|
+  'mos2'|'ws2'|'mose2'|'wse2' plus supercell/dopants/adsorb as requested,
+  THEN graph.run with template_id and empty inputs — omit inputs.material so the
+  built structure chains automatically. Kind matches the material named.
+- Bulk doping ("P掺杂Si", "B-doped diamond", X掺杂Y): structure.dope
+  with source (host material/formula), element (dopant), supercell '2x2x2'
+  (default; use '3x3x3' for lower concentration), then graph.run with
+  empty inputs — the doped structure chains automatically.
+- 2D doping/adsorption (N掺杂石墨烯, O吸附在MoS2): structure.build2d with
+  dopants/adsorb args (supercell '3x3' typical for doping), then graph.run
+  with empty inputs.
 - Site scan ("different sites/positions"): emit one structure.build2d step per site
   (top/bridge/hollow), each with its own output path.
 - Chit-chat / questions about you: empty steps, answer in "reply".
@@ -338,6 +372,44 @@ class AgentLoop:
         wants_ledger = any(k in lower for k in ["账本", "ledger", "历史", "history", "record", "查询", "query", "记录", "日志"])
         wants_doctor = any(k in lower for k in ["环境", "env", "doctor", "诊断", "diagnose", "依赖", "dependencies", "安装", "software"])
 
+        # ── 2D monolayer / doping / adsorption intents ────────────────────
+        # Graphene/h-BN are monolayers by name; TMDs (MoS2...) have bulk
+        # forms too, so they need an explicit 单层/2D keyword to build 2D.
+        _tmd_map = {
+            "mos2": "mos2", "二硫化钼": "mos2", "ws2": "ws2",
+            "mose2": "mose2", "wse2": "wse2", "mote2": "mote2", "wte2": "wte2",
+        }
+        wants_2d = any(k in lower for k in ("单层", "monolayer", "二维", "2d"))
+        build2d_kind = None
+        if any(k in lower for k in ("石墨烯", "graphene")):
+            build2d_kind = "graphene"
+        elif any(k in lower for k in ("氮化硼", "h-bn", "hbn")) or re.search(r"\bbn\b", lower):
+            build2d_kind = "bn"
+        elif wants_2d or "吸附" in message or "adsorb" in lower:
+            for key, kind in _tmd_map.items():
+                if key in lower:
+                    build2d_kind = kind
+                    break
+
+        dopant_el = None
+        m = re.search(r"([A-Z][a-z]?)\s*掺杂", message) or re.search(r"掺杂\s*([A-Z][a-z]?)", message)
+        if m is None:
+            m = re.search(r"([A-Z][a-z]?)[-\s]doped", lower)
+        if m:
+            dopant_el = m.group(1)
+
+        ads_el = None
+        ads_site = None
+        m = re.search(r"([A-Z][a-z]?)\s*吸附", message)
+        if m:
+            ads_el = m.group(1)
+            if "bridge" in lower or "桥" in message:
+                ads_site = "bridge"
+            elif "hollow" in lower or "洞" in message or "六元环" in message:
+                ads_site = "hollow"
+            else:
+                ads_site = "top"
+
         # If analyze is requested, do not auto-trigger submit/build unless explicitly requested
         if wants_analyze:
             wants_submit = False
@@ -366,6 +438,54 @@ class AgentLoop:
         ):
             graph_targets.append("t1_vc_relax")
 
+        # ── 2D / doped structures: build first, then a chained graph.run ──
+        # (the execution loop injects the built CIF into graph.run steps
+        #  that name no material)
+        if (
+            (build2d_kind or dopant_el)
+            and not strong_analyze
+            and not wants_import
+            and not wants_generate
+            and not (wants_analyze and not graph_targets)
+        ):
+            build_steps: List[Dict[str, Any]] = []
+            if build2d_kind:
+                bargs: Dict[str, Any] = {"kind": build2d_kind}
+                if dopant_el or ads_el:
+                    bargs["supercell"] = "3x3"
+                if dopant_el:
+                    bargs["dopants"] = [{"index": 0, "element": dopant_el}]
+                if ads_el:
+                    bargs["adsorb"] = {"element": ads_el, "site": ads_site or "top"}
+                kind_label = {"graphene": "石墨烯", "bn": "h-BN", "mos2": "MoS2", "ws2": "WS2",
+                              "mose2": "MoSe2", "wse2": "WSe2"}.get(build2d_kind, build2d_kind)
+                mods = []
+                if dopant_el:
+                    mods.append(f"{dopant_el}掺杂")
+                if ads_el:
+                    mods.append(f"{ads_el}吸附({ads_site})")
+                desc = f"构建{kind_label}单层" + ("".join(mods) if mods else "")
+                build_steps.append({"tool": "structure.build2d", "args": bargs, "description": desc})
+            elif dopant_el:
+                host = formula_hint or material_hint
+                if host:
+                    build_steps.append({
+                        "tool": "structure.dope",
+                        "args": {"source": host, "element": dopant_el, "supercell": "2x2x2"},
+                        "description": f"构建{dopant_el}掺杂{host}超胞",
+                    })
+            if build_steps:
+                if graph_targets:
+                    label = {"t2_bands": "能带结构", "t2_dos": "态密度", "t1_vc_relax": "结构优化"}
+                    name = build2d_kind or f"{dopant_el}掺杂{formula_hint or ''}"
+                    for tid in graph_targets:
+                        build_steps.append({
+                            "tool": "graph.run",
+                            "args": {"template_id": tid, "inputs": {}},
+                            "description": f"{name} {label[tid]}",
+                        })
+                return build_steps
+
         if graph_targets and formula_hint and not strong_analyze and not (wants_import or wants_generate):
             label = {"t2_bands": "能带结构", "t2_dos": "态密度", "t1_vc_relax": "结构优化"}
             for tid in graph_targets:
@@ -380,7 +500,16 @@ class AgentLoop:
         if wants_analyze:
             source = ctx.get("last_structure_file") or ctx.get("last_structure_source")
             if not source:
-                if wants_generate or material_hint or formula_hint:
+                if build2d_kind:
+                    kind_label = {"graphene": "石墨烯", "bn": "h-BN", "mos2": "MoS2", "ws2": "WS2",
+                                  "mose2": "MoSe2", "wse2": "WSe2"}.get(build2d_kind, build2d_kind)
+                    steps.append({
+                        "tool": "structure.build2d",
+                        "args": {"kind": build2d_kind},
+                        "description": f"构建{kind_label}单层",
+                    })
+                    source = "__generated__"
+                elif wants_generate or material_hint or formula_hint:
                     steps.append({
                         "tool": "structure.generate",
                         "args": {"source": material_hint or formula_hint or "Si"},
@@ -407,11 +536,20 @@ class AgentLoop:
 
         # Intent: generate structure
         elif wants_generate and not wants_analyze:
-            steps.append({
-                "tool": "structure.generate",
-                "args": {"source": material_hint or "Si"},
-                "description": f"Generate {material_hint or 'Si'} structure",
-            })
+            if build2d_kind:
+                kind_label = {"graphene": "石墨烯", "bn": "h-BN", "mos2": "MoS2", "ws2": "WS2",
+                              "mose2": "MoSe2", "wse2": "WSe2"}.get(build2d_kind, build2d_kind)
+                steps.append({
+                    "tool": "structure.build2d",
+                    "args": {"kind": build2d_kind},
+                    "description": f"构建{kind_label}单层",
+                })
+            else:
+                steps.append({
+                    "tool": "structure.generate",
+                    "args": {"source": material_hint or "Si"},
+                    "description": f"Generate {material_hint or 'Si'} structure",
+                })
 
         # Intent: build QE input
         if wants_build:
@@ -540,6 +678,9 @@ class AgentLoop:
         results: List[Dict[str, Any]] = []
         reply_parts: List[str] = []
         chain: List[Dict[str, Any]] = []
+        # structure built earlier in this plan (build2d/dope/generate) —
+        # auto-chained into a following graph.run that names no material
+        built_structure: Optional[str] = None
 
         for idx, step in enumerate(steps):
             tool_id = step.get("tool")
@@ -605,15 +746,26 @@ class AgentLoop:
                 sc = str(args.get("supercell", "1x1")).replace("x", "_")
                 site = str((args.get("adsorb") or {}).get("site", "")).replace("/", "_")
                 args["output"] = str(session_dir / f"{kind}_{sc}{'_' + site if site else ''}.cif")
+            elif tool_id == "structure.dope":
+                src = re.sub(r"[^A-Za-z0-9]", "_", str(args.get("source", "mat")))[:20]
+                el = re.sub(r"[^A-Za-z0-9]", "", str(args.get("element", "X")))[:3]
+                args["output"] = str(session_dir / f"doped_{src}_{el}.cif")
             elif tool_id == "structure.analyze" and str(args.get("output", "")).endswith(".json"):
                 args["output"] = str(session_dir / "structure_analysis.json")
             elif tool_id == "structure.analyze" and args.get("source") == "__generated__":
                 args["source"] = ctx.get("last_structure_source") or args.get("source")
             elif tool_id == "input.build":
                 args["output"] = str(session_dir / "input.in")
+                if not args.get("structure") and built_structure:
+                    args["structure"] = built_structure
             elif tool_id == "graph.run":
                 if not str(args.get("workdir") or "").strip():
                     args["workdir"] = str(session_dir / "graphs")
+                inputs = dict(args.get("inputs") or {})
+                if built_structure and not inputs.get("structure") and not inputs.get("material"):
+                    # chain the structure built by an earlier step in this plan
+                    inputs["structure"] = built_structure
+                    args["inputs"] = inputs
 
                 def _node_cb(ev, _idx=idx, _log=node_log):
                     _log.append({"node": ev.get("node"), "state": ev.get("state")})
@@ -678,6 +830,7 @@ class AgentLoop:
                     ctx["last_structure_source"] = data.get("output")
                     ctx["last_formula"] = data.get("formula")
                     ctx["last_structure_file"] = data.get("output")
+                    built_structure = data.get("output")
                     reply_parts.append(f"已生成结构: {data.get('formula')}（{len(data.get('species', []))} 种元素，{data.get('natoms')} 原子）\n文件: {data.get('output')}")
                     result_dict["viewer"] = {
                         "formula": data.get("formula"),
@@ -689,6 +842,7 @@ class AgentLoop:
                     ctx["last_structure_source"] = data.get("output")
                     ctx["last_structure_file"] = data.get("output")
                     ctx["last_formula"] = data.get("formula")
+                    built_structure = data.get("output")
                     lines = [
                         f"已构建2D结构: {data.get('formula')} — {data.get('description')}",
                         f"原子数: {data.get('natoms')} | 最小原子间距: {data.get('min_distance')} Å | 真空层已含",
@@ -702,6 +856,22 @@ class AgentLoop:
                         "cif": _read_text(data.get("output")),
                         "cell": data.get("cell"),
                         "sites": data.get("sites"),
+                        "natoms": data.get("natoms"),
+                    }
+                elif tool_id == "structure.dope" and data.get("output"):
+                    ctx["last_structure_source"] = data.get("output")
+                    ctx["last_structure_file"] = data.get("output")
+                    ctx["last_formula"] = data.get("formula")
+                    built_structure = data.get("output")
+                    reply_parts.append(
+                        f"已构建掺杂结构: {data.get('formula')} — {data.get('description')}\n"
+                        f"原子数: {data.get('natoms')} | 最小原子间距: {data.get('min_distance')} Å\n"
+                        f"文件: {data.get('output')}"
+                    )
+                    result_dict["viewer"] = {
+                        "formula": data.get("formula"),
+                        "cif_path": data.get("output"),
+                        "cif": _read_text(data.get("output")),
                         "natoms": data.get("natoms"),
                     }
                 elif tool_id == "graph.run" and data.get("run_id"):
@@ -725,7 +895,10 @@ class AgentLoop:
                     chart = _extract_charts(data.get("nodes") or {})
                     if chart:
                         result_dict["chart"] = chart
-                    viewer = _viewer_payload_for_material((args.get("inputs") or {}).get("material"))
+                    _inputs = args.get("inputs") or {}
+                    viewer = _viewer_payload_for_material(_inputs.get("material"))
+                    if viewer is None and _inputs.get("structure"):
+                        viewer = _viewer_payload_from_file(_inputs["structure"])
                     if viewer:
                         result_dict["viewer"] = viewer
                 elif tool_id == "input.build" and data.get("input_file"):

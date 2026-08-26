@@ -36,7 +36,62 @@ class TestMonolayer:
 
     def test_bad_kind_raises(self):
         with pytest.raises(StructureBuildError):
-            build_2d("mos2")
+            build_2d("xx-unknown")
+
+
+class TestTMDMonolayer:
+    def test_mos2_1h_phase(self):
+        r = build_2d("mos2")
+        assert r.atoms.get_chemical_formula() == "MoS2"
+        assert len(r.atoms) == 3  # X-M-X sandwich in the 1H cell
+
+    def test_tmd_vacuum_layer(self):
+        r = build_2d("ws2", vacuum=22.0)
+        z = r.atoms.positions[:, 2]
+        thickness = z.max() - z.min()
+        gap = r.atoms.cell[2, 2] - thickness  # empty space between periodic images
+        assert 21.5 < gap < 22.5
+
+    def test_all_tmd_kinds(self):
+        from dft_forge.structure_builder import TMD_MONOLAYERS
+
+        for kind in TMD_MONOLAYERS:
+            r = build_2d(kind)
+            assert len(r.atoms) == 3
+            assert r.to_dict()["min_distance"] > MIN_DISTANCE_ANGSTROM
+
+    def test_tmd_adsorbate_top(self):
+        r = build_2d("mos2", supercell="2x2", adsorbate={"element": "O", "site": "top"})
+        assert "O" in r.atoms.get_chemical_symbols()
+        assert r.to_dict()["min_distance"] > MIN_DISTANCE_ANGSTROM
+
+
+class TestBulkDoping:
+    def test_si_p_doping(self):
+        from dft_forge.structure_builder import dope_3d
+
+        r = dope_3d("Si", "P", supercell="2x2x2")
+        assert r.atoms.get_chemical_formula() == "PSi15"
+        assert r.atoms.pbc.all()
+
+    def test_site_autopick_prefers_similar_element(self):
+        from dft_forge.structure_builder import dope_3d
+
+        r = dope_3d("CaTiO3", "Nb", supercell="2x2x2")
+        # Nb (Z=41) substitutes Ti (Z=22), not Ca (Z=20) or O — closest Z wins
+        assert r.atoms.get_chemical_formula() == "Ca8NbO24Ti7"
+
+    def test_explicit_index_respected(self):
+        from dft_forge.structure_builder import dope_3d
+
+        r = dope_3d("Si", "B", supercell="2x2x2", index=0)
+        assert r.atoms.get_chemical_formula() == "BSi15"
+
+    def test_min_distance_after_doping(self):
+        from dft_forge.structure_builder import dope_3d
+
+        r = dope_3d("GaAs", "Si", supercell="2x2x2")
+        assert r.to_dict()["min_distance"] > MIN_DISTANCE_ANGSTROM
 
 
 class TestModifications:

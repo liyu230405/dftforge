@@ -129,6 +129,51 @@ class TestAgentLoop:
         assert len(steps) == 1
         assert steps[0]["tool"] == "structure.analyze"
 
+    def test_plan_2d_bands(self):
+        loop = AgentLoop()
+        steps = loop.plan("算单层MoS2的能带")
+        assert [s["tool"] for s in steps] == ["structure.build2d", "graph.run"]
+        assert steps[0]["args"]["kind"] == "mos2"
+        assert steps[1]["args"]["template_id"] == "t2_bands"
+        assert "material" not in steps[1]["args"]["inputs"]  # chains the built CIF
+
+    def test_plan_2d_doped_dos(self):
+        loop = AgentLoop()
+        steps = loop.plan("N掺杂石墨烯的态密度")
+        assert [s["tool"] for s in steps] == ["structure.build2d", "graph.run"]
+        assert steps[0]["args"]["kind"] == "graphene"
+        assert steps[0]["args"]["dopants"] == [{"index": 0, "element": "N"}]
+        assert steps[1]["args"]["template_id"] == "t2_dos"
+
+    def test_plan_bulk_doping(self):
+        loop = AgentLoop()
+        steps = loop.plan("P掺杂Si的能带")
+        assert [s["tool"] for s in steps] == ["structure.dope", "graph.run"]
+        assert steps[0]["args"] == {"source": "Si", "element": "P", "supercell": "2x2x2"}
+        assert steps[1]["args"]["template_id"] == "t2_bands"
+
+    def test_plan_2d_adsorption(self):
+        loop = AgentLoop()
+        steps = loop.plan("O吸附在石墨烯的bridge位")
+        assert steps[0]["tool"] == "structure.build2d"
+        assert steps[0]["args"]["adsorb"] == {"element": "O", "site": "bridge"}
+        assert steps[0]["args"]["supercell"] == "3x3"
+
+    def test_plan_hbn_monolayer(self):
+        loop = AgentLoop()
+        steps = loop.plan("构建h-BN单层并优化结构")
+        tools = [s["tool"] for s in steps]
+        assert tools[0] == "structure.build2d"
+        assert steps[0]["args"]["kind"] == "bn"
+        assert "graph.run" in tools
+
+    def test_plan_bulk_mos2_stays_bulk(self):
+        # no 单层/2D keyword → bulk MoS2 goes straight to graph.run
+        loop = AgentLoop()
+        steps = loop.plan("算MoS2的能带")
+        assert [s["tool"] for s in steps] == ["graph.run"]
+        assert steps[0]["args"]["inputs"]["material"] == "MoS2"
+
     def test_run_returns_multi_step_results(self):
         import asyncio
         loop = AgentLoop()

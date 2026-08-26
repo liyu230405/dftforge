@@ -484,6 +484,14 @@ class StructureImporter:
             report.errors.append("Parser returned an empty or invalid structure")
             return report
 
+        # Physical sanity BEFORE normalization: two atoms on top of each
+        # other make spglib/pymatgen fail with a misleading "Invalid cell
+        # vectors" — report the real problem instead.
+        nn_errors = _validate_nearest_neighbors(atoms, self.min_nearest_neighbor_angstrom)
+        if nn_errors:
+            report.errors.extend(nn_errors)
+            return report
+
         # ── Normalize ───────────────────────────────────────────────────────────
         try:
             if self.standardize:

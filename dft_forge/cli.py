@@ -294,6 +294,36 @@ def cmd_structure_build2d(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_structure_dope(args: argparse.Namespace) -> int:
+    """structure dope: supercell + single-atom substitution → CIF."""
+    from pathlib import Path as _P
+
+    from ase.io import write as ase_write
+
+    from dft_forge.structure_builder import BuildResult, StructureBuildError, dope_3d
+
+    try:
+        result: BuildResult = dope_3d(
+            args.source,
+            args.element,
+            supercell=args.supercell,
+            index=args.index,
+        )
+    except (StructureBuildError, ValueError, FileNotFoundError) as exc:
+        return _error_response(str(exc))
+
+    output_path = _P(args.output) if args.output else _P.cwd() / f"doped_{args.source}_{args.element}.cif"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ase_write(str(output_path), result.atoms)
+
+    data = result.to_dict()
+    data["command"] = "structure.dope"
+    data["ok"] = True
+    data["output"] = str(output_path)
+    print(_json_dumps(data))
+    return 0
+
+
 def cmd_structure_analyze(args: argparse.Namespace) -> int:
     from dft_forge.structure import StructureImporter
 
@@ -940,8 +970,8 @@ def main() -> int:
     gen.add_argument("source", help="Material name, e.g. NaCl, MgO, Si, Al")
     gen.add_argument("--output", default=None)
 
-    b2d = struct_sub.add_parser("build2d", help="Build a 2D material (graphene/h-BN) with supercell/doping/adsorbate")
-    b2d.add_argument("kind", help="graphene | bn")
+    b2d = struct_sub.add_parser("build2d", help="Build a 2D material (graphene/h-BN/TMD monolayer) with supercell/doping/adsorbate")
+    b2d.add_argument("kind", help="graphene | bn | mos2 | ws2 | mose2 | wse2 | mote2 | wte2")
     b2d.add_argument("--supercell", default="1x1", help="Supercell spec, e.g. 3x3")
     b2d.add_argument("--vacancy", type=int, default=None, help="Atom index to remove")
     b2d.add_argument("--dopant", action="append", default=None, metavar="ELEMENT@INDEX", help="e.g. N@0 (repeatable)")
@@ -949,6 +979,13 @@ def main() -> int:
     b2d.add_argument("--height", type=float, default=1.5, help="Adsorbate height above site (Å)")
     b2d.add_argument("--vacuum", type=float, default=15.0)
     b2d.add_argument("--output", default=None, help="Output CIF path")
+
+    dop = struct_sub.add_parser("dope", help="Dope a bulk crystal: supercell + substitution (e.g. P in Si)")
+    dop.add_argument("source", help="Material name, formula (CaTiO3), or CIF/POSCAR path")
+    dop.add_argument("element", help="Dopant element, e.g. P")
+    dop.add_argument("--supercell", default="2x2x2", help="Supercell spec, e.g. 2x2x2 (larger = lower concentration)")
+    dop.add_argument("--index", type=int, default=0, help="Atom index to substitute in the supercell")
+    dop.add_argument("--output", default=None, help="Output CIF path")
 
     ana = struct_sub.add_parser("analyze", help="Analyze structure: formula, cell, pair distances, bond lengths")
     ana.add_argument("source", help="Path to structure file or inline content")
@@ -1065,6 +1102,8 @@ def main() -> int:
                 return cmd_structure_generate(args)
             if args.structure_command == "build2d":
                 return cmd_structure_build2d(args)
+            if args.structure_command == "dope":
+                return cmd_structure_dope(args)
             if args.structure_command == "analyze":
                 return cmd_structure_analyze(args)
             return _error_response("Unknown structure command")

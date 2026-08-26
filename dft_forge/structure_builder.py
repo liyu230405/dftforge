@@ -11,7 +11,9 @@ broken structures fail fast instead of producing garbage QE runs.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from ase import Atom, Atoms
@@ -22,6 +24,18 @@ from ase.neighborlist import neighbor_list
 MIN_DISTANCE_ANGSTROM = 0.9
 DEFAULT_VACUUM = 15.0
 DEFAULT_ADS_HEIGHT = 1.5
+
+# 1H-phase TMD monolayers: kind -> (metal, chalcogen, a [Å], M-X bond [Å]).
+# a is the hexagonal lattice constant; the vertical S-M-S offset follows
+# from sqrt(bond² - (a/√3)²), so only (a, bond) is tabulated.
+TMD_MONOLAYERS: Dict[str, Tuple[str, str, float, float]] = {
+    "mos2": ("Mo", "S", 3.16, 2.41),
+    "ws2": ("W", "S", 3.15, 2.41),
+    "mose2": ("Mo", "Se", 3.29, 2.38),
+    "wse2": ("W", "Se", 3.28, 2.41),
+    "mote2": ("Mo", "Te", 3.52, 2.73),
+    "wte2": ("W", "Te", 3.51, 2.72),
+}
 
 
 class StructureBuildError(ValueError):
@@ -70,11 +84,37 @@ def build_monolayer(kind: str, *, a: Optional[float] = None, vacuum: float = DEF
         atoms = ase_graphene(a=a or 2.51)
         atoms.symbols[0] = "B"
         atoms.symbols[1] = "N"
+    elif kind in TMD_MONOLAYERS:
+        atoms = _tmd_monolayer(kind, vacuum=vacuum)
     else:
-        raise StructureBuildError(f"unsupported monolayer kind: {kind} (graphene | bn)")
+        raise StructureBuildError(
+            f"unsupported monolayer kind: {kind} (graphene | bn | {' | '.join(TMD_MONOLAYERS)})"
+        )
     # ASE vacuum is per-side; we promise the total vacuum layer
-    atoms.center(vacuum=vacuum / 2, axis=2)
+    if kind not in TMD_MONOLAYERS:
+        atoms.center(vacuum=vacuum / 2, axis=2)
     return atoms
+
+
+def _tmd_monolayer(kind: str, *, vacuum: float = DEFAULT_VACUUM) -> Atoms:
+    """1H-phase TMD monolayer: X-M-X sandwich on a hexagonal cell.
+
+    M at (1/3, 2/3), X at (2/3, 1/3) ± dz — in-plane M-X distance a/√3,
+    dz = sqrt(bond² − (a/√3)²) fixes the S-M-S height.
+    """
+    import math as _math
+
+    metal, chalc, a, bond = TMD_MONOLAYERS[kind]
+    inplane = a / _math.sqrt(3.0)
+    dz = _math.sqrt(bond**2 - inplane**2)
+    c = 2.0 * dz + vacuum
+    cell = [[a, 0, 0], [-a / 2, a * _math.sqrt(3) / 2, 0], [0, 0, c]]
+    pos = [
+        (1 / 3, 2 / 3, 0.5),
+        (2 / 3, 1 / 3, 0.5 + dz / c),
+        (2 / 3, 1 / 3, 0.5 - dz / c),
+    ]
+    return Atoms([metal, chalc, chalc], scaled_positions=pos, cell=cell, pbc=True)
 
 
 def make_supercell(atoms: Atoms, m: int = 1, n: int = 1) -> Atoms:
@@ -101,32 +141,45 @@ def remove_atom(atoms: Atoms, index: int) -> Atoms:
 def surface_sites(atoms: Atoms, *, site_index: int = 0) -> Dict[str, List[float]]:
     """top / bridge / hollow sites on the topmost layer of a 2D slab.
 
-    Geometry assumes a hexagonal sheet; positions are in Å with z above the
-    topmost atom layer.
+    Geometry works for both honeycomb sheets (graphene, h-BN: 3 in-plane
+    neighbours, hexagon centre = atom + v1 + v2) and TMD chalcogen
+    triangular layers (6 neighbours, triangle centre = atom + (v1+v2)/3).
+    Neighbours are filtered to the topmost layer so the metal below a
+    TMD chalcogen plane is not mistaken for a surface neighbour.
     """
     z_top = max(atoms.positions[:, 2])
     layer = [i for i in range(len(atoms)) if abs(atoms.positions[i, 2] - z_top) < 0.1]
     ref = layer[site_index % len(layer)]
     pos = atoms.positions[ref]
 
-    idx_i, idx_j, d = neighbor_list("ijD", atoms, cutoff=2.0)
+    # generous cutoff: TMD in-plane X-X spacing (a ≈ 3.2 Å) exceeds the
+    # graphene bond (1.42 Å), so 2.0 Å would find nothing
+    idx_i, idx_j, idx_D = neighbor_list("ijD", atoms, cutoff=4.0)
     nbrs = sorted(
-        [(j, tuple(D)) for i, j, D in zip(idx_i, idx_j, d) if i == ref],
+        [
+            (j, tuple(D))
+            for i, j, D in zip(idx_i, idx_j, idx_D)
+            if i == ref and abs(D[2]) < 0.1 and j in layer
+        ],
         key=lambda t: (t[1][0] ** 2 + t[1][1] ** 2 + t[1][2] ** 2),
     )
-    if len(nbrs) < 3:
-        raise StructureBuildError("reference atom has <3 neighbours within 2.0 Å — not a hexagonal sheet?")
+    if len(nbrs) < 2:
+        raise StructureBuildError("reference atom has <2 in-plane neighbours — not a 2D sheet?")
 
     def xy(v: Tuple[float, ...]) -> List[float]:
         return [pos[0] + v[0], pos[1] + v[1], pos[2]]
 
-    # honeycomb geometry: the three neighbour vectors sum to zero, so the
-    # hexagon centre is atom + (v1 + v2) — two neighbours 120° apart, whose
-    # sum has magnitude equal to the bond length
     v1, v2 = nbrs[0][1], nbrs[1][1]
+    d1 = math.hypot(v1[0], v1[1])
+    # coordination within the first shell only — a 4 Å cutoff also returns
+    # second-shell atoms (e.g. graphene's 2.46 Å), which must not flip the
+    # lattice classification
+    coord = sum(1 for _j, v in nbrs if math.hypot(v[0], v[1]) < 1.2 * d1)
+    div = 3.0 if coord >= 5 else 1.0
+    hollow_v = ((v1[0] + v2[0]) / div, (v1[1] + v2[1]) / div)
     top = xy((0.0, 0.0, 0.0))
     bridge = xy((v1[0] / 2, v1[1] / 2, 0.0))
-    hollow = xy((v1[0] + v2[0], v1[1] + v2[1], 0.0))
+    hollow = xy(hollow_v)
     return {"top": top, "bridge": bridge, "hollow": hollow}
 
 
@@ -210,3 +263,75 @@ def parse_supercell(spec: str) -> Tuple[int, int]:
     except ValueError:
         raise StructureBuildError(f"bad supercell spec: {spec!r} (expected e.g. '3x3')") from None
     return m, n
+
+
+def parse_supercell_3d(spec: str) -> Tuple[int, int, int]:
+    """Parse '2x2x2' (or '2x2') into an (m, n, p) tuple."""
+    spec = (spec or "1x1x1").lower().strip()
+    parts = spec.split("x")
+    try:
+        nums = tuple(int(p) for p in parts)
+        if len(nums) == 2:
+            nums = nums + (1,)
+        if len(nums) != 3 or any(p < 1 for p in nums):
+            raise ValueError
+    except ValueError:
+        raise StructureBuildError(f"bad supercell spec: {spec!r} (expected e.g. '2x2x2')") from None
+    return nums
+
+
+def _pick_substitution_site(atoms: Atoms, dopant: str) -> int:
+    """Index of the host atom most likely to be substituted: same element,
+    else the element closest in atomic number to the dopant."""
+    from ase.data import atomic_numbers
+
+    z_d = atomic_numbers.get(dopant)
+    syms = atoms.get_chemical_symbols()
+    best_el, best_d = None, None
+    for el in sorted(set(syms)):
+        d = 0 if z_d is None else abs(atomic_numbers.get(el, 999) - z_d)
+        if best_d is None or d < best_d:
+            best_el, best_d = el, d
+    return syms.index(best_el)
+
+
+def dope_3d(
+    source: Any,
+    element: str,
+    *,
+    supercell: str = "2x2x2",
+    index: Optional[int] = None,
+) -> BuildResult:
+    """Dope a bulk crystal: supercell, then substitute one host atom.
+
+    ``source`` is a material key ('Si'), a formula ('CaTiO3'), or a path to
+    a CIF/POSCAR file. Returns the doped supercell with a concentration
+    estimate in the description. When ``index`` is None the substituted
+    site is auto-picked: the host element closest in atomic number to the
+    dopant (Nb→Ti in CaTiO3, P→Si in Si).
+    """
+    from dft_forge.compiler import MATERIAL_DB, build_atoms, formula_atoms, read_structure
+
+    src = str(source)
+    path = Path(src)
+    if path.suffix.lower() in (".cif", ".poscar", ".xyz") and path.exists():
+        atoms = read_structure(path)
+    elif src in MATERIAL_DB:
+        atoms = build_atoms(src)
+    else:
+        atoms, _proto = formula_atoms(src)
+
+    m, n, p = parse_supercell_3d(supercell)
+    if (m, n, p) != (1, 1, 1):
+        P = [[m, 0, 0], [0, n, 0], [0, 0, p]]
+        atoms = ase_make_supercell(atoms, P)
+    if index is None:
+        index = _pick_substitution_site(atoms, str(element))
+    host = atoms.symbols[index]
+    atoms = substitute(atoms, index, str(element))
+    check_distances(atoms, f"dope {element}@{index}")
+
+    frac = 100.0 / len(atoms)
+    n_el = atoms.get_chemical_symbols().count(str(element))
+    description = f"{host}→{element} in {m}x{n}x{p} supercell ({frac:.1f}% nominal, {n_el} atom)"
+    return BuildResult(atoms=atoms, description=description)

@@ -180,9 +180,12 @@ DEFAULT_PSEUDO_DIR = Path(__file__).resolve().parents[2] / "assets" / "pseudos"
 def read_structure(path) -> Atoms:
     """Read a structure file (CIF/POSCAR/...) into ASE Atoms.
 
-    A cell with one axis much longer than the other two is treated as a
-    2D slab: periodicity along the vacuum axis is turned off so band
-    paths stay in-plane.
+    A vacuum axis is detected from the atomic coordinate span: if the
+    largest circular gap between fractional coordinates along an axis
+    exceeds half the cell (and the axis is ≥ 8 Å), the slab occupies less
+    than half the cell there — periodicity is turned off so k-meshes
+    collapse and band paths stay in-plane. A length-ratio test would miss
+    large in-plane supercells (e.g. 4×4 graphene with 15 Å vacuum).
     """
     from ase.io import read as ase_read
 
@@ -190,12 +193,17 @@ def read_structure(path) -> Atoms:
     if not p.exists():
         raise FileNotFoundError(f"structure file not found: {path}")
     atoms = ase_read(str(p))
-    lengths = sorted(atoms.cell.cellpar()[:3])
-    if lengths[-1] > 2.0 * lengths[-2] and lengths[-1] > 12.0:
-        longest = int(np.argmax(atoms.cell.cellpar()[:3]))
-        pbc = [True, True, True]
-        pbc[longest] = False
-        atoms.pbc = pbc
+    lengths = atoms.cell.cellpar()[:3]
+    frac = atoms.get_scaled_positions(wrap=True)
+    pbc = [True, True, True]
+    for i in range(3):
+        if lengths[i] < 8.0 or len(atoms) < 2:
+            continue
+        f = np.sort(frac[:, i])
+        gaps = np.diff(np.concatenate([f, [f[0] + 1.0]]))
+        if float(gaps.max()) > 0.5:
+            pbc[i] = False
+    atoms.pbc = pbc
     return atoms
 
 
@@ -203,8 +211,9 @@ def profile_from_atoms(atoms: Atoms, pseudo_dir: Optional[Path] = None) -> Dict[
     """MATERIAL_DB-shaped profile for an arbitrary Atoms object.
 
     Species map onto the GBRV ``{Element}.upf`` library; ibrav=0 with the
-    cell emitted explicitly. The k-mesh adapts to cell size and collapses
-    to 1 along vacuum axes.
+    cell emitted explicitly. The k-mesh adapts to cell size; non-periodic
+    axes (slab vacuum, atoms.pbc=False) always get k=1, while long but
+    genuinely periodic axes (e.g. 2H TMD c) are still sampled.
     """
     from ase.data import atomic_masses, chemical_symbols
 
@@ -218,7 +227,11 @@ def profile_from_atoms(atoms: Atoms, pseudo_dir: Optional[Path] = None) -> Dict[
         pseudos[el] = found
     masses = [float(atomic_masses[chemical_symbols.index(el)]) for el in species]
     lengths = atoms.cell.cellpar()[:3]
-    k = [1 if L > 12.0 else max(1, min(8, round(24.0 / L))) for L in lengths]
+    pbc = list(atoms.pbc) if len(atoms.pbc) == 3 else [True, True, True]
+    k = [
+        1 if not periodic else max(1, min(8, round(24.0 / L)))
+        for L, periodic in zip(lengths, pbc)
+    ]
     return {
         "ibrav": 0,
         "nspecies": len(species),
@@ -251,6 +264,34 @@ _V_VI = {"N", "P", "As", "Sb", "Bi"}
 _DIAMOND_ELS = {"C", "Si", "Ge", "Sn"}
 _BCC_ELS = {"Fe", "Cr", "W", "Mo", "V", "Nb", "Ta", "K", "Na", "Li"}
 _HCP_ELS = {"Mg", "Zn", "Ti", "Zr", "Co", "Be", "Ru", "Os", "Sc", "Y", "Hf", "Re"}
+
+# 2H-layered TMD bulks: formula -> (metal, chalcogen, a [Å], M-X bond [Å],
+# interlayer gap [Å]). Built instead of the fluorite prototype — fluorite
+# MX2 is not a real TMD structure.
+TMD_BULKS: Dict[str, Tuple[str, str, float, float, float]] = {
+    "MoS2": ("Mo", "S", 3.16, 2.41, 3.0),
+    "WS2": ("W", "S", 3.15, 2.41, 3.1),
+    "MoSe2": ("Mo", "Se", 3.29, 2.38, 3.3),
+    "WSe2": ("W", "Se", 3.28, 2.41, 3.3),
+    "MoTe2": ("Mo", "Te", 3.52, 2.73, 3.5),
+    "WTe2": ("W", "Te", 3.51, 2.72, 3.5),
+}
+
+
+def _tmd_bulk(formula_key: str) -> Tuple[Atoms, str]:
+    """2H-phase TMD bulk: two AB-stacked X-M-X layers per hexagonal cell."""
+    metal, chalc, a, bond, gap = TMD_BULKS[formula_key]
+    inplane = a / math.sqrt(3.0)
+    dz = math.sqrt(bond**2 - inplane**2)
+    c = 4.0 * dz + 2.0 * gap
+    cell = [[a, 0, 0], [-a / 2, a * math.sqrt(3) / 2, 0], [0, 0, c]]
+    z = dz / c
+    pos = [
+        (1 / 3, 2 / 3, 0.25), (1 / 3, 2 / 3, 0.25 + z), (1 / 3, 2 / 3, 0.25 - z),
+        (2 / 3, 1 / 3, 0.75), (2 / 3, 1 / 3, 0.75 + z), (2 / 3, 1 / 3, 0.75 - z),
+    ]
+    syms = [metal, chalc, chalc] * 2
+    return Atoms(syms, scaled_positions=pos, cell=cell, pbc=True), "tmd-2h"
 
 
 def _cov_radius(el: str) -> float:
@@ -312,6 +353,12 @@ def formula_atoms(formula: str) -> Tuple[Atoms, str]:
         syms = [a_site, b_site, "O", "O", "O"]
         return Atoms(syms, scaled_positions=pos, cell=cell, pbc=True), "perovskite"
 
+    # 2H-layered TMD bulk (MoS2 family) — before the generic AB2 fluorite
+    # branch, which would otherwise emit a physically wrong structure
+    tmd_key = next((k for k in TMD_BULKS if k.lower() == str(formula).replace(" ", "").lower()), None)
+    if tmd_key is not None:
+        return _tmd_bulk(tmd_key)
+
     # AB binary
     if len(els) == 2 and nums[0] == 1 and nums[1] == 1:
         e1, e2 = els
@@ -338,8 +385,9 @@ def formula_atoms(formula: str) -> Tuple[Atoms, str]:
         return Atoms(syms, scaled_positions=pos, cell=cell, pbc=True), "fluorite"
 
     raise ValueError(
-        f"no structure prototype for '{formula}' (supports: elemental, AB, ABO3, AB2). "
-        "Provide a CIF file or use structure.build2d for 2D systems."
+        f"no structure prototype for '{formula}' (supports: elemental, AB, ABO3, "
+        "AB2, TMD MoS2-family). Provide a CIF file or use structure.build2d "
+        "for 2D monolayers."
     )
 
 
@@ -398,9 +446,12 @@ def bandpath_segments_from_atoms(atoms: Atoms) -> List[List[Tuple[str, tuple]]]:
 
     Each segment is a list of (label, (kx, ky, kz)) pairs in fractional
     coordinates of the cell. Uses ASE's Bravais-lattice aware bandpath
-    (version-robust, no seekpath dependency).
+    (version-robust, no seekpath dependency). ``atoms.pbc`` is forwarded so
+    slab/2D cells (vacuum axis non-periodic) get an in-plane path (Γ-M-K-Γ)
+    instead of a 3D one with A/H/L.
     """
-    bp = atoms.cell.bandpath()
+    pbc = tuple(bool(b) for b in atoms.pbc) if len(atoms.pbc) == 3 else None
+    bp = atoms.cell.bandpath(pbc=pbc)
     special = bp.special_points
     segments: List[List[Tuple[str, tuple]]] = []
     for seg in str(bp.path).split(","):
@@ -431,7 +482,8 @@ def get_bandpath_kpoints(material: str, npoints: int = 100, atoms: Optional[Atom
     interpolated across), unlike a naive crystal_b segment rendering.
     """
     a = atoms if atoms is not None else build_atoms(material)
-    return np.asarray(a.cell.bandpath(npoints=max(10, npoints)).kpts)
+    pbc = tuple(bool(b) for b in a.pbc) if len(a.pbc) == 3 else None
+    return np.asarray(a.cell.bandpath(npoints=max(10, npoints), pbc=pbc).kpts)
 
 
 # ── QE input generator ────────────────────────────────────────────────────────
@@ -844,7 +896,7 @@ class QECompiler:
             lines.append(f"  Emax = {emax}")
         lines.append("/")
 
-        content = "\n".join(lines)
+        content = "\n".join(lines) + "\n"  # trailing newline: QE 7.5 dos.x namelist reader aborts without it
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(content)
         return content
