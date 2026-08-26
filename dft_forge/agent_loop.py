@@ -144,6 +144,8 @@ def _extract_charts(nodes: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             chart["bands"] = bands
         if outs.get("dos_curve"):
             chart["dos"] = {"kind": "dos", **outs["dos_curve"], "fermi_ev": outs.get("fermi_ev")}
+        if outs.get("pdos_curve"):
+            chart["pdos"] = {"kind": "pdos", **outs["pdos_curve"], "fermi_ev": outs.get("fermi_ev")}
         for k in ("energy_ry", "a_angstrom", "pressure_kbar", "max_force_ev_ang"):
             v = outs.get(k)
             if v is None:
@@ -261,6 +263,22 @@ Rules:
   with empty inputs.
 - Site scan ("different sites/positions"): emit one structure.build2d step per site
   (top/bridge/hollow), each with its own output path.
+- Adsorption energy (吸附能/E_ads): a 3-calculation workflow —
+  (1) structure.build2d with adsorb + supercell '3x3', (2) graph.run t0_scf,
+  (3) structure.build2d same supercell WITHOUT adsorb, (4) graph.run t0_scf,
+  (5) structure.molecule (O→o2, H→h2, N→n2, Cl→cl2), (6) graph.run t0_scf,
+  (7) thermo.eads with empty args (executor injects the three energies).
+- Formation energy (形成能): (1) graph.run t0_scf with material=compound,
+  then for EACH element: structure.reference {{element}} + graph.run t0_scf,
+  finally thermo.formation {{formula}} with empty refs (auto-injected).
+  Reference phases use structure.reference (NOT structure.generate), and the
+  graph.run AFTER any builder (build2d/dope/molecule/reference) must have
+  EMPTY inputs — the built structure chains automatically; never invent a
+  material name for it.
+- Crystallography knowledge: a primitive cell of rocksalt NaCl has only 2
+  atoms (1 Na + 1 Cl) in a rhombohedral FCC setting — that is CORRECT; the
+  conventional cubic cell has 4 formula units. Never call 2-atom NaCl wrong.
+  structure.analyze reports space group + conventional cell for verification.
 - Chit-chat / questions about you: empty steps, answer in "reply".
 - Use the conversation history for context: pronouns like "它/这个/再算一次/继续"
   refer to the material or calculation mentioned earlier.
@@ -400,7 +418,9 @@ class AgentLoop:
 
         ads_el = None
         ads_site = None
-        m = re.search(r"([A-Z][a-z]?)\s*吸附", message)
+        m = re.search(r"([A-Z][a-z]?[A-Za-z0-9]*)\s*吸附", message) or re.search(r"([a-z0-9]{2,3})\s*(?:on|@)\s*\w+", lower)
+        if m is None:
+            m = re.search(r"\b(o2|n2|h2|cl2|co|oh|no|h2o|co2|nh3)\s*吸附", lower)
         if m:
             ads_el = m.group(1)
             if "bridge" in lower or "桥" in message:
@@ -419,6 +439,84 @@ class AgentLoop:
 
         # Strong analysis words beat calculation; bare "结构" does not (能带结构 etc.)
         strong_analyze = any(k in lower for k in ("键长", "键能", "bond", "distance", "距离", "分析", "analyze"))
+
+        # ── Composite thermochemistry intents: E_ads / formation energy ──
+        # These assemble multi-calculation workflows (agent-level value-add).
+        wants_eads = any(k in lower for k in ("吸附能", "adsorption energy", "eads", "e_ads"))
+        wants_formation = any(k in lower for k in ("形成能", "formation energy", "formation enthalpy", "生成能"))
+
+        _ADSORBATE_MOLECULE = {
+            "O": "o2", "N": "n2", "H": "h2", "Cl": "cl2", "F": "f2",
+            "CO": "co", "OH": "oh", "NO": "no", "H2O": "h2o", "CO2": "co2", "NH3": "nh3",
+        }
+        if wants_eads:
+            ads_species = ads_el or "O"
+            molecule_kind = _ADSORBATE_MOLECULE.get(ads_species.upper()) or _ADSORBATE_MOLECULE.get(ads_species.lower())
+            if molecule_kind is None:
+                for mk in ("co2", "h2o", "nh3", "cl2", "o2", "n2", "h2", "co"):
+                    if mk in lower.replace(" ", "").replace("-", ""):
+                        molecule_kind = mk
+                        break
+            is_single_atom = len(ads_species) <= 2 and ads_species.capitalize() in _ELEMENTS
+            if build2d_kind and molecule_kind:
+                if not is_single_atom:
+                    notice = (
+                        f"分子吸附（{ads_species}）的多原子建模暂不支持；当前 E_ads 闭环支持"
+                        "单原子吸附（O/H/N/Cl，气相参考 O₂/H₂/N₂/Cl₂）。可先算原子吸附能。"
+                    )
+                    return [{"tool": "help", "args": {"topic": "eads"}, "description": notice}]
+                sc = "3x3"  # standard surface supercell for adsorption studies
+                steps_eads: List[Dict[str, Any]] = [
+                    {
+                        "tool": "structure.build2d",
+                        "args": {"kind": build2d_kind, "supercell": sc,
+                                 "adsorb": {"element": ads_species, "site": ads_site or "top"}},
+                        "description": f"构建吸附体系: {ads_species}@{build2d_kind} {sc} 超胞({ads_site or 'top'}位)",
+                    },
+                    {"tool": "graph.run", "args": {"template_id": "t0_scf", "inputs": {}},
+                     "description": "吸附体系单点能 E(surf+ads)"},
+                    {
+                        "tool": "structure.build2d",
+                        "args": {"kind": build2d_kind, "supercell": sc},
+                        "description": f"构建纯表面: {build2d_kind} {sc} 超胞",
+                    },
+                    {"tool": "graph.run", "args": {"template_id": "t0_scf", "inputs": {}},
+                     "description": "纯表面单点能 E(surf)"},
+                    {"tool": "structure.molecule", "args": {"kind": molecule_kind},
+                     "description": f"构建气体分子参考 {molecule_kind.upper()}"},
+                    {"tool": "graph.run", "args": {"template_id": "t0_scf", "inputs": {}},
+                     "description": "分子单点能 E(mol)"},
+                    {"tool": "thermo.eads", "args": {},
+                     "description": "计算吸附能 E_ads = E(surf+ads) − E(surf) − E(mol)"},
+                ]
+                return steps_eads
+
+        if wants_formation and (formula_hint or material_hint):
+            comp = formula_hint or material_hint
+            from dft_forge.structure_builder import REFERENCE_PHASES
+
+            try:
+                from dft_forge.structure_builder import reference_elements
+                els = reference_elements(str(comp))
+            except Exception:
+                els = []
+            unsupported = [e for e in els if e not in REFERENCE_PHASES]
+            if unsupported:
+                reply = (f"暂无法计算 {comp} 的形成能：缺少元素参考态（{', '.join(unsupported)}）。"
+                         f"当前支持的元素: {', '.join(sorted(REFERENCE_PHASES))}")
+                return [{"tool": "help", "args": {"topic": "formation"}, "description": reply}]
+            steps_f: List[Dict[str, Any]] = [
+                {"tool": "graph.run", "args": {"template_id": "t0_scf", "inputs": {"material": str(comp)}},
+                 "description": f"{comp} 化合物单点能"},
+            ]
+            for el in els:
+                steps_f.append({"tool": "structure.reference", "args": {"element": el},
+                                "description": f"构建 {el} 元素参考态"})
+                steps_f.append({"tool": "graph.run", "args": {"template_id": "t0_scf", "inputs": {}},
+                                "description": f"{el} 参考态单点能"})
+            steps_f.append({"tool": "thermo.formation", "args": {"formula": str(comp)},
+                            "description": f"计算 {comp} 形成能"})
+            return steps_f
 
         # Full-calculation intent: one-shot graph.run for ANY formula — the
         # engine auto-builds a prototype structure when the material is unknown.
@@ -681,6 +779,9 @@ class AgentLoop:
         # structure built earlier in this plan (build2d/dope/generate) —
         # auto-chained into a following graph.run that names no material
         built_structure: Optional[str] = None
+        # SCF energies collected from graph.run steps (for thermo injection):
+        # each entry {"energy_ry", "natoms", "label"}
+        scf_energies: List[Dict[str, Any]] = []
 
         for idx, step in enumerate(steps):
             tool_id = step.get("tool")
@@ -754,6 +855,43 @@ class AgentLoop:
                 args["output"] = str(session_dir / "structure_analysis.json")
             elif tool_id == "structure.analyze" and args.get("source") == "__generated__":
                 args["source"] = ctx.get("last_structure_source") or args.get("source")
+            elif tool_id == "structure.molecule":
+                if not args.get("output"):
+                    mk = re.sub(r"[^a-z0-9]", "", str(args.get("kind", "mol")))
+                    args["output"] = str(session_dir / f"molecule_{mk}.cif")
+            elif tool_id == "structure.reference":
+                if not args.get("output"):
+                    el = re.sub(r"[^A-Za-z]", "", str(args.get("element", "X")))
+                    args["output"] = str(session_dir / f"ref_{el}.cif")
+            elif tool_id == "thermo.eads" and args.get("ry_a") is None:
+                # inject the last three SCF energies in plan order:
+                # [adsorbed, surface, molecule]
+                if len(scf_energies) >= 3:
+                    e_a, e_s, e_m = scf_energies[-3], scf_energies[-2], scf_energies[-1]
+                    args["ry_a"] = e_a["energy_ry"]
+                    args["ry_s"] = e_s["energy_ry"]
+                    args["ry_m"] = e_m["energy_ry"]
+                    n_a, n_s, n_m = e_a.get("natoms"), e_s.get("natoms"), e_m.get("natoms")
+                    if n_a and n_s and n_m and n_a > n_s:
+                        # molecule energy is shared between its atoms: O adsorbed
+                        # from an O2 reference → subtract E(O2)/2, not E(O2)
+                        args["nat_a"] = n_a - n_s
+                        args["nat_mol"] = n_m
+            elif tool_id == "thermo.formation" and not args.get("refs"):
+                # inject: first SCF = compound, rest = element refs in plan order
+                try:
+                    from dft_forge.structure_builder import reference_elements as _ref_els
+                    els = _ref_els(str(args.get("formula", "")))
+                except Exception:
+                    els = []
+                refs_needed = len(els)
+                if scf_energies and len(scf_energies) >= refs_needed + 1:
+                    args["compound_energy"] = scf_energies[0]["energy_ry"]
+                    refs = {}
+                    for i, el in enumerate(els):
+                        e = scf_energies[i + 1]
+                        refs[el] = {"energy_ry": e["energy_ry"], "natoms": e.get("natoms") or 1}
+                    args["refs"] = refs
             elif tool_id == "input.build":
                 args["output"] = str(session_dir / "input.in")
                 if not args.get("structure") and built_structure:
@@ -762,10 +900,29 @@ class AgentLoop:
                 if not str(args.get("workdir") or "").strip():
                     args["workdir"] = str(session_dir / "graphs")
                 inputs = dict(args.get("inputs") or {})
-                if built_structure and not inputs.get("structure") and not inputs.get("material"):
-                    # chain the structure built by an earlier step in this plan
+                if built_structure and not inputs.get("structure"):
+                    # a structure built earlier in this plan is authoritative —
+                    # it overrides any material name the planner guessed
                     inputs["structure"] = built_structure
+                    inputs.pop("material", None)
                     args["inputs"] = inputs
+                elif not built_structure and not inputs.get("material") and not inputs.get("structure"):
+                    # nothing to chain: running the template default (Si) would
+                    # silently produce wrong physics for E_ads/formation flows
+                    commands.append({"command": "noop", "description": description})
+                    results.append({
+                        "tool_id": tool_id,
+                        "returncode": -1,
+                        "json": None,
+                        "error": "no structure to chain (previous build step failed) and no material given",
+                        "traceback": None,
+                    })
+                    reply_parts.append(f"步骤失败: {description} — 前置结构构建未成功，无法链接结构。")
+                    chain.append({"tool": tool_id, "description": description, "status": "error",
+                                  "summary": _summary(), "nodes": []})
+                    emit({"type": "step", "index": idx, "status": "error",
+                          "summary": "无结构可链接（前置构建失败）"})
+                    continue
 
                 def _node_cb(ev, _idx=idx, _log=node_log):
                     _log.append({"node": ev.get("node"), "state": ev.get("state")})
@@ -874,6 +1031,20 @@ class AgentLoop:
                         "cif": _read_text(data.get("output")),
                         "natoms": data.get("natoms"),
                     }
+                elif tool_id in ("structure.molecule", "structure.reference") and data.get("output"):
+                    built_structure = data.get("output")
+                    ctx["last_structure_source"] = data.get("output")
+                    ctx["last_structure_file"] = data.get("output")
+                    ctx["last_formula"] = data.get("formula")
+                    reply_parts.append(
+                        f"已构建: {data.get('formula')} — {data.get('description')}\n文件: {data.get('output')}"
+                    )
+                    result_dict["viewer"] = {
+                        "formula": data.get("formula"),
+                        "cif_path": data.get("output"),
+                        "cif": _read_text(data.get("output")),
+                        "natoms": data.get("natoms"),
+                    }
                 elif tool_id == "graph.run" and data.get("run_id"):
                     ctx["last_run_id"] = data.get("run_id")
                     lines = [f"图计算完成: {data.get('state')}  (运行ID: {data.get('run_id')})"]
@@ -882,15 +1053,35 @@ class AgentLoop:
                         if info.get("error"):
                             line += f" | {str(info['error'])[:100]}"
                         outs = info.get("outputs") or {}
-                        bulky = ("eigenvalues_ev", "k_axis", "k_ticks", "dos_curve")
+                        bulky = ("eigenvalues_ev", "k_axis", "k_ticks", "dos_curve", "pdos_curve", "analysis")
                         shown = {
                             k: (round(v, 4) if isinstance(v, float) else v)
                             for k, v in outs.items()
-                            if not str(k).endswith("stdout") and k not in bulky and not isinstance(v, list)
+                            if not str(k).endswith("stdout") and k not in bulky and not isinstance(v, list) and not isinstance(v, dict)
                         }
                         if shown:
                             line += f" | {shown}"
                         lines.append(line)
+                        # collect SCF-class energies for thermo workflows
+                        if info.get("state") == "succeeded" and outs.get("energy_ry") is not None:
+                            scf_energies.append({
+                                "energy_ry": outs["energy_ry"],
+                                "natoms": outs.get("natoms"),
+                                "label": f"{description}:{nid}",
+                            })
+                        # surface post-relax geometry facts directly in the reply
+                        an = outs.get("analysis")
+                        if isinstance(an, dict) and an.get("symmetry", {}).get("available"):
+                            lines.append(
+                                f"  结构分析: 空间群 {an['symmetry'].get('space_group')} "
+                                f"(No.{an['symmetry'].get('space_group_number')}) | "
+                                f"常规胞 {an['symmetry'].get('conventional_cell', {}).get('formula', '')}"
+                            )
+                            bl = an.get("bond_lengths") or {}
+                            for pair, st in list(bl.items())[:3]:
+                                lines.append(
+                                    f"  键长 {pair}: {st['mean_angstrom']} Å (均值, {st['count']} 条)"
+                                )
                     reply_parts.append("\n".join(lines))
                     chart = _extract_charts(data.get("nodes") or {})
                     if chart:
@@ -938,10 +1129,39 @@ class AgentLoop:
                             lines.append(f"最短距离: {min_dist:.4f} Å ({'-'.join(min_pair)})")
                         for pair, info in pair_distances.items():
                             lines.append(f"{pair}: count={info.get('count')} min={info.get('min_angstrom')} Å max={info.get('max_angstrom')} Å")
+                        sym = analysis.get("symmetry") or {}
+                        if sym.get("available"):
+                            conv = sym.get("conventional_cell") or {}
+                            lines.append(
+                                f"空间群: {sym.get('space_group')} (No.{sym.get('space_group_number')})"
+                                + (f" | 常规胞 {conv.get('formula')} (a={conv.get('a_angstrom')} Å)" if conv else "")
+                            )
+                        bl = analysis.get("bond_lengths") or {}
+                        for pair, st in list(bl.items())[:4]:
+                            lines.append(f"键长 {pair}: 均值 {st['mean_angstrom']} Å ×{st['count']}")
+                        ba = analysis.get("bond_angles") or {}
+                        for trip, st in list(ba.items())[:3]:
+                            lines.append(f"键角 {trip}: 均值 {st['mean_deg']}° ×{st['count']}")
                         src = args.get("source") if args.get("source") != "__generated__" else ctx.get("last_structure_source")
                         if src:
                             lines.append(f"文件: {src}")
                         reply_parts.append("\n".join(lines))
+                elif tool_id == "thermo.eads" and isinstance(data.get("e_ads_ev"), (int, float)):
+                    ev = data.get("e_ads_ev")
+                    strength = "强吸附（放热）" if ev < -1.0 else ("中等吸附" if ev < -0.3 else "弱吸附/近似不吸附")
+                    reply_parts.append(
+                        f"吸附能计算完成: E_ads = {ev} eV/原子\n"
+                        f"判定: {strength}" + ("（负值=放热，体系稳定）" if ev < 0 else "（正值=吸热，不稳定吸附）")
+                    )
+                    result_dict["metrics"] = {"e_ads_ev": ev}
+                elif tool_id == "thermo.formation" and isinstance(data.get("formation_energy_ev_per_atom"), (int, float)):
+                    evpa = data.get("formation_energy_ev_per_atom")
+                    stability = "相对单质稳定（负形成能）" if evpa < 0 else "相对单质不稳定（正形成能）"
+                    reply_parts.append(
+                        f"形成能计算完成: {data.get('formula')} E_form = {evpa} eV/原子"
+                        f"（{data.get('formation_energy_ev_per_formula')} eV/化学式）\n判定: {stability}"
+                    )
+                    result_dict["metrics"] = {"formation_energy_ev_per_atom": evpa}
                 else:
                     reply_parts.append(f"{description}: 完成")
             except Exception as exc:  # noqa: BLE001

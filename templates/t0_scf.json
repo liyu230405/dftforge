@@ -1,0 +1,29 @@
+{
+  "template_id": "t0_scf",
+  "description": "Single-point SCF energy (building block for E_ads / formation energy workflows)",
+  "inputs": {
+    "material": "Si",
+    "ecutwfc": null,
+    "kpoints": null,
+    "structure": null
+  },
+  "outputs": {
+    "scf_energy_ry": "${nodes.scf.outputs.energy_ry}",
+    "natoms": "${nodes.scf.outputs.natoms}"
+  },
+  "nodes": [
+    {
+      "id": "scf",
+      "tool": "qe",
+      "params": {
+        "calc": "scf",
+        "material": "${inputs.material}",
+        "ecutwfc": "${inputs.ecutwfc}",
+        "kpoints": "${inputs.kpoints}",
+        "structure": "${inputs.structure}"
+      },
+      "depends_on": [],
+      "max_repair_attempts": 2
+    }
+  ]
+}

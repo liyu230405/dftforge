@@ -10,6 +10,7 @@ export function renderCharts(container, chart) {
   if (chart.metrics) renderMetrics(container, chart.metrics);
   if (chart.bands) renderBands(container, chart.bands);
   if (chart.dos) renderDos(container, chart.dos);
+  if (chart.pdos) renderPdos(container, chart.pdos);
 }
 
 function renderMetrics(container, metrics) {
@@ -151,6 +152,67 @@ function renderDos(container, dos) {
   const head = document.createElement("div");
   head.className = "chart-block";
   head.innerHTML = `<h3>态密度 (DOS)</h3><div class="chart-note">${energies.length} 能量点 · E − E_F (eV)</div>`;
+  head.appendChild(svg);
+  container.appendChild(head);
+}
+
+function renderPdos(container, pdos) {
+  const energies = pdos.energies_ev || [];
+  const elemDos = pdos.element_dos || {};
+  const elems = Object.keys(elemDos);
+  if (!energies.length || !elems.length) return;
+  const fermi = pdos.fermi_ev ?? 0;
+
+  let lo = Math.max(Math.min(...energies), fermi - 8);
+  let hi = Math.min(Math.max(...energies), fermi + 8);
+  let maxD = 0;
+  for (const el_ of elems) {
+    const arr = elemDos[el_] || [];
+    for (let i = 0; i < energies.length && i < arr.length; i++) {
+      if (energies[i] >= lo && energies[i] <= hi) maxD = Math.max(maxD, arr[i]);
+    }
+  }
+  maxD = maxD * 1.08 || 1;
+
+  const W = 340, H = 170, ML = 8, MR = 36, MT = 8, MB = 22;
+  const x = (e) => ML + ((e - lo) / (hi - lo)) * (W - ML - MR);
+  const y = (d) => MT + (1 - d / maxD) * (H - MT - MB);
+
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "投影态密度图" });
+  svg.append(el("line", { x1: x(fermi), y1: MT, x2: x(fermi), y2: H - MB, stroke: RED, "stroke-width": 1, "stroke-dasharray": "4 3" }));
+
+  const SERIES = ["#22527A", "#A03D2E", "#5B7553", "#7A5C8E", "#B07D2B", "#3E8E9E"];
+  const legend = [];
+  elems.forEach((name, idx) => {
+    const arr = elemDos[name] || [];
+    const color = SERIES[idx % SERIES.length];
+    legend.push({ name, color });
+    const pts = [];
+    for (let i = 0; i < energies.length && i < arr.length; i++) {
+      if (energies[i] < lo || energies[i] > hi) continue;
+      pts.push(`${x(energies[i]).toFixed(1)},${y(arr[i]).toFixed(2)}`);
+    }
+    if (pts.length > 1) {
+      svg.append(el("polyline", { points: pts.join(" "), fill: "none", stroke: color, "stroke-width": 1.3 }));
+    }
+  });
+
+  svg.append(el("line", { x1: ML, y1: H - MB, x2: W - MR, y2: H - MB, stroke: INK, "stroke-width": 1 }));
+  for (const e of ticks(lo, hi)) {
+    const t = el("text", { x: x(e), y: H - MB + 13, "text-anchor": "middle", "font-size": 9, fill: INK3, "font-family": "Spline Sans Mono, monospace" });
+    t.textContent = e.toFixed(0);
+    svg.append(t);
+  }
+  const fl = el("text", { x: x(fermi), y: MT + 9, "text-anchor": "end", "font-size": 9.5, fill: RED, "font-family": "Spline Sans Mono, monospace" });
+  fl.textContent = "E_F";
+  svg.append(fl);
+
+  const head = document.createElement("div");
+  head.className = "chart-block";
+  const legendHtml = legend
+    .map((g) => `<span class="pdos-legend-item"><span style="display:inline-block;width:14px;height:3px;background:${g.color};vertical-align:middle;margin-right:4px"></span>${g.name}</span>`)
+    .join("");
+  head.innerHTML = `<h3>投影态密度 (PDOS)</h3><div class="chart-note">${energies.length} 能量点 · 分元素贡献 · E (eV)，E_F 虚线</div><div class="pdos-legend">${legendHtml}</div>`;
   head.appendChild(svg);
   container.appendChild(head);
 }

@@ -172,6 +172,58 @@ def _structure_dope(args: dict) -> dict:
     return _call_cmd(cmd_structure_dope, ns)
 
 
+def _structure_molecule(args: dict) -> dict:
+    from dft_forge.cli import cmd_structure_molecule
+    import argparse
+    ns = argparse.Namespace(
+        kind=args.get("kind", ""),
+        box=float(args.get("box", 10.0)),
+        output=args.get("output"),
+    )
+    return _call_cmd(cmd_structure_molecule, ns)
+
+
+def _structure_reference(args: dict) -> dict:
+    from dft_forge.cli import cmd_structure_reference
+    import argparse
+    ns = argparse.Namespace(
+        element=args.get("element", ""),
+        output=args.get("output"),
+    )
+    return _call_cmd(cmd_structure_reference, ns)
+
+
+def _thermo_eads(args: dict) -> dict:
+    from dft_forge.cli import cmd_thermo_eads
+    import argparse
+    if args.get("ry_a") is None or args.get("ry_s") is None or args.get("ry_m") is None:
+        return {"error": "three SCF energies missing (E(surf+ads), E(surf), E(mol)) — run t0_scf for each first"}
+    ns = argparse.Namespace(
+        ry_a=args.get("ry_a"),
+        ry_s=args.get("ry_s"),
+        ry_m=args.get("ry_m"),
+        nat_a=args.get("nat_a"),
+        nat_mol=args.get("nat_mol"),
+    )
+    return _call_cmd(cmd_thermo_eads, ns)
+
+
+def _thermo_formation(args: dict) -> dict:
+    from dft_forge.cli import cmd_thermo_formation
+    import argparse
+    if args.get("compound_energy") is None:
+        return {"error": "compound_energy missing — run t0_scf for the compound first"}
+    refs = args.get("refs") or {}
+    ns = argparse.Namespace(
+        formula=args.get("formula", ""),
+        compound_energy=args.get("compound_energy"),
+        ref_element=list(refs.keys()),
+        ref_energy=[refs[k].get("energy_ry") for k in refs],
+        ref_natoms=[refs[k].get("natoms", 1) for k in refs],
+    )
+    return _call_cmd(cmd_thermo_formation, ns)
+
+
 def _structure_analyze(args: dict) -> dict:
     from dft_forge.cli import cmd_structure_analyze
     import argparse
@@ -272,6 +324,89 @@ def register_default_tools() -> None:
                 "required": ["source", "element"],
             },
             execute_fn=_structure_dope,
+        ),
+        ToolEntry(
+            id="structure.molecule",
+            name="Build Gas Molecule",
+            description=(
+                "Build a gas-phase molecule in a cubic box (Γ-point reference for "
+                "adsorption energies). kind: o2|n2|h2|cl2|co|oh|no|h2o|co2|nh3. "
+                "Example: {kind: 'o2'}"
+            ),
+            category="structure",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["o2", "n2", "h2", "cl2", "co", "oh", "no", "h2o", "co2", "nh3"]},
+                    "box": {"type": "number"},
+                    "output": {"type": "string"},
+                },
+                "required": ["kind"],
+            },
+            execute_fn=_structure_molecule,
+        ),
+        ToolEntry(
+            id="structure.reference",
+            name="Elemental Reference Phase",
+            description=(
+                "Elemental reference phase for formation-energy bookkeeping "
+                "(Si diamond, Na bcc, Ti hcp, O→O2 gas, ...). "
+                "Example: {element: 'Na'}"
+            ),
+            category="structure",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "element": {"type": "string", "description": "element symbol, e.g. Na, Si, Ti, O"},
+                    "output": {"type": "string"},
+                },
+                "required": ["element"],
+            },
+            execute_fn=_structure_reference,
+        ),
+        ToolEntry(
+            id="thermo.eads",
+            name="Adsorption Energy",
+            description=(
+                "E_ads = E(surface+adsorbate) − E(surface) − E(molecule), in eV. "
+                "Feed the three t0_scf energies. Example: {ry_a: -158.0, ry_s: -156.0, ry_m: -1.0}"
+            ),
+            category="analysis",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "ry_a": {"type": "number", "description": "E(surface+adsorbate) in Ry"},
+                    "ry_s": {"type": "number", "description": "E(surface) in Ry"},
+                    "ry_m": {"type": "number", "description": "E(molecule) in Ry"},
+                    "nat_a": {"type": "integer", "description": "adsorbed atoms on the surface"},
+                    "nat_mol": {"type": "integer", "description": "atoms in the gas molecule (2 for O2)"},
+                },
+                "required": ["ry_a", "ry_s", "ry_m"],
+            },
+            execute_fn=_thermo_eads,
+        ),
+        ToolEntry(
+            id="thermo.formation",
+            name="Formation Energy",
+            description=(
+                "E_form = E(compound) − Σ n_i·e_i(element per atom), in eV/atom. "
+                "refs maps element → {energy_ry, natoms} from structure.reference+t0_scf. "
+                "Example: {formula: 'NaCl', compound_energy: -164.0, refs: {Na: {energy_ry: -3.0, natoms: 2}, Cl: {energy_ry: -20.0, natoms: 2}}}"
+            ),
+            category="analysis",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "formula": {"type": "string"},
+                    "compound_energy": {"type": "number"},
+                    "refs": {
+                        "type": "object",
+                        "description": "element → {energy_ry: number, natoms: int}",
+                    },
+                },
+                "required": ["formula", "compound_energy", "refs"],
+            },
+            execute_fn=_thermo_formation,
         ),
         ToolEntry(
             id="structure.import",

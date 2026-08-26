@@ -324,6 +324,127 @@ def cmd_structure_dope(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_structure_molecule(args: argparse.Namespace) -> int:
+    """structure molecule: gas-phase molecule in a box → CIF."""
+    from ase.io import write as ase_write
+
+    from dft_forge.structure_builder import BuildResult, StructureBuildError, build_molecule
+
+    try:
+        result: BuildResult = build_molecule(args.kind, box=args.box)
+    except StructureBuildError as exc:
+        return _error_response(str(exc))
+
+    output_path = Path(args.output) if args.output else Path.cwd() / f"molecule_{args.kind}.cif"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ase_write(str(output_path), result.atoms)
+
+    data = result.to_dict()
+    data["command"] = "structure.molecule"
+    data["ok"] = True
+    data["output"] = str(output_path)
+    print(_json_dumps(data))
+    return 0
+
+
+def cmd_structure_reference(args: argparse.Namespace) -> int:
+    """structure reference: elemental reference phase for formation energies."""
+    from ase.io import write as ase_write
+
+    from dft_forge.structure_builder import BuildResult, StructureBuildError, build_reference
+
+    try:
+        result: BuildResult = build_reference(args.element)
+    except StructureBuildError as exc:
+        return _error_response(str(exc))
+
+    output_path = Path(args.output) if args.output else Path.cwd() / f"ref_{args.element}.cif"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ase_write(str(output_path), result.atoms)
+
+    data = result.to_dict()
+    data["command"] = "structure.reference"
+    data["ok"] = True
+    data["element"] = args.element
+    data["output"] = str(output_path)
+    print(_json_dumps(data))
+    return 0
+
+
+RY_TO_EV = 13.605693122994
+
+
+def cmd_thermo_eads(args: argparse.Namespace) -> int:
+    """thermo eads: E_ads = E(adsorbed) − E(surface) − (n_ads/n_mol)·E(molecule)."""
+    try:
+        e_a, e_s, e_m = args.ry_a, args.ry_s, args.ry_m
+    except TypeError:
+        return _error_response("eads requires --ry-a, --ry-s, --ry-m energies in Ry")
+    n_ads = int(getattr(args, "nat_a", 0) or 0)   # adsorbed atoms on the surface
+    n_mol = int(getattr(args, "nat_mol", 0) or 0)  # atoms in the gas molecule
+    if n_ads > 0 and n_mol > 0:
+        # one O atom adsorbed but the reference gas is O2 → subtract E(O2)/2
+        ratio = n_ads / n_mol
+    else:
+        ratio = 1.0
+    e_ads = e_a - e_s - ratio * e_m
+    data = {
+        "command": "thermo.eads",
+        "ok": True,
+        "e_ads_ev": round(e_ads * RY_TO_EV, 4),
+        "e_ads_ry": round(e_ads, 6),
+        "e_ads_ev_per_adsorbate": round(e_ads * RY_TO_EV / n_ads, 4) if n_ads else None,
+        "molecule_ratio": round(ratio, 4),
+        "formula_note": (
+            f"E_ads = E(surf+ads) − E(surf) − {ratio:g}·E(mol) "
+            "(molecule energy scaled by adsorbed-atom count); negative = exothermic"
+        ),
+    }
+    print(_json_dumps(data))
+    return 0
+
+
+def cmd_thermo_formation(args: argparse.Namespace) -> int:
+    """thermo formation: E_form from compound + elemental reference energies."""
+    from dft_forge.compiler import formula_atoms
+
+    try:
+        atoms, _proto = formula_atoms(args.formula)
+    except Exception as exc:
+        return _error_response(f"cannot parse formula {args.formula!r}: {exc}")
+
+    counts: Dict[str, int] = {}
+    for s in atoms.get_chemical_symbols():
+        counts[s] = counts.get(s, 0) + 1
+
+    refs = dict(zip(args.ref_element or [], args.ref_energy or []))
+    refs = {el: float(e) for el, e in refs.items()}
+    ref_n = dict(zip(args.ref_element or [], args.ref_natoms or []))
+    ref_n = {el: int(n) for el, n in ref_n.items()}
+
+    missing = [el for el in counts if el not in refs]
+    if missing:
+        return _error_response(
+            f"missing reference energy for: {', '.join(missing)} — run structure.reference + t0_scf for each"
+        )
+
+    e_comp = float(args.compound_energy)
+    e_form = e_comp - sum(n * (refs[el] / ref_n.get(el, 1)) for el, n in counts.items())
+    n_atoms = sum(counts.values())
+    data = {
+        "command": "thermo.formation",
+        "ok": True,
+        "formula": args.formula,
+        "formation_energy_ev_per_atom": round(e_form * RY_TO_EV / n_atoms, 4),
+        "formation_energy_ev_per_formula": round(e_form * RY_TO_EV, 4),
+        "composition": counts,
+        "n_atoms": n_atoms,
+        "formula_note": "E_form = E(compound) − Σ n_i·e_i(element per atom); negative = thermodynamically stable vs elements",
+    }
+    print(_json_dumps(data))
+    return 0
+
+
 def cmd_structure_analyze(args: argparse.Namespace) -> int:
     from dft_forge.structure import StructureImporter
 
@@ -362,55 +483,9 @@ def cmd_structure_analyze(args: argparse.Namespace) -> int:
 
 
 def _analyze_structure(atoms, pair_types=None):
-    result = {
-        "formula": atoms.get_chemical_formula(),
-        "natoms": len(atoms),
-        "species": sorted({sym for sym in atoms.get_chemical_symbols()}),
-        "nspecies": len(sorted({sym for sym in atoms.get_chemical_symbols()})),
-        "lattice_vectors_angstrom": atoms.cell.tolist(),
-        "volume_angstrom3": float(abs(np.linalg.det(atoms.cell))),
-        "volume_bohr3": float(abs(np.linalg.det(atoms.cell)) * 1.8897261246 ** 3),
-        "pbc": atoms.pbc.tolist() if hasattr(atoms.pbc, "tolist") else list(atoms.pbc),
-    }
+    from dft_forge.structure_analysis import analyze
 
-    if len(atoms) >= 2:
-        try:
-            positions = atoms.get_positions()
-            species = atoms.get_chemical_symbols()
-            min_dist = float("inf")
-            min_pair = None
-            pair_dists = {}
-            for i in range(len(atoms)):
-                for j in range(i + 1, len(atoms)):
-                    pair = tuple(sorted((species[i], species[j])))
-                    allowed = True
-                    if pair_types:
-                        allowed = pair in pair_types or (species[i], species[j]) in pair_types or (species[j], species[i]) in pair_types
-                    if not allowed:
-                        continue
-                    dist = float(np.linalg.norm(positions[i] - positions[j]))
-                    if dist <= 1e-12:
-                        continue
-                    pair_dists.setdefault(str(pair), []).append(dist)
-                    if dist < min_dist:
-                        min_dist = dist
-                        min_pair = pair
-
-            result["minimum_distance_angstrom"] = min_dist if min_dist != float("inf") else None
-            result["minimum_distance_pair"] = min_pair
-            result["pair_distances"] = {
-                pair: {
-                    "count": len(vals),
-                    "min_angstrom": min(vals),
-                    "max_angstrom": max(vals),
-                    "mean_angstrom": float(np.mean(vals)),
-                }
-                for pair, vals in pair_dists.items()
-            }
-        except Exception as exc:
-            result["analysis_error"] = str(exc)
-
-    return result
+    return analyze(atoms, pair_types=pair_types)
 
 
 def cmd_materials_list(args: argparse.Namespace) -> int:
@@ -987,13 +1062,38 @@ def main() -> int:
     dop.add_argument("--index", type=int, default=0, help="Atom index to substitute in the supercell")
     dop.add_argument("--output", default=None, help="Output CIF path")
 
-    ana = struct_sub.add_parser("analyze", help="Analyze structure: formula, cell, pair distances, bond lengths")
+    ana = struct_sub.add_parser("analyze", help="Analyze structure: formula, cell, bonds, angles, coordination, space group")
     ana.add_argument("source", help="Path to structure file or inline content")
     ana.add_argument("--format", default=None, choices=["cif", "poscar", "xyz", "qe_input", "explicit"])
     ana.add_argument("--fractional", action="store_true", default=False)
     ana.add_argument("--min-nn", type=float, default=0.8)
     ana.add_argument("--pair-types", default=None, help="Optional comma-separated pairs like Na-Cl,Si-Si")
     ana.add_argument("--output", default=None)
+
+    mol = struct_sub.add_parser("molecule", help="Build a gas molecule in a box (O2/H2/CO/...)")
+    mol.add_argument("kind", help="o2 | n2 | h2 | cl2 | co | oh | no | h2o | co2 | nh3")
+    mol.add_argument("--box", type=float, default=10.0, help="Cubic box edge in Å")
+    mol.add_argument("--output", default=None)
+
+    ref = struct_sub.add_parser("reference", help="Elemental reference phase for formation energies")
+    ref.add_argument("element", help="Element symbol, e.g. Na, Si, Ti, O (O→O2 gas)")
+    ref.add_argument("--output", default=None)
+
+    # thermo
+    th = subparsers.add_parser("thermo", help="Thermochemistry from computed energies")
+    th_sub = th.add_subparsers(dest="thermo_command")
+    ea = th_sub.add_parser("eads", help="Adsorption energy from three SCF energies")
+    ea.add_argument("--ry-a", type=float, required=True, help="E(surface+adsorbate) in Ry")
+    ea.add_argument("--ry-s", type=float, required=True, help="E(surface) in Ry")
+    ea.add_argument("--ry-m", type=float, required=True, help="E(molecule) in Ry")
+    ea.add_argument("--nat-a", type=int, default=None, help="Adsorbed atoms on the surface (e.g. 1)")
+    ea.add_argument("--nat-mol", type=int, default=None, help="Atoms in the gas molecule (e.g. 2 for O2)")
+    fm = th_sub.add_parser("formation", help="Formation energy from compound + element references")
+    fm.add_argument("--formula", required=True, help="Compound formula, e.g. NaCl, CaTiO3")
+    fm.add_argument("--compound-energy", type=float, required=True, help="E(compound) in Ry")
+    fm.add_argument("--ref-element", action="append", default=None, help="Element (repeatable)")
+    fm.add_argument("--ref-energy", action="append", default=None, help="Reference cell energy in Ry (repeatable)")
+    fm.add_argument("--ref-natoms", action="append", default=None, help="Atoms in reference cell (repeatable)")
 
     # materials
     mat = subparsers.add_parser("materials", help="Material catalog commands")
@@ -1106,7 +1206,18 @@ def main() -> int:
                 return cmd_structure_dope(args)
             if args.structure_command == "analyze":
                 return cmd_structure_analyze(args)
+            if args.structure_command == "molecule":
+                return cmd_structure_molecule(args)
+            if args.structure_command == "reference":
+                return cmd_structure_reference(args)
             return _error_response("Unknown structure command")
+
+        if args.command == "thermo":
+            if args.thermo_command == "eads":
+                return cmd_thermo_eads(args)
+            if args.thermo_command == "formation":
+                return cmd_thermo_formation(args)
+            return _error_response("Unknown thermo command")
 
         if args.command == "materials":
             if args.materials_command == "list":

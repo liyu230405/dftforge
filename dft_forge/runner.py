@@ -688,6 +688,8 @@ class TaskRunner:
                 return self.executor.run_bands_x(input_file, workdir)
             if tool == "dos.x":
                 return self.executor.run_dos_x(input_file, workdir)
+            if tool == "projwfc.x":
+                return self.executor.run_projwfc_x(input_file, workdir)
 
         handle = self.executor.stage({"input_file": str(input_file), "tool": tool})
         handle = self.executor.submit(handle, {"input_file": str(input_file), "workdir": str(workdir)})

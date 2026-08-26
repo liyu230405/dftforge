@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 from ase import Atom, Atoms
 from ase.build import graphene as ase_graphene
 from ase.build import make_supercell as ase_make_supercell
@@ -335,3 +336,151 @@ def dope_3d(
     n_el = atoms.get_chemical_symbols().count(str(element))
     description = f"{host}→{element} in {m}x{n}x{p} supercell ({frac:.1f}% nominal, {n_el} atom)"
     return BuildResult(atoms=atoms, description=description)
+
+
+# ── Gas molecules (adsorption references) and elemental reference phases ──────
+
+# bond lengths in Å; boxed in a cube with BOX edge so images never interact
+MOLECULES: Dict[str, list] = {
+    # name: [(element, x, y, z), ...]
+    "h2": [("H", -0.370, 0.0, 0.0), ("H", 0.370, 0.0, 0.0)],
+    "o2": [("O", -0.605, 0.0, 0.0), ("O", 0.605, 0.0, 0.0)],
+    "n2": [("N", -0.550, 0.0, 0.0), ("N", 0.550, 0.0, 0.0)],
+    "cl2": [("Cl", -0.995, 0.0, 0.0), ("Cl", 0.995, 0.0, 0.0)],
+    "co": [("C", -0.570, 0.0, 0.0), ("O", 0.570, 0.0, 0.0)],
+    "oh": [("O", -0.490, 0.0, 0.0), ("H", 0.490, 0.0, 0.0)],
+    "no": [("N", -0.575, 0.0, 0.0), ("O", 0.575, 0.0, 0.0)],
+    "h2o": [("O", 0.0, 0.117, 0.0), ("H", 0.757, -0.470, 0.0), ("H", -0.757, -0.470, 0.0)],
+    "co2": [("C", 0.0, 0.0, 0.0), ("O", 1.160, 0.0, 0.0), ("O", -1.160, 0.0, 0.0)],
+    "nh3": [("N", 0.0, 0.0, 0.100), ("H", 0.937, 0.0, -0.265), ("H", -0.469, 0.812, -0.265), ("H", -0.469, -0.812, -0.265)],
+}
+
+# elemental reference phases for formation energies: (formula, kind, params)
+# kind: diamond | bcc | fcc | hcp | molecule — phase chosen by convention
+# (standard DFT reference set, e.g. the Materials Project / AFLOW conventions)
+REFERENCE_PHASES: Dict[str, tuple] = {
+    "Si": ("diamond", 5.430),
+    "Ge": ("diamond", 5.658),
+    "C": ("diamond", 3.567),
+    "Sn": ("diamond", 6.489),
+    "Na": ("bcc", 4.231),
+    "K": ("bcc", 5.247),
+    "Mo": ("bcc", 3.147),
+    "W": ("bcc", 3.165),
+    "V": ("bcc", 3.024),
+    "Nb": ("bcc", 3.301),
+    "Ta": ("bcc", 3.306),
+    "Cr": ("bcc", 2.884),
+    "Fe": ("bcc", 2.866),
+    "Ca": ("fcc", 5.588),
+    "Al": ("fcc", 4.050),
+    "Ni": ("fcc", 3.524),
+    "Cu": ("fcc", 3.615),
+    "Ag": ("fcc", 4.085),
+    "Au": ("fcc", 4.078),
+    "Pt": ("fcc", 3.924),
+    "Pd": ("fcc", 3.890),
+    "Pb": ("fcc", 4.951),
+    "Ti": ("hcp", 2.951, 4.684),
+    "Zr": ("hcp", 3.232, 5.147),
+    "Hf": ("hcp", 3.195, 5.051),
+    "Mg": ("hcp", 3.209, 5.211),
+    "Zn": ("hcp", 2.665, 4.947),
+    "Co": ("hcp", 2.507, 4.070),
+    "O": ("molecule", "o2"),
+    "N": ("molecule", "n2"),
+    "H": ("molecule", "h2"),
+    "Cl": ("molecule", "cl2"),
+    "F": ("molecule", "f2"),
+}
+
+_BOX = 10.0
+
+
+def build_molecule(kind: str, *, box: float = _BOX) -> BuildResult:
+    """Build a gas-phase molecule in a cubic box (Gamma-point SCF reference)."""
+    key = kind.lower().replace("-", "").replace("_", "").replace(" ", "")
+    if key not in MOLECULES:
+        raise StructureBuildError(
+            f"unknown molecule '{kind}'; available: {', '.join(sorted(MOLECULES))}"
+        )
+    spec = MOLECULES[key]
+    symbols = [s for s, *_ in spec]
+    pos = [[x + box / 2, y + box / 2, z + box / 2] for _, x, y, z in spec]
+    # pbc=False keeps every k-mesh at Γ (molecules have no periodicity)
+    atoms = Atoms(symbols, positions=pos, cell=[box, box, box], pbc=False)
+    check_distances(atoms, f"molecule {key}")
+    name = {"o2": "O₂", "n2": "N₂", "h2": "H₂", "cl2": "Cl₂", "f2": "F₂",
+            "co": "CO", "oh": "OH", "no": "NO", "h2o": "H₂O", "co2": "CO₂",
+            "nh3": "NH₃"}.get(key, key)
+    return BuildResult(atoms=atoms, description=f"{name} 分子（{box:g} Å 立方盒子，Γ 点）")
+
+
+def build_reference(element: str) -> BuildResult:
+    """Elemental reference phase for formation-energy bookkeeping."""
+    el = element.strip()
+    el = el.capitalize() if len(el) > 1 else el.upper()
+    if el not in REFERENCE_PHASES:
+        raise StructureBuildError(
+            f"no reference phase for '{el}' — supported: "
+            + ", ".join(sorted(REFERENCE_PHASES))
+        )
+    spec = REFERENCE_PHASES[el]
+    kind = spec[0]
+    if kind == "molecule":
+        res = build_molecule(spec[1])
+        res.description = f"{el} 参考态: {res.description}"
+        return res
+    if kind == "diamond":
+        a = spec[1]
+        cell = [[0, a / 2, a / 2], [a / 2, 0, a / 2], [a / 2, a / 2, 0]]
+        atoms = Atoms(
+            [el, el],
+            scaled_positions=[(0, 0, 0), (0.25, 0.25, 0.25)],
+            cell=cell, pbc=True,
+        )
+        phase = "金刚石结构"
+    elif kind == "bcc":
+        a = spec[1]
+        atoms = Atoms(
+            [el, el],
+            scaled_positions=[(0, 0, 0), (0.5, 0.5, 0.5)],
+            cell=np.eye(3) * a, pbc=True,
+        )
+        phase = "BCC"
+    elif kind == "fcc":
+        a = spec[1]
+        cell = [[0, a / 2, a / 2], [a / 2, 0, a / 2], [a / 2, a / 2, 0]]
+        atoms = Atoms(
+            [el] * 4,
+            scaled_positions=[(0, 0, 0), (0.5, 0.5, 0), (0.5, 0, 0.5), (0, 0.5, 0.5)],
+            cell=cell, pbc=True,
+        )
+        phase = "FCC"
+    else:  # hcp
+        a, c = spec[1], spec[2]
+        cell = [
+            [a, 0, 0],
+            [-a / 2, a * math.sqrt(3) / 2, 0],
+            [0, 0, c],
+        ]
+        atoms = Atoms(
+            [el] * 2,
+            scaled_positions=[(1 / 3, 2 / 3, 0.25), (2 / 3, 1 / 3, 0.75)],
+            cell=cell, pbc=True,
+        )
+        phase = "HCP"
+    check_distances(atoms, f"reference {el}")
+    return BuildResult(atoms=atoms, description=f"{el} 参考态: {phase}")
+
+
+def reference_elements(formula: str) -> list:
+    """Elements of a formula, each once, in composition order."""
+    from dft_forge.compiler import formula_atoms
+
+    atoms, _proto = formula_atoms(formula)
+    seen = []
+    for s in atoms.get_chemical_symbols():
+        if s not in seen:
+            seen.append(s)
+    return seen

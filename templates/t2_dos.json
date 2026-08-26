@@ -34,7 +34,8 @@
         "material": "${inputs.material}",
         "ecutwfc": "${inputs.ecutwfc}",
         "nbnd": "${inputs.nbnd}",
-        "structure": "${inputs.structure}"
+        "structure": "${inputs.structure}",
+        "kmode": "uniform"
       },
       "depends_on": [
         "scf"
@@ -53,6 +54,19 @@
       },
       "depends_on": [
         "scf",
+        "nscf"
+      ],
+      "max_repair_attempts": 1
+    },
+    {
+      "id": "pdos",
+      "tool": "qe",
+      "params": {
+        "calc": "pdos",
+        "material": "${inputs.material}",
+        "structure": "${inputs.structure}"
+      },
+      "depends_on": [
         "nscf"
       ],
       "max_repair_attempts": 1

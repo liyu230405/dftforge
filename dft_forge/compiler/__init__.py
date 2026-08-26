@@ -110,16 +110,13 @@ def build_atoms(material: str) -> Atoms:
 
     db = MATERIAL_DB[material]
     a_angstrom = get_lattice_constant_angstrom(material)
-    a_bohr = a_angstrom * 1.8897261246
 
     if "cellpar" in db and "sites" in db:
-        # Library material: exact MP cell + fractional sites.
-        # Cell lengths are converted to Bohr to match the built-in convention
-        # (CELL_PARAMETERS are emitted in alat units of celldm(1) in Bohr).
+        # Library material: exact MP cell + fractional sites (Å, ASE convention)
         from ase.cell import Cell
 
         a, b, c, alpha, beta, gamma = db["cellpar"]
-        cell = Cell.fromcellpar([a * 1.8897261246, b * 1.8897261246, c * 1.8897261246, alpha, beta, gamma])
+        cell = Cell.fromcellpar([a, b, c, alpha, beta, gamma])
         symbols = [s[0] for s in db["sites"]]
         positions = [s[1] for s in db["sites"]]
         atoms = Atoms(symbols=symbols, scaled_positions=positions, cell=cell, pbc=True)
@@ -129,9 +126,9 @@ def build_atoms(material: str) -> Atoms:
         # Diamond structure: primitive 2-atom cell
         # Lattice vectors for FCC primitive cell
         cell = [
-            [0, a_bohr/2, a_bohr/2],
-            [a_bohr/2, 0, a_bohr/2],
-            [a_bohr/2, a_bohr/2, 0]
+            [0, a_angstrom/2, a_angstrom/2],
+            [a_angstrom/2, 0, a_angstrom/2],
+            [a_angstrom/2, a_angstrom/2, 0]
         ]
         # Positions in crystal coordinates of primitive cell
         pos = [
@@ -144,9 +141,9 @@ def build_atoms(material: str) -> Atoms:
     elif material == "Al":
         # FCC primitive cell: 1 atom
         cell = [
-            [0, a_bohr/2, a_bohr/2],
-            [a_bohr/2, 0, a_bohr/2],
-            [a_bohr/2, a_bohr/2, 0]
+            [0, a_angstrom/2, a_angstrom/2],
+            [a_angstrom/2, 0, a_angstrom/2],
+            [a_angstrom/2, a_angstrom/2, 0]
         ]
         pos = [[0, 0, 0]]
         atoms = Atoms("Al", scaled_positions=pos, cell=cell, pbc=True)
@@ -155,9 +152,9 @@ def build_atoms(material: str) -> Atoms:
     elif material == "MgO":
         # NaCl structure: primitive 2-atom cell (FCC lattice with 2-atom basis)
         cell = [
-            [0, a_bohr/2, a_bohr/2],
-            [a_bohr/2, 0, a_bohr/2],
-            [a_bohr/2, a_bohr/2, 0]
+            [0, a_angstrom/2, a_angstrom/2],
+            [a_angstrom/2, 0, a_angstrom/2],
+            [a_angstrom/2, a_angstrom/2, 0]
         ]
         # Mg at (0,0,0), O at (0.5,0.5,0.5) in primitive coordinates
         pos = [
@@ -649,10 +646,13 @@ class QECompiler:
         # CELL_PARAMETERS: only for ibrav=0 (free cell)
         # For ibrav != 0, QE derives the cell from celldm(1) and bravais-lattice index
         if db["ibrav"] == 0:
-            # Cell vectors are in Bohr; express them in alat units (alat = celldm(1) in Bohr)
+            # atoms.cell is in Å; alat = celldm(1) is in Bohr — convert both
+            # to the same unit before dividing, or the lattice shrinks by
+            # BOHR_PER_ANG (cells at 53% size → garbage energies)
+            alat_ang = alat_bohr / BOHR_PER_ANG
             lines.append("CELL_PARAMETERS (alat=1.0)")
             for vec in atoms.cell:
-                lines.append(f"  {vec[0]/alat_bohr:.8f}  {vec[1]/alat_bohr:.8f}  {vec[2]/alat_bohr:.8f}")
+                lines.append(f"  {vec[0]/alat_ang:.8f}  {vec[1]/alat_ang:.8f}  {vec[2]/alat_ang:.8f}")
             lines.append("")
         
         # K_POINTS
@@ -682,11 +682,14 @@ class QECompiler:
         nbnd: Optional[int] = None,
         nkpoints_bands: int = 60,
         atoms: Optional[Atoms] = None,
+        kmode: str = "path",
     ) -> str:
         """Compile a generic SCF or NSCF input file.
-        
+
         Used for T2 bands/DOS steps. Pass ``atoms`` to compile from an
-        arbitrary structure instead of a MATERIAL_DB material.
+        arbitrary structure instead of a MATERIAL_DB material. ``kmode``:
+        "path" (nscf along the high-symmetry band path, for bands.x) or
+        "uniform" (dense automatic mesh, for dos.x / projwfc.x).
         """
         db, atoms, alat_bohr = self._resolve(material, atoms)
         
@@ -758,14 +761,16 @@ class QECompiler:
         # CELL_PARAMETERS — only for ibrav=0; for ibrav != 0 QE derives the
         # cell from celldm(1) and emitting both is a fatal "redundant data" error
         if db["ibrav"] == 0:
+            # atoms.cell (Å) must be divided by alat in Å, not in Bohr
+            alat_ang = alat_bohr / BOHR_PER_ANG
             lines.append("CELL_PARAMETERS (alat=1.0)")
             for vec in atoms.cell:
-                lines.append(f"  {vec[0]/alat_bohr:.8f}  {vec[1]/alat_bohr:.8f}  {vec[2]/alat_bohr:.8f}")
+                lines.append(f"  {vec[0]/alat_ang:.8f}  {vec[1]/alat_ang:.8f}  {vec[2]/alat_ang:.8f}")
             lines.append("")
         
         # K_POINTS — SCF uses a uniform grid; NSCF runs the high-symmetry
         # band path so bands.x can post-process the same k-points
-        if calculation == "nscf":
+        if calculation == "nscf" and kmode == "path":
             kpts_path = get_bandpath_kpoints(material, npoints=nkpoints_bands, atoms=atoms)
             lines.append("K_POINTS crystal")
             lines.append(f"  {len(kpts_path)}")
@@ -774,6 +779,11 @@ class QECompiler:
                 lines.append(f"  {k[0]:.8f}  {k[1]:.8f}  {k[2]:.8f}  1.0")
             lines.append("")
         else:
+            if calculation == "nscf":
+                # uniform nscf for DOS/PDOS: dense mesh, k=1 stays k=1
+                kpoints = tuple(
+                    (max(1, 2 * n) if n > 1 else 1) for n in kpoints[:3]
+                ) + tuple(kpoints[3:])
             lines.append("K_POINTS automatic")
             lines.append(f"  {kpoints[0]} {kpoints[1]} {kpoints[2]}  {kpoints[3]} {kpoints[4]} {kpoints[5]}")
             lines.append("")
@@ -897,6 +907,46 @@ class QECompiler:
         lines.append("/")
 
         content = "\n".join(lines) + "\n"  # trailing newline: QE 7.5 dos.x namelist reader aborts without it
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(content)
+        return content
+
+    def compile_pdos_input(
+        self,
+        material: str,
+        output_path: Path,
+        *,
+        prefix: Optional[str] = None,
+        deltae: float = 0.01,
+        fwhm: float = 0.05,
+        ngauss: int = 1,
+        atoms: Optional[Atoms] = None,
+    ) -> str:
+        """Compile a projwfc.x input for projected DOS.
+
+        Requires a prior nscf with the same prefix; produces one
+        {prefix}.pdos_atm#N(wfc#M) file per atomic wavefunction plus
+        {prefix}.pdos_tot for the total DOS.
+        """
+        if atoms is None and material not in MATERIAL_DB:
+            raise ValueError(f"Unknown material: {material}")
+
+        prefix = prefix or material.lower()
+
+        lines = []
+        lines.append("&projwfc")
+        lines.append(f'  prefix = "{prefix}"')
+        lines.append('  outdir = "./"')
+        lines.append(f'  filpdos = "{prefix}"')
+        lines.append(f"  ngauss = {ngauss}")
+        lines.append(f"  degauss = {fwhm}")
+        lines.append(f"  DeltaE = {deltae}")
+        # QE 7.x writes the pdos files ONLY when lsym=.true. (projwfc.f90:
+        # "ELSE IF ( lsym .OR. kresolveddos ) THEN CALL partialdos")
+        lines.append("  lsym = .true.")
+        lines.append("/")
+        # trailing newline: QE namelist readers abort without it
+        content = "\n".join(lines) + "\n"
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(content)
         return content

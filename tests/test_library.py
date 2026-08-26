@@ -70,9 +70,9 @@ class TestBuildAtomsLibrary:
         assert Formula(atoms.get_chemical_formula()).reduce()[0] == Formula("AlN").reduce()[0]
         db = LIBRARY_MATERIALS["AlN"]
         a_ang, c_ang = db["cellpar"][0], db["cellpar"][2]
-        # |a1| in Bohr should match a * conversion
+        # cell in Å (ASE convention; the compiler converts to alat itself)
         lengths = np.linalg.norm(atoms.cell.array, axis=1)
-        assert lengths.max() == pytest.approx(max(a_ang, c_ang) * 1.8897261246, rel=1e-4)
+        assert lengths.max() == pytest.approx(max(a_ang, c_ang), rel=1e-4)
 
     def test_bcc_li(self):
         atoms = build_atoms("Li")

@@ -182,6 +182,9 @@ class FakeExecutor(Executor):
     def run_dos_x(self, input_file: Path, workdir: Path) -> JobResult:
         return self.run_pw(input_file, workdir)
 
+    def run_projwfc_x(self, input_file: Path, workdir: Path) -> JobResult:
+        return self.run_pw(input_file, workdir)
+
 
 # ── LocalExecutor ──────────────────────────────────────────────────────────────
 
@@ -335,6 +338,9 @@ class LocalExecutor(Executor):
 
     def run_dos_x(self, input_file: Path, workdir: Path) -> JobResult:
         return self._run_tool("dos.x", input_file, workdir)
+
+    def run_projwfc_x(self, input_file: Path, workdir: Path) -> JobResult:
+        return self._run_tool("projwfc.x", input_file, workdir)
 
     def _run_tool(self, binary: str, input_file: Path, workdir: Path) -> JobResult:
         workdir = Path(workdir).resolve()

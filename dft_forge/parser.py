@@ -88,6 +88,18 @@ class ParsedDOS:
     dos: Optional[np.ndarray] = None
 
 
+@dataclass
+class ParsedPDOS:
+    """Parsed projected DOS from projwfc.x output files."""
+    fermi_energy_ev: float = 0.0
+    n_energy_points: int = 0
+    # element -> summed projected DOS on a common energy grid
+    energies: Optional[np.ndarray] = None
+    element_dos: Optional[Dict[str, np.ndarray]] = None
+    # atom index (1-based, QE order) -> element
+    atom_elements: Optional[List[str]] = None
+
+
 # ── Main parser class ─────────────────────────────────────────────────────────
 
 class QEParser:
@@ -226,8 +238,63 @@ class QEParser:
                 )
             if xml_data.get("cell") and result.cell is None:
                 result.cell = xml_data["cell"]
-        
+
         return result
+
+    @staticmethod
+    def extract_final_structure(stdout: str):
+        """Final relaxed structure from vc-relax stdout.
+
+        QE prints the last CELL_PARAMETERS + ATOMIC_POSITIONS after
+        'Begin final coordinates'. Cell vectors are in bohr (alat units);
+        positions respect their own declared unit.
+        Returns ASE Atoms (Å) or None.
+        """
+        BOHR = 0.529177210903
+        _num = r"-?\d+\.?\d*(?:[eE][+-]?\d+)?"
+        cell_blocks = re.findall(
+            r"CELL_PARAMETERS\s+\(\w+\s*=\s*([\d.]+)\)\s*\n"
+            rf"((?:\s*{_num}\s+{_num}\s+{_num}\s*\n){{3}})",
+            stdout,
+        )
+        pos_blocks = re.findall(
+            r"ATOMIC_POSITIONS\s*[({]\s*(\w+)\s*[=)}][^\n]*\n"
+            rf"((?:\s*[A-Za-z]{{1,2}}\s+{_num}\s+{_num}\s+{_num}[^\n]*\n)+)",
+            stdout,
+        )
+        if not cell_blocks or not pos_blocks:
+            return None
+
+        alat_bohr = float(cell_blocks[-1][0])
+        cell_bohr = np.array([
+            [float(x) for x in line.split()]
+            for line in cell_blocks[-1][1].strip().splitlines()
+        ]) * alat_bohr
+        cell_ang = cell_bohr * BOHR
+
+        mode = pos_blocks[-1][0].lower()
+        symbols, cart_ang = [], []
+        for line in pos_blocks[-1][1].strip().splitlines():
+            parts = line.split()
+            if len(parts) < 4 or parts[0][0].isdigit():
+                continue
+            symbols.append(parts[0])
+            xyz = np.array([float(x) for x in parts[1:4]])
+            if mode == "crystal":
+                cart_ang.append(xyz @ cell_ang)
+            elif mode == "alat":
+                cart_ang.append(xyz * alat_bohr * BOHR)
+            elif mode in ("bohr", "au"):
+                cart_ang.append(xyz * BOHR)
+            else:  # angstrom
+                cart_ang.append(xyz)
+
+        if not symbols:
+            return None
+
+        from ase import Atoms
+
+        return Atoms(symbols, positions=np.array(cart_ang), cell=cell_ang, pbc=True)
 
     @staticmethod
     def parse_bands(xml_path: Path) -> ParsedBands:
@@ -341,6 +408,124 @@ class QEParser:
             pass
         
         return result
+
+    @staticmethod
+    def parse_pdos(workdir: Path, prefix: str) -> ParsedPDOS:
+        """Parse projwfc.x per-atom pdos files, summed per element.
+
+        Atom->element mapping comes from the QE XML in the .save dir; if the
+        XML is unavailable, from the pw stdout 'site n.' table.
+        """
+        result = ParsedPDOS()
+        atm_files = sorted(workdir.glob(f"{prefix}.pdos_atm*"))
+        if not atm_files:
+            return result
+
+        # atom index -> element: try QE XML (nscf wrote it into a .save dir
+        # that projwfc read); fall back to projwfc stdout table
+        atom_elements: Dict[int, str] = {}
+        xml_candidates = list(workdir.glob("*.xml")) + list(workdir.glob(f"{prefix}.save/*.xml"))
+        for xml in xml_candidates:
+            atom_elements = QEParser._xml_atom_species(xml)
+            if atom_elements:
+                result.fermi_energy_ev = QEParser._xml_fermi_ev(xml)
+                break
+        if not atom_elements:
+            for out in workdir.glob("*.out"):
+                try:
+                    atom_elements = QEParser._stdout_atom_species(out.read_text())
+                except OSError:
+                    continue
+                if atom_elements:
+                    break
+
+        energies: Optional[np.ndarray] = None
+        elem_dos: Dict[str, np.ndarray] = {}
+        for f in atm_files:
+            m = re.search(r"atm#(\d+)\(", f.name)
+            if not m:
+                continue
+            atom_idx = int(m.group(1))
+            try:
+                data = np.loadtxt(f)
+            except Exception:
+                continue
+            if data.ndim != 2 or data.shape[1] < 2:
+                continue
+            e = data[:, 0] * RY_TO_EV
+            ldos = data[:, 1]
+            if energies is None:
+                energies = e
+                result.n_energy_points = len(e)
+            elif len(e) == len(energies):
+                ldos = ldos[: len(energies)]
+            else:
+                continue
+            el = atom_elements.get(atom_idx)
+            if el is None:
+                continue
+            elem_dos[el] = elem_dos.get(el, np.zeros_like(energies)) + ldos
+
+        if energies is not None and elem_dos:
+            result.energies = energies
+            result.element_dos = elem_dos
+            result.atom_elements = [atom_elements.get(i, "?") for i in range(1, max(atom_elements) + 1)] if atom_elements else None
+        return result
+
+    @staticmethod
+    def _xml_atom_species(xml_path: Path) -> Dict[int, str]:
+        """1-based atom index -> element symbol from QE XML."""
+        out: Dict[int, str] = {}
+        try:
+            root = ET.parse(xml_path).getroot()
+        except Exception:
+            return out
+        ns = {"qes": "http://www.quantum-espresso.org/ns/qes/qes-1.0"}
+
+        def find_all(elem, local: str):
+            found = elem.findall(f".//{{{ns['qes']}}}{local}")
+            return found or elem.findall(f".//{local}")
+
+        atoms = find_all(root, "atom")
+        for i, a in enumerate(atoms, start=1):
+            name = a.get("name") or a.get("species")
+            if name:
+                out[i] = name.capitalize() if len(name) > 1 else name.upper()
+        return out
+
+    @staticmethod
+    def _xml_fermi_ev(xml_path: Path) -> float:
+        """Fermi level in eV from a QE XML (Hartree internally)."""
+        try:
+            root = ET.parse(xml_path).getroot()
+            for elem in root.iter("fermi_energy"):
+                if elem.text:
+                    return float(elem.text) * 27.211386245988
+            for elem in root.iter("highestOccupiedLevel"):
+                if elem.text:
+                    return float(elem.text) * 27.211386245988
+        except Exception:
+            pass
+        return 0.0
+
+    @staticmethod
+    def _stdout_atom_species(stdout: str) -> Dict[int, str]:
+        """1-based atom index -> element from pw stdout 'site n.' PAW block."""
+        out: Dict[int, str] = {}
+        # QE prints a table: "site n.     atom      ... " followed by rows
+        # like "   1          Na ..."
+        m = re.search(
+            r"site n\.\s+atom\s+.*?\n((?:\s+\d+\s+[A-Za-z]{1,2}\s.*\n)+)",
+            stdout,
+        )
+        if not m:
+            return out
+        for line in m.group(1).strip().splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].isdigit():
+                sym = parts[1]
+                out[int(parts[0])] = sym.capitalize() if len(sym) > 1 else sym.upper()
+        return out
 
     @staticmethod
     def parse_xml(xml_path: Path) -> Dict[str, Any]:

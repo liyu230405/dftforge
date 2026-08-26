@@ -78,7 +78,7 @@ class QECalcTool:
         workdir = ctx.node_workdir(node.node_id)
         workdir.mkdir(parents=True, exist_ok=True)
 
-        if calc in ("nscf", "bands", "dos"):
+        if calc in ("nscf", "bands", "dos", "pdos"):
             self._link_upstream_save(ctx, workdir, prefix)
 
         if calc == "vc-relax":
@@ -91,6 +91,8 @@ class QECalcTool:
             return self._run_bands(material, prefix, params, workdir, atoms)
         if calc == "dos":
             return self._run_dos(material, prefix, params, workdir, atoms)
+        if calc == "pdos":
+            return self._run_pdos(material, prefix, params, workdir, atoms)
         raise ToolError(f"unknown qe calc type '{calc}'", category="config")
 
     # ── Calc implementations ─────────────────────────────────────────────────
@@ -117,7 +119,7 @@ class QECalcTool:
                 repairable=True,
             )
         cell = parsed.cell
-        return {
+        outputs = {
             "energy_ry": parsed.final_energy_ry,
             "max_force_ry_bohr": parsed.max_force_ry_bohr,
             "pressure_kbar": parsed.pressure_kbar,
@@ -126,6 +128,23 @@ class QECalcTool:
             "volume_a3": (cell.volume_bohr3 * BOHR3_TO_ANG3) if cell else None,
             "stdout_file": str(input_file.with_suffix(".out")),
         }
+
+        # export the relaxed structure and attach a geometry/symmetry report so
+        # downstream steps (and the chat reply) can cite bond lengths directly
+        final_atoms = QEParser.extract_final_structure(result.stdout)
+        if final_atoms is not None:
+            cif_path = workdir / f"{prefix}_relaxed.cif"
+            from ase.io import write as ase_write
+
+            ase_write(str(cif_path), final_atoms, format="cif")
+            outputs["final_structure_cif"] = str(cif_path)
+            from dft_forge.structure_analysis import analyze
+
+            try:
+                outputs["analysis"] = analyze(final_atoms)
+            except Exception as exc:
+                outputs["analysis_error"] = str(exc)
+        return outputs
 
     def _run_scf(self, material, prefix, params, workdir, atoms=None) -> Dict[str, Any]:
         input_file = workdir / f"{prefix}_scf.in"
@@ -149,10 +168,12 @@ class QECalcTool:
                 category="scf_not_converged",
                 repairable=True,
             )
+        nat_match = re.search(r"number of atoms/cell\s+=\s+(\d+)", result.stdout)
         return {
             "energy_ry": parsed.total_energy_ry,
             "fermi_ev": parsed.fermi_energy_ev,
             "n_iterations": parsed.n_iterations,
+            "natoms": int(nat_match.group(1)) if nat_match else (len(atoms) if atoms is not None else None),
             "stdout_file": str(input_file.with_suffix(".out")),
         }
 
@@ -170,6 +191,7 @@ class QECalcTool:
             nbnd=params.get("nbnd"),
             nkpoints_bands=int(params.get("nkpoints_bands", 60)),
             atoms=atoms,
+            kmode=str(params.get("kmode", "path")),
         )
         result = self._run_pw(input_file, workdir)
         parsed = QEParser.parse_scf(result.stdout)
@@ -288,6 +310,45 @@ class QECalcTool:
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
+    def _run_pdos(self, material, prefix, params, workdir, atoms=None) -> Dict[str, Any]:
+        """projwfc.x element-projected DOS. Requires upstream nscf save dir."""
+        input_file = workdir / f"{prefix}_pdos.in"
+        self.compiler.compile_pdos_input(
+            material,
+            input_file,
+            prefix=prefix,
+            deltae=float(params.get("dos_deltae", 0.01)),
+            fwhm=float(params.get("dos_fwhm", 0.05)),
+            atoms=atoms,
+        )
+        result = self._run_projwfc(input_file, workdir)
+        atm_files = sorted(workdir.glob(f"{prefix}.pdos_atm*"))
+        if not atm_files:
+            raise ToolError(
+                f"projwfc.x produced no pdos_atm files: {result.error_message or 'unknown error'}",
+                category="tool_failure",
+            )
+        parsed = QEParser.parse_pdos(workdir, prefix)
+        if parsed.element_dos is None or not parsed.element_dos:
+            raise ToolError(
+                "pdos parse failed: no element-resolved projections recovered",
+                category="tool_failure",
+                repairable=False,
+            )
+        outputs: Dict[str, Any] = {
+            "n_energy_points": parsed.n_energy_points,
+            "elements": sorted(parsed.element_dos.keys()),
+            "fermi_ev": parsed.fermi_energy_ev or None,
+        }
+        outputs["pdos_curve"] = {
+            "energies_ev": np.round(parsed.energies, 4).tolist(),
+            "element_dos": {
+                el: np.round(arr, 3).tolist()
+                for el, arr in sorted(parsed.element_dos.items())
+            },
+        }
+        return outputs
+
     @staticmethod
     def _locate_bands_xml(workdir: Path, prefix: str) -> Optional[Path]:
         """Find the QE XML holding nscf eigenvalues (version-robust)."""
@@ -328,11 +389,25 @@ class QECalcTool:
         return None
 
     def _run_tool(self, tool: str, input_file: Path, workdir: Path):
-        runner = {"bands.x": self.executor.run_bands_x, "dos.x": self.executor.run_dos_x}
+        runner = {
+            "bands.x": self.executor.run_bands_x,
+            "dos.x": self.executor.run_dos_x,
+            "projwfc.x": self.executor.run_projwfc_x,
+        }
         result = runner[tool](input_file, workdir)
         if not result.success:
             raise ToolError(
                 f"{tool} failed: {result.error_message or result.stderr or 'exit != 0'}",
+                category="tool_failure",
+                repairable=True,
+            )
+        return result
+
+    def _run_projwfc(self, input_file: Path, workdir: Path):
+        result = self.executor.run_projwfc_x(input_file, workdir)
+        if not result.success or "JOB DONE" not in (result.stdout or ""):
+            raise ToolError(
+                f"projwfc.x failed: {self._qe_error_snippet(result) or result.error_message or result.stderr or 'no JOB DONE in stdout'}",
                 category="tool_failure",
                 repairable=True,
             )
