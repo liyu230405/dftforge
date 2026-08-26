@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -15,7 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -146,7 +147,18 @@ def _save_session(session_id: str) -> None:
     sf.write_text(json.dumps(session, ensure_ascii=False, default=str))
 
 FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
-app.mount("/frontend", StaticFiles(directory=FRONTEND_DIR), name="frontend")
+
+
+class NoCacheStaticFiles(StaticFiles):
+    """Dev server: always revalidate JS modules so fixes reach the browser."""
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
+app.mount("/frontend", NoCacheStaticFiles(directory=FRONTEND_DIR), name="frontend")
 
 
 class ChatRequest(BaseModel):
@@ -248,6 +260,15 @@ def delete_session(session_id: str) -> Dict[str, Any]:
     return {"deleted": session_id}
 
 
+def _history_for(session: Dict[str, Any], limit: int = 8) -> List[Dict[str, Any]]:
+    """Recent turns for the planner: pronouns like "它/再算一次" resolve here."""
+    return [
+        {"role": m.get("role"), "text": str(m.get("text", ""))[:400]}
+        for m in (session.get("messages") or [])[-limit:]
+        if m.get("text")
+    ]
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
     session_id = req.session_id or str(uuid.uuid4())
@@ -260,7 +281,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
     if not session.get("title"):
         session["title"] = req.message.strip()[:40]
 
-    result = await agent_loop.run(req.message.strip(), session_dir, ctx=ctx)
+    result = await agent_loop.run(req.message.strip(), session_dir, ctx=ctx, history=_history_for(session))
     ctx.update(result.get("ctx") or {})
 
     messages.append({"role": "user", "text": req.message.strip(), "ts": time.time()})
@@ -269,6 +290,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
         "text": result["reply"],
         "commands": result["commands"],
         "results": result["results"],
+        "chain": result.get("chain", []),
         "ts": time.time(),
     })
     session["updated_at"] = time.time()
@@ -279,4 +301,65 @@ async def chat(req: ChatRequest) -> ChatResponse:
         reply=result["reply"],
         commands=result["commands"],
         results=result["results"],
+    )
+
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """SSE stream of the agent's execution chain: plan → steps → nodes → reply."""
+    session_id = req.session_id or str(uuid.uuid4())
+    session_dir = WEB_WORKDIR / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    session = _load_session(session_id)
+    ctx = session.setdefault("ctx", {})
+    messages = session.setdefault("messages", [])
+    if not session.get("title"):
+        session["title"] = req.message.strip()[:40]
+    message = req.message.strip()
+
+    q: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def emit(ev) -> None:
+        loop.call_soon_threadsafe(q.put_nowait, ev)
+
+    async def worker() -> None:
+        try:
+            result = await agent_loop.run(
+                message, session_dir, ctx=ctx, history=_history_for(session), on_event=emit
+            )
+            ctx.update(result.get("ctx") or {})
+            messages.append({"role": "user", "text": message, "ts": time.time()})
+            messages.append({
+                "role": "agent",
+                "text": result["reply"],
+                "commands": result.get("commands", []),
+                "results": result.get("results", []),
+                "chain": result.get("chain", []),
+                "ts": time.time(),
+            })
+            session["updated_at"] = time.time()
+            _save_session(session_id)
+        except Exception as exc:  # noqa: BLE001
+            emit({"type": "error", "message": str(exc)})
+        finally:
+            emit(None)
+
+    task = asyncio.create_task(worker())
+
+    async def gen():
+        yield "data: " + json.dumps({"type": "start", "session_id": session_id}, ensure_ascii=False) + "\n\n"
+        while True:
+            ev = await q.get()
+            if ev is None:
+                break
+            yield "data: " + json.dumps(ev, ensure_ascii=False, default=str) + "\n\n"
+        await task
+        yield "data: " + json.dumps({"type": "done", "session_id": session_id}, ensure_ascii=False) + "\n\n"
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

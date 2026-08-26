@@ -86,7 +86,7 @@ class GraphEngine:
         self.store.save_run(run)
         return run
 
-    def start(self, run_id: str) -> GraphRun:
+    def start(self, run_id: str, on_event: Optional[Any] = None) -> GraphRun:
         """Run to a terminal state. Blocks until done (or cancelled)."""
         run = self._load(run_id)
         if run.state in TERMINAL_RUN_STATES:
@@ -95,13 +95,13 @@ class GraphEngine:
         scheduler = GraphScheduler(
             self.store, self.tools, self.repairers, max_concurrency=self.max_concurrency
         )
-        return scheduler.run(run, template, self.base_dir)
+        return scheduler.run(run, template, self.base_dir, on_event=on_event)
 
     def run_template(
-        self, template_id: str, inputs: Optional[Dict[str, Any]] = None
+        self, template_id: str, inputs: Optional[Dict[str, Any]] = None, on_event: Optional[Any] = None
     ) -> GraphRun:
         run = self.create(template_id, inputs)
-        return self.start(run.run_id)
+        return self.start(run.run_id, on_event=on_event)
 
     def resume(self, run_id: str) -> GraphRun:
         """Resume an interrupted run; in-flight nodes are reset to Pending."""

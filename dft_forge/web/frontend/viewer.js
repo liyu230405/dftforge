@@ -14,12 +14,68 @@ const CPK = {
   Hg: "#B8B8D0", Pb: "#575961", Bi: "#9E4FB5",
 };
 
+const ROT_DEG_PER_PX = 0.22;   // drag sensitivity (built-in 3Dmol feels ~2x faster)
+const ZOOM_PER_PX = 0.0012;    // wheel sensitivity (exp factor)
+const PAN_PER_PX = 0.05;
+
 export function initViewer() {
   const el = document.getElementById("viewer3d");
   if (!el || viewer) return;
   if (typeof $3Dmol === "undefined") return;
+  el.style.position = "relative";
   viewer = $3Dmol.createViewer(el, { backgroundColor: "#FFFDF9" });
   viewer.render();
+  installControls(el);
+}
+
+/* 3Dmol's built-in drag/scroll is far too twitchy on a small canvas and offers
+   no sensitivity setting — so we disable it (canvas pointer-events:none) and
+   drive the viewer API ourselves from a transparent overlay. */
+function installControls(el) {
+  el.style.touchAction = "none";
+  const canvas = el.querySelector("canvas");
+  if (canvas) canvas.style.pointerEvents = "none";
+  const overlay = document.createElement("div");
+  overlay.className = "viewer-overlay";
+  el.appendChild(overlay);
+
+  let drag = null;
+  overlay.addEventListener("pointerdown", (e) => {
+    overlay.setPointerCapture(e.pointerId);
+    drag = { x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey };
+    overlay.classList.add("grabbing");
+    e.preventDefault();
+  });
+  overlay.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    const dx = e.clientX - drag.x;
+    const dy = e.clientY - drag.y;
+    drag.x = e.clientX;
+    drag.y = e.clientY;
+    if (drag.pan) {
+      viewer.translate(dx * PAN_PER_PX, -dy * PAN_PER_PX);
+    } else {
+      viewer.rotate(dx * ROT_DEG_PER_PX, { x: 0, y: 1, z: 0 });
+      viewer.rotate(dy * ROT_DEG_PER_PX, { x: 1, y: 0, z: 0 });
+    }
+    viewer.render();
+  });
+  const end = () => {
+    drag = null;
+    overlay.classList.remove("grabbing");
+  };
+  overlay.addEventListener("pointerup", end);
+  overlay.addEventListener("pointercancel", end);
+  overlay.addEventListener("contextmenu", (e) => e.preventDefault());
+  overlay.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    viewer.zoom(Math.exp(-e.deltaY * ZOOM_PER_PX));
+    viewer.render();
+  }, { passive: false });
+  overlay.addEventListener("dblclick", () => {
+    viewer.zoomTo();
+    viewer.render();
+  });
 }
 
 export function renderCif(cif, meta = {}) {
@@ -61,8 +117,7 @@ export function renderCif(cif, meta = {}) {
 export function toggleReplica(on) {
   if (!viewer || !currentCif) return;
   const el = document.getElementById("viewer3d");
-  const models = viewer.getAllModels();
-  const m0 = models[0];
+  const m0 = viewer.getModel();
   if (!m0) return;
   if (on) {
     viewer.replicateUnitCell(2, 2, 1, m0);
@@ -80,10 +135,10 @@ export function toggleReplica(on) {
 
 export function toggleCellFrame(on) {
   if (!viewer || !currentCif) return;
-  const models = viewer.getAllModels();
-  if (!models.length) return;
+  const m0 = viewer.getModel();
+  if (!m0) return;
   viewer.removeAllShapes();
-  if (on) viewer.addUnitCell(models[0], { box: { color: "#5C544A" } });
+  if (on) viewer.addUnitCell(m0, { box: { color: "#5C544A" } });
   viewer.render();
 }
 

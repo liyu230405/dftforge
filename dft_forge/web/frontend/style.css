@@ -308,6 +308,74 @@ body {
 ::-webkit-scrollbar-thumb { background: #CFC7B8; border-radius: 5px; border: 2px solid var(--paper); }
 ::-webkit-scrollbar-thumb:hover { background: #B8AE9C; }
 
+/* ── Viewer overlay (custom low-sensitivity controls) ─────────────── */
+.viewer-overlay {
+  position: absolute; inset: 0; z-index: 3; cursor: grab;
+  background: transparent;
+}
+.viewer-overlay.grabbing { cursor: grabbing; }
+
+/* ── Execution chain card (coding-agent transcript) ───────────────── */
+.chain {
+  margin-top: 8px; border: 1px solid var(--hairline-2); border-radius: 8px;
+  background: var(--paper); overflow: hidden;
+}
+.chain-head {
+  display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+  font-size: 12px; color: var(--ink-2); border-bottom: 1px solid var(--hairline-2);
+  background: var(--paper-raised);
+}
+.chain.phase-planning .chain-head { border-bottom-color: transparent; }
+.chain-toggle {
+  border: 0; background: none; cursor: pointer; padding: 0;
+  font: inherit; color: inherit; display: flex; align-items: center; gap: 8px;
+  flex: 1; min-width: 0; text-align: left;
+}
+.chain-toggle:hover { color: var(--ink); }
+.chain-phase { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chain-elapsed { color: var(--ink-3); font-size: 11px; flex: none; }
+.chain-arrow { flex: none; color: var(--ink-3); font-size: 10px; transition: transform 0.15s ease; }
+.chain.collapsed .chain-arrow { transform: rotate(-90deg); }
+.chain.collapsed .chain-steps { display: none; }
+
+.chain-steps { padding: 6px 10px 8px; }
+.chain-step { position: relative; padding: 3px 0 3px 22px; }
+.chain-step::before {
+  content: ""; position: absolute; left: 7px; top: 18px; bottom: -4px;
+  width: 1px; background: var(--hairline);
+}
+.chain-step:last-child::before { display: none; }
+.cs-row { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; }
+.cs-icon {
+  position: absolute; left: 0; top: 4px; width: 15px; text-align: center;
+  font-family: var(--mono); font-size: 11px; color: var(--ink-3); line-height: 1.4;
+}
+.chain-step.running .cs-icon { color: var(--blue); animation: chain-spin 1s linear infinite; display: inline-block; }
+.chain-step.done .cs-icon { color: var(--green); }
+.chain-step.error .cs-icon { color: var(--red); }
+.cs-desc { color: var(--ink); }
+.chain-step.pending .cs-desc { color: var(--ink-3); }
+.cs-tool { font-size: 10.5px; color: var(--ink-3); flex: none; }
+.cs-summary { display: block; font-size: 11px; color: var(--ink-3); margin-top: 1px; line-height: 1.5; }
+.chain-step.error .cs-summary { color: var(--red); }
+.cs-nodes { margin: 3px 0 2px 0; display: flex; flex-direction: column; gap: 1px; }
+.cs-node {
+  display: flex; align-items: center; gap: 7px; font-size: 11px;
+  color: var(--ink-2); font-family: var(--mono); padding-left: 2px;
+}
+.cs-node .nd { width: 6px; height: 6px; border-radius: 50%; background: var(--hairline); flex: none; }
+.cs-node.running { color: var(--blue); }
+.cs-node.running .nd { background: var(--blue); animation: chain-pulse 1.1s ease infinite; }
+.cs-node.succeeded { color: var(--green); }
+.cs-node.succeeded .nd { background: var(--green); }
+.cs-node.failed, .cs-node.repairing, .cs-node.ready, .cs-node.blocked { color: var(--amber); }
+.cs-node.failed .nd { background: var(--red); }
+.cs-node.repairing .nd, .cs-node.ready .nd, .cs-node.blocked .nd { background: var(--amber); }
+.cs-node .nd-label { color: var(--ink-3); }
+
+@keyframes chain-spin { to { transform: rotate(360deg); } }
+@keyframes chain-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
 /* ── Motion: one authored moment — the reply lands like a proof line ── */
 @keyframes reply-in {
   from { opacity: 0; transform: translateY(6px); }

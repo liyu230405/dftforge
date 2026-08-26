@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from dft_forge.tools.definitions import register_default_tools
 from dft_forge.tools.registry import registry
@@ -130,6 +131,18 @@ def _extract_charts(nodes: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return chart or None
 
 
+def _dedupe_node_log(log: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse a node event stream to one entry per node (latest state, first-seen order)."""
+    latest: Dict[str, Any] = {}
+    order: List[str] = []
+    for e in log:
+        n = e.get("node")
+        if n not in latest:
+            order.append(n)
+        latest[n] = e.get("state")
+    return [{"node": n, "state": latest[n]} for n in order]
+
+
 def _load_env_file(path: Path) -> None:
     """Load 'export KEY=VALUE' lines from .env without overwriting real env."""
     if not path.exists():
@@ -192,7 +205,7 @@ class LLMPlanner:
         lines.append(f"Available bulk materials: {', '.join(sorted(MATERIAL_DB))}")
         return "\n".join(lines)
 
-    def plan(self, message: str, ctx: Dict[str, Any]):
+    def plan(self, message: str, ctx: Dict[str, Any], history: Optional[List[Dict[str, Any]]] = None):
         """Returns (steps, direct_reply) or (None, None) to fall back to rules."""
         provider = self._get_provider()
         if provider is None:
@@ -215,12 +228,24 @@ Rules:
 - Site scan ("different sites/positions"): emit one structure.build2d step per site
   (top/bridge/hollow), each with its own output path.
 - Chit-chat / questions about you: empty steps, answer in "reply".
+- Use the conversation history for context: pronouns like "它/这个/再算一次/继续"
+  refer to the material or calculation mentioned earlier.
 - descriptions in Chinese. At most 8 steps.
 
 Tools:
 {self._catalog()}"""
         ctx_summary = {k: ctx.get(k) for k in ("last_structure_source", "last_formula", "last_input_file", "last_job_id") if ctx.get(k)}
-        user = f"Context: {json.dumps(ctx_summary, ensure_ascii=False)}\nUser: {message}"
+        user = f"Context: {json.dumps(ctx_summary, ensure_ascii=False)}"
+        if history:
+            lines = []
+            for h in history[-8:]:
+                who = "用户" if h.get("role") == "user" else "助手"
+                text = str(h.get("text", ""))[:200]
+                if text:
+                    lines.append(f"{who}: {text}")
+            if lines:
+                user += "\n对话历史（旧→新）:\n" + "\n".join(lines)
+        user += f"\nUser: {message}"
         try:
             raw = provider.chat(system, user)
             data = json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
@@ -283,6 +308,9 @@ class AgentLoop:
             material_hint = "Al"
             pair_types = "Al-Al"
         formula_hint = material_hint or extract_formula(message)
+        if not formula_hint:
+            # follow-up like "再算一下它的能带": reuse the session's last material
+            formula_hint = ctx.get("last_formula") or ctx.get("last_material")
 
         # Detect compound intents
         wants_analyze = any(
@@ -471,26 +499,62 @@ class AgentLoop:
 
         return steps
 
-    async def run(self, message: str, session_dir: Path, ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def run(
+        self,
+        message: str,
+        session_dir: Path,
+        ctx: Optional[Dict[str, Any]] = None,
+        history: Optional[List[Dict[str, Any]]] = None,
+        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
         ctx = dict(ctx or {})
-        llm_steps, llm_reply = self.llm_planner.plan(message, ctx)
+
+        def emit(ev: Dict[str, Any]) -> None:
+            if on_event is None:
+                return
+            try:
+                on_event(ev)
+            except Exception:
+                pass
+
+        emit({"type": "phase", "phase": "planning", "label": "理解需求，规划步骤…"})
+        llm_steps, llm_reply = await asyncio.to_thread(self.llm_planner.plan, message, ctx, history)
         if llm_reply is not None:
+            emit({"type": "reply", "text": llm_reply})
             return {
                 "reply": llm_reply,
                 "commands": [],
                 "results": [],
+                "chain": [],
                 "session_id": ctx.get("session_id", str(uuid.uuid4())),
                 "planner": "llm",
             }
         steps = llm_steps if llm_steps is not None else self.plan(message, ctx)
+        planner_name = "llm" if llm_steps is not None else "rules"
+        emit({
+            "type": "plan",
+            "planner": planner_name,
+            "steps": [{"tool": s.get("tool"), "description": s.get("description", "")} for s in steps],
+        })
         commands: List[Dict[str, Any]] = []
         results: List[Dict[str, Any]] = []
         reply_parts: List[str] = []
+        chain: List[Dict[str, Any]] = []
 
-        for step in steps:
+        for idx, step in enumerate(steps):
             tool_id = step.get("tool")
             args = dict(step.get("args") or {})
             description = step.get("description", "")
+            emit({"type": "step", "index": idx, "status": "running", "tool": tool_id, "description": description})
+            node_log: List[Dict[str, Any]] = []
+            part_count = len(reply_parts)
+
+            def _summary() -> str:
+                new = [p for p in reply_parts[part_count:] if p]
+                if not new:
+                    return ""
+                line = new[0].splitlines()[0] if new[0].splitlines() else ""
+                return line[:120]
 
             if not tool_id:
                 commands.append({"command": "noop", "description": description})
@@ -504,6 +568,8 @@ class AgentLoop:
                 reply_parts.append(
                     "未匹配到可执行工具，请尝试：导入结构、构建输入、提交任务、查看状态、查询账本、环境诊断。"
                 )
+                chain.append({"tool": None, "description": description, "status": "error", "summary": _summary(), "nodes": []})
+                emit({"type": "step", "index": idx, "status": "error", "summary": "未匹配到可执行工具"})
                 continue
 
             if tool_id == "help":
@@ -526,6 +592,8 @@ class AgentLoop:
                     "- 查询历史：'查询账本'、'history'\n"
                     "- 环境诊断：'环境诊断'、'doctor'"
                 )
+                chain.append({"tool": "help", "description": description, "status": "done", "summary": "能力说明", "nodes": []})
+                emit({"type": "step", "index": idx, "status": "done", "summary": "能力说明"})
                 continue
 
             if tool_id == "structure.import":
@@ -546,6 +614,12 @@ class AgentLoop:
             elif tool_id == "graph.run":
                 if not str(args.get("workdir") or "").strip():
                     args["workdir"] = str(session_dir / "graphs")
+
+                def _node_cb(ev, _idx=idx, _log=node_log):
+                    _log.append({"node": ev.get("node"), "state": ev.get("state")})
+                    emit({"type": "node", "step": _idx, "node": ev.get("node"), "state": ev.get("state")})
+
+                args["_on_event"] = _node_cb
             elif tool_id == "job.submit":
                 args["input"] = str(session_dir / "input.in")
                 args["output"] = str(session_dir / "job_result.json")
@@ -709,23 +783,45 @@ class AgentLoop:
 
             results.append(result_dict)
 
+            step_failed = bool(result_dict.get("error")) or (
+                isinstance(result_dict.get("json"), dict)
+                and bool(result_dict["json"].get("error"))
+                and tool_id not in ("structure.analyze",)
+            )
+            status = "error" if step_failed else "done"
+            chain.append({
+                "tool": tool_id,
+                "description": description,
+                "status": status,
+                "summary": _summary(),
+                "nodes": _dedupe_node_log(node_log),
+            })
+            emit({"type": "step", "index": idx, "status": status, "summary": _summary()})
+            if result_dict.get("viewer"):
+                emit({"type": "figure", "viewer": result_dict["viewer"]})
+            if result_dict.get("chart"):
+                emit({"type": "figure", "chart": result_dict["chart"]})
+
         reply = "\n".join(reply_parts) if reply_parts else "我已收到你的消息。"
         # LLM narration: replace template-concatenated reply with natural language
         # when a provider is configured; deterministic fallback keeps templates.
         provider = self.llm_planner._get_provider()
         if provider is not None and commands:
+            emit({"type": "phase", "phase": "narrating", "label": "整理计算结果…"})
             try:
-                narrated = self._narrate(provider, message, commands, results, ctx)
+                narrated = await asyncio.to_thread(self._narrate, provider, message, commands, results, ctx)
             except Exception:
                 narrated = ""
             if narrated:
                 reply = narrated
+        emit({"type": "reply", "text": reply})
         return {
             "reply": reply,
             "commands": commands,
             "results": results,
+            "chain": chain,
             "ctx": ctx,
-            "planner": "llm" if llm_steps is not None else "rules",
+            "planner": planner_name,
         }
 
     def _narrate(self, provider, message, commands, results, ctx) -> str:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Optional
 
@@ -52,7 +53,9 @@ class ToolRegistry:
             return ToolResult(data={}, output_type=tool.output_type, tool_id=tool_id, error=f"Tool missing executor: {tool_id}")
 
         try:
-            result_data = tool.execute_fn(arguments)
+            # Run in a worker thread: tools may block for minutes (QE runs),
+            # and the web SSE stream needs the event loop alive meanwhile.
+            result_data = await asyncio.to_thread(tool.execute_fn, arguments)
             if not isinstance(result_data, dict):
                 result_data = {"content": str(result_data)}
             return ToolResult(data=result_data, output_type=tool.output_type, tool_id=tool_id)

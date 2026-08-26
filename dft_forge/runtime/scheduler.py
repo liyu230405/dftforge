@@ -94,11 +94,25 @@ class GraphScheduler:
         self.poll_interval = poll_interval
         self.cancel_event = cancel_event or threading.Event()
 
-    def run(self, run: GraphRun, template: GraphTemplate, base_dir: Path) -> GraphRun:
+    def run(
+        self,
+        run: GraphRun,
+        template: GraphTemplate,
+        base_dir: Path,
+        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> GraphRun:
         run.state = RunState.RUNNING
         self.store.save_run(run)
         ctx_base = Path(base_dir) / run.run_id
         ctx_base.mkdir(parents=True, exist_ok=True)
+
+        def notify(node_id: str, state: str, **extra: Any) -> None:
+            if on_event is None:
+                return
+            try:
+                on_event({"type": "node", "node": node_id, "state": state, **extra})
+            except Exception:
+                pass
 
         futures: Dict[Future, str] = {}
         with ThreadPoolExecutor(max_workers=self.max_concurrency) as pool:
@@ -123,6 +137,7 @@ class GraphScheduler:
                     node.state = NodeState.RUNNING
                     node.workdir = str(ctx_base / node_id)
                     self.store.save_node_run(run, node)
+                    notify(node_id, "running", attempt=node.attempt)
                     ctx = ExecutionContext(
                         base_dir=ctx_base,
                         run_id=run.run_id,
@@ -138,10 +153,13 @@ class GraphScheduler:
                         node.outputs = fut.result()
                         node.error = None
                         node.state = NodeState.SUCCEEDED
+                        notify(node_id, "succeeded")
                     except ToolError as exc:
                         self._handle_failure(run, spec, node, exc)
+                        notify(node_id, node.state.value, error=node.error)
                     except Exception as exc:  # tool crashed unexpectedly
                         self._handle_failure(run, spec, node, ToolError(str(exc)))
+                        notify(node_id, node.state.value, error=node.error)
                     self.store.save_node_run(run, node)
 
                 if not futures and not find_ready_nodes(run, template):

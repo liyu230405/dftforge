@@ -32,14 +32,18 @@ function appendUser(text, ts) {
   chat.scrollTop = chat.scrollHeight;
 }
 
-function appendAgent(text, commands, results, ts) {
+const NODE_LABELS = { running: "运行中", succeeded: "完成", failed: "失败", repairing: "修复重试", ready: "重试", blocked: "阻塞" };
+const STEP_ICONS = { pending: "○", running: "◐", done: "✓", error: "✗" };
+
+function appendAgent(text, commands, results, ts, chain) {
   const div = document.createElement("div");
   div.className = "msg msg-agent";
   const bubble = document.createElement("div");
   bubble.className = "bubble";
   bubble.textContent = text;
   div.appendChild(bubble);
-  if (commands?.length) div.appendChild(toolTable(commands, results));
+  if (chain?.length) div.appendChild(renderChain(chain));
+  else if (commands?.length) div.appendChild(toolTable(commands, results));
   if (ts) {
     const t = document.createElement("div");
     t.className = "msg-time";
@@ -49,6 +53,69 @@ function appendAgent(text, commands, results, ts) {
   chat.appendChild(div);
   chat.scrollTop = chat.scrollHeight;
   return div;
+}
+
+/* ── execution chain card (coding-agent transcript) ────────────────── */
+
+function makeChainCard() {
+  const root = document.createElement("div");
+  root.className = "chain";
+  root.innerHTML = `
+    <div class="chain-head">
+      <button class="chain-toggle" type="button" title="展开/收起执行过程">
+        <span class="chain-arrow">▾</span>
+        <span class="chain-phase">准备中…</span>
+      </button>
+      <span class="chain-elapsed mono"></span>
+    </div>
+    <div class="chain-steps"></div>`;
+  root.querySelector(".chain-toggle").addEventListener("click", () => root.classList.toggle("collapsed"));
+  return root;
+}
+
+function addChainStep(stepsEl, step) {
+  const el = document.createElement("div");
+  el.className = "chain-step pending";
+  el.innerHTML = `
+    <span class="cs-icon">${STEP_ICONS.pending}</span>
+    <div class="cs-row"><span class="cs-desc">${esc(step.description || step.tool || "")}</span><span class="cs-tool mono">${esc(step.tool || "")}</span></div>
+    <span class="cs-summary"></span>
+    <div class="cs-nodes"></div>`;
+  stepsEl.appendChild(el);
+  return el;
+}
+
+function setNodeRow(stepEl, node, state) {
+  let row = stepEl.querySelector(`.cs-node[data-node="${CSS.escape(node)}"]`);
+  if (!row) {
+    row = document.createElement("div");
+    row.dataset.node = node;
+    row.innerHTML = `<span class="nd"></span><span class="nd-name">${esc(node)}</span><span class="nd-label"></span>`;
+    stepEl.querySelector(".cs-nodes").appendChild(row);
+  }
+  row.className = `cs-node ${state || ""}`;
+  row.querySelector(".nd-label").textContent = NODE_LABELS[state] || state || "";
+}
+
+function renderChain(chain) {
+  const card = makeChainCard();
+  const stepsEl = card.querySelector(".chain-steps");
+  const nErr = chain.filter((s) => s.status === "error").length;
+  card.querySelector(".chain-phase").textContent =
+    `执行过程 · ${chain.length} 步${nErr ? ` · ${nErr} 步失败` : ""}`;
+  card.querySelector(".chain-elapsed").remove();
+  // ?chain=open keeps historical transcripts expanded (default: collapsed)
+  if (new URLSearchParams(location.search).get("chain") !== "open") {
+    card.classList.add("collapsed");
+  }
+  for (const s of chain) {
+    const el = addChainStep(stepsEl, s);
+    el.className = `chain-step ${s.status || "done"}`;
+    el.querySelector(".cs-icon").textContent = STEP_ICONS[s.status] || "·";
+    if (s.summary) el.querySelector(".cs-summary").textContent = s.summary;
+    for (const n of s.nodes || []) setNodeRow(el, n.node, n.state);
+  }
+  return card;
 }
 
 function toolTable(commands, results) {
@@ -82,15 +149,17 @@ function fmtTime(ts) {
 
 /* ── figures: structure + charts from tool results ─────────────────── */
 
-function applyFigures(results) {
-  for (const r of results || []) {
-    if (r.viewer?.cif) {
-      renderCif(r.viewer.cif, r.viewer);
-      const cap = document.getElementById("viewerCaption");
-      cap.textContent = `${r.viewer.formula || ""} · ${r.viewer.natoms ?? "?"} 原子 · 拖拽旋转 / 滚轮缩放`;
-    }
-    if (r.chart) renderCharts(chartsEl, r.chart);
+function applyFigure(viewer, chart) {
+  if (viewer?.cif) {
+    renderCif(viewer.cif, viewer);
+    const cap = document.getElementById("viewerCaption");
+    cap.textContent = `${viewer.formula || ""} · ${viewer.natoms ?? "?"} 原子 · 拖拽旋转 / 滚轮缩放 / 双击复位`;
   }
+  if (chart) renderCharts(chartsEl, chart);
+}
+
+function applyFigures(results) {
+  for (const r of results || []) applyFigure(r.viewer, r.chart);
 }
 
 /* Session restore: the structure may come from an early message while the
@@ -150,7 +219,7 @@ async function loadSession(id) {
   chat.innerHTML = "";
   for (const m of data.messages || []) {
     if (m.role === "user") appendUser(m.text, m.ts);
-    else appendAgent(m.text, m.commands, m.results, m.ts);
+    else appendAgent(m.text, m.commands, m.results, m.ts, m.chain);
   }
   if (!data.messages?.length) showWelcome();
   restoreFigures(data.messages || []);
@@ -185,37 +254,128 @@ function showWelcome() {
   chat.appendChild(w);
 }
 
-/* ── send loop ─────────────────────────────────────────────────────── */
+/* ── send loop: streaming execution chain ──────────────────────────── */
 
 async function send() {
   const text = input.value.trim();
   if (!text) return;
   input.value = "";
   sendBtn.disabled = true;
-  setStatus("思考与规划中…", "busy");
+  setStatus("执行中…", "busy");
   const welcome = chat.querySelector(".welcome");
   if (welcome) welcome.remove();
   appendUser(text);
 
+  const card = makeChainCard();
+  const stepsEl = card.querySelector(".chain-steps");
+  const phaseEl = card.querySelector(".chain-phase");
+  const elapsedEl = card.querySelector(".chain-elapsed");
+  const msgDiv = document.createElement("div");
+  msgDiv.className = "msg msg-agent";
+  msgDiv.appendChild(card);
+  chat.appendChild(msgDiv);
+  chat.scrollTop = chat.scrollHeight;
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  const t0 = performance.now();
+  const timer = setInterval(() => {
+    elapsedEl.textContent = `${Math.round((performance.now() - t0) / 1000)}s`;
+  }, 1000);
+  let finished = false;
+
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    clearInterval(timer);
+    card.classList.add("collapsed");
+    phaseEl.textContent = "执行完成";
+    setStatus("就绪");
+    sendBtn.disabled = false;
+    input.focus();
+    refreshSessions();
+  };
+
+  const handleEvent = (ev) => {
+    switch (ev.type) {
+      case "start":
+        sessionId = ev.session_id;
+        localStorage.setItem("dftforge_session", sessionId);
+        break;
+      case "phase":
+        phaseEl.textContent = ev.label || ev.phase;
+        card.classList.toggle("phase-planning", ev.phase === "planning");
+        break;
+      case "plan":
+        stepsEl.innerHTML = "";
+        phaseEl.textContent = `${ev.planner === "llm" ? "LLM" : "规则"}规划 · ${ev.steps.length} 步`;
+        for (const s of ev.steps) addChainStep(stepsEl, s);
+        chat.scrollTop = chat.scrollHeight;
+        break;
+      case "step": {
+        const el = stepsEl.children[ev.index];
+        if (!el) break;
+        el.className = `chain-step ${ev.status}`;
+        el.querySelector(".cs-icon").textContent = STEP_ICONS[ev.status] || "·";
+        if (ev.summary) el.querySelector(".cs-summary").textContent = ev.summary;
+        chat.scrollTop = chat.scrollHeight;
+        break;
+      }
+      case "node": {
+        const el = stepsEl.children[ev.step];
+        if (el) setNodeRow(el, ev.node, ev.state);
+        chat.scrollTop = chat.scrollHeight;
+        break;
+      }
+      case "figure":
+        applyFigure(ev.viewer, ev.chart);
+        break;
+      case "reply":
+        bubble.textContent = ev.text;
+        if (!bubble.parentNode) msgDiv.insertBefore(bubble, card);
+        chat.scrollTop = chat.scrollHeight;
+        break;
+      case "error":
+        bubble.textContent = `执行出错：${ev.message || "未知错误"}`;
+        if (!bubble.parentNode) msgDiv.insertBefore(bubble, card);
+        phaseEl.textContent = "执行出错";
+        break;
+      case "done":
+        finish();
+        break;
+    }
+  };
+
   try {
-    const res = await fetch("/chat", {
+    const res = await fetch("/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message: text, session_id: sessionId }),
     });
-    const data = await res.json();
-    sessionId = data.session_id;
-    localStorage.setItem("dftforge_session", sessionId);
-    appendAgent(data.reply, data.commands, data.results);
-    applyFigures(data.results);
-    setStatus("就绪");
-    refreshSessions();
+    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const frames = buf.split("\n\n");
+      buf = frames.pop();
+      for (const frame of frames) {
+        const line = frame.split("\n").find((l) => l.startsWith("data: "));
+        if (!line) continue;
+        try {
+          handleEvent(JSON.parse(line.slice(6)));
+        } catch { /* skip malformed frame */ }
+      }
+    }
   } catch (e) {
-    appendAgent("请求失败：" + e.message);
+    bubble.textContent = `请求失败：${e.message}`;
+    if (!bubble.parentNode) msgDiv.insertBefore(bubble, card);
     setStatus("错误", "error");
   } finally {
-    sendBtn.disabled = false;
-    input.focus();
+    finish();
   }
 }
 

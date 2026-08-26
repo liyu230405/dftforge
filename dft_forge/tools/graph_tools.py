@@ -62,8 +62,9 @@ def _graph_run(args: dict) -> dict:
         return {"error": "template_id is required"}
     engine = _get_engine(args.get("workdir"))
     inputs = args.get("inputs") or {}
+    on_event = args.pop("_on_event", None)
     try:
-        run = engine.run_template(template_id, inputs)
+        run = engine.run_template(template_id, inputs, on_event=on_event)
     except ValueError as exc:
         return {"error": str(exc)}
     nodes = {
