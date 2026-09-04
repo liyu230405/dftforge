@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -10,6 +11,8 @@ from dft_forge.runtime.run import GraphRun, NodeRun, create_run
 from dft_forge.runtime.scheduler import GraphScheduler, RepairHandler, Tool
 from dft_forge.runtime.states import NodeState, RunState, TERMINAL_RUN_STATES
 from dft_forge.runtime.store import SQLiteStateStore
+
+logger = logging.getLogger(__name__)
 
 
 class GraphEngine:
@@ -29,6 +32,7 @@ class GraphEngine:
         repairers: Optional[Dict[str, RepairHandler]] = None,
         max_concurrency: int = 2,
         templates_dir: Optional[Path] = None,
+        use_asyncio: bool = False,
     ):
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
@@ -37,6 +41,7 @@ class GraphEngine:
         self.repairers: Dict[str, RepairHandler] = dict(repairers or {})
         self.max_concurrency = max_concurrency
         self.templates_dir = templates_dir
+        self.use_asyncio = use_asyncio
         self._templates: Dict[str, GraphTemplate] = {}
 
     # ── Tool / template registries ──────────────────────────────────────────
@@ -86,22 +91,49 @@ class GraphEngine:
         self.store.save_run(run)
         return run
 
-    def start(self, run_id: str, on_event: Optional[Any] = None) -> GraphRun:
+    def _cancel_executors(self) -> int:
+        """Kill in-flight subprocesses of every tool's executor; returns count.
+
+        Duck-typed: anything on a tool (or on tool.executor) exposing
+        cancel_all() participates — LocalExecutor does, FakeExecutor doesn't.
+        """
+        killed = 0
+        for tool in self.tools.values():
+            for holder in (tool, getattr(tool, "executor", None)):
+                cancel_all = getattr(holder, "cancel_all", None)
+                if callable(cancel_all):
+                    try:
+                        killed += int(cancel_all() or 0)
+                    except Exception:
+                        logger.exception("cancel_all failed on %s", tool)
+        return killed
+
+    def start(
+        self, run_id: str, on_event: Optional[Any] = None, cancel_event: Optional[Any] = None
+    ) -> GraphRun:
         """Run to a terminal state. Blocks until done (or cancelled)."""
         run = self._load(run_id)
         if run.state in TERMINAL_RUN_STATES:
             return run
         template = self.get_template(run.template_id)
         scheduler = GraphScheduler(
-            self.store, self.tools, self.repairers, max_concurrency=self.max_concurrency
+            self.store, self.tools, self.repairers,
+            max_concurrency=self.max_concurrency,
+            use_asyncio=self.use_asyncio,
+            cancel_event=cancel_event,
+            on_cancel=self._cancel_executors,
         )
         return scheduler.run(run, template, self.base_dir, on_event=on_event)
 
     def run_template(
-        self, template_id: str, inputs: Optional[Dict[str, Any]] = None, on_event: Optional[Any] = None
+        self,
+        template_id: str,
+        inputs: Optional[Dict[str, Any]] = None,
+        on_event: Optional[Any] = None,
+        cancel_event: Optional[Any] = None,
     ) -> GraphRun:
         run = self.create(template_id, inputs)
-        return self.start(run.run_id, on_event=on_event)
+        return self.start(run.run_id, on_event, cancel_event=cancel_event)
 
     def resume(self, run_id: str) -> GraphRun:
         """Resume an interrupted run; in-flight nodes are reset to Pending."""
@@ -112,7 +144,9 @@ class GraphEngine:
         if run.state in TERMINAL_RUN_STATES:
             return run
         scheduler = GraphScheduler(
-            self.store, self.tools, self.repairers, max_concurrency=self.max_concurrency
+            self.store, self.tools, self.repairers,
+            max_concurrency=self.max_concurrency,
+            use_asyncio=self.use_asyncio,
         )
         return scheduler.run(run, template, self.base_dir)
 
@@ -129,6 +163,7 @@ class GraphEngine:
             node.repair_attempts = 0
             node.error = None
             node.params = {}  # re-resolve bindings on next dispatch
+            node.params_resolved = False
             self.store.save_node_run(run, node)
         run.state = RunState.VALIDATED
         self.store.save_run(run)
@@ -159,10 +194,10 @@ class GraphEngine:
     # ── Internals ────────────────────────────────────────────────────────────
 
     def _peek_template_id(self, run_id: str) -> str:
-        for entry in self.store.list_runs():
-            if entry["run_id"] == run_id:
-                return entry["template_id"]
-        raise ValueError(f"unknown run '{run_id}'")
+        template_id = self.store.template_id_for(run_id)
+        if template_id is None:
+            raise ValueError(f"unknown run '{run_id}'")
+        return template_id
 
     def _load(self, run_id: str) -> GraphRun:
         template = self.get_template(self._peek_template_id(run_id))

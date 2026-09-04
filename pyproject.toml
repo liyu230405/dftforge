@@ -1,12 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "dft-forge"
 version = "0.1.0"
 description = "Deterministic Quantum ESPRESSO Scientific Computing Agent"
 readme = "README.md"
 requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "ase>=3.22.0",
+    "pymatgen>=2023.0.0",
+    "spglib>=2.0.0",
+    "seekpath>=2.0.0",
+    "h5py>=3.0.0",
+    "lxml>=4.9.0",
+    "jsonschema>=4.17.0",
+    "pydantic>=2.0.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0.0"]
+test = ["pytest>=7.0.0", "pytest-cov>=4.0.0"]
 
 [project.scripts]
 dft-forge = "dft_forge.cli:main"
+dft-forge-web = "dft_forge.web.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["dft_forge*"]
+
+[tool.setuptools.package-data]
+"dft_forge.web" = ["frontend/*", "templates/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

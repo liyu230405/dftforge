@@ -95,18 +95,20 @@ class RecoveryController:
 
         if any("scf stage failed" in r or "scf did not converge" in r for r in reasons):
             return FailureKind.SCF_NOT_CONVERGED
-        if any("nscf stage did not converge" in r for r in reasons):
+        # verifier emits "NSCF stage did not pass" — match both spellings or
+        # this recovery branch is unreachable
+        if any("nscf stage did not converge" in r or "nscf stage did not pass" in r for r in reasons):
             return FailureKind.NSCF_NOT_CONVERGED
+        if any("bands xml parsed but empty" in r or "bands.xml not found" in r for r in reasons):
+            return FailureKind.BANDS_XML_MISSING
+        if any("dos file parsed but empty" in r or "dos file not found" in r for r in reasons):
+            return FailureKind.DOS_FILE_MISSING
         if any("force" in r for r in reasons):
             return FailureKind.FORCES_TOO_HIGH
         if any("pressure" in r for r in reasons):
             return FailureKind.PRESSURE_TOO_HIGH
         if any("cell" in r for r in reasons):
             return FailureKind.BAD_CELL
-        if any("bands.xml not found" in r for r in reasons):
-            return FailureKind.BANDS_XML_MISSING
-        if any("dos file not found" in r for r in reasons):
-            return FailureKind.DOS_FILE_MISSING
         if any("timed out" in r for r in reasons) or any("timeout" in r for r in reasons):
             return FailureKind.JOB_TIMEOUT
         if any("dos.x" in r or "bands.x" in r for r in reasons):

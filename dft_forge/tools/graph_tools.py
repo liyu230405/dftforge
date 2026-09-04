@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from dft_forge.runtime.graph import OUTPUT_REF_RE
 from dft_forge.tools.models import ToolEntry
 
 DEFAULT_WORKSPACE = Path(os.environ.get("DFT_FORGE_WORKSPACE", "./work/graphs"))
@@ -39,21 +40,68 @@ def _get_engine(workdir: Optional[str] = None):
 
 
 def _pick_executor():
-    from dft_forge.executor import FakeExecutor, LocalExecutor
+    from dft_forge.executor import FakeExecutor, LocalExecutor, SSHExecutor
     import shutil
+
+    executor_kind = os.environ.get("DFT_FORGE_EXECUTOR", "local").strip().lower()
+    if executor_kind == "ssh":
+        host_spec = os.environ.get("DFT_FORGE_SSH_HOST", "").strip()
+        if not host_spec:
+            raise ValueError("DFT_FORGE_SSH_HOST is required when DFT_FORGE_EXECUTOR=ssh")
+        username = os.environ.get("DFT_FORGE_SSH_USER") or None
+        host = host_spec
+        if "@" in host_spec and username is None:
+            username, host = host_spec.rsplit("@", 1)
+        key = os.environ.get("DFT_FORGE_SSH_KEY", "").strip()
+        return SSHExecutor(
+            host=host,
+            username=username,
+            ssh_key=Path(key).expanduser() if key else None,
+            port=int(os.environ.get("DFT_FORGE_SSH_PORT", "22")),
+            remote_workdir=os.environ.get("DFT_FORGE_REMOTE_WORKDIR", "/root/workspace"),
+            qe_bin_dir=os.environ.get("DFT_FORGE_REMOTE_QE_BIN", "/opt/qe/bin"),
+            scheduler=os.environ.get("DFT_FORGE_SCHEDULER", "none"),
+            max_walltime_sec=int(os.environ.get("DFT_FORGE_WALLTIME", "1800")),
+        )
+    if executor_kind not in {"", "local", "fake"}:
+        raise ValueError(f"unsupported DFT_FORGE_EXECUTOR: {executor_kind!r}")
+    if executor_kind == "fake":
+        return FakeExecutor()
 
     qe_bin = os.environ.get("DFT_FORGE_QE_BIN")
     if qe_bin and Path(qe_bin).is_dir():
-        return LocalExecutor(qe_bin_dir=Path(qe_bin))
+        return LocalExecutor(qe_bin_dir=Path(qe_bin), max_walltime_sec=1800)
     pw = shutil.which("pw.x")
     if pw:
-        return LocalExecutor(qe_bin_dir=Path(pw).parent)
+        return LocalExecutor(qe_bin_dir=Path(pw).parent, max_walltime_sec=1800)
     return FakeExecutor()
 
 
 def _graph_templates(args: dict) -> dict:
     engine = _get_engine(args.get("workdir"))
     return {"templates": engine.list_templates()}
+
+
+def _resolve_template_outputs(template, run) -> dict:
+    """Resolve the template's top-level output contract against a finished run.
+
+    Each declared output ("band_gap_ev": "${nodes.bands.outputs.band_gap_ev}")
+    becomes a concrete value; a ref whose node did not succeed yields None —
+    callers can trust the key set even for failed runs.
+    """
+    outs: dict = {}
+    for name, ref in (template.outputs or {}).items():
+        m = OUTPUT_REF_RE.match(str(ref))
+        if not m:
+            outs[name] = ref
+            continue
+        node = run.nodes.get(m.group(1))
+        if node is None or node.state.value != "succeeded":
+            outs[name] = None
+            continue
+        v = node.outputs.get(m.group(2))
+        outs[name] = v.item() if hasattr(v, "item") else v
+    return outs
 
 
 def _graph_run(args: dict) -> dict:
@@ -63,8 +111,9 @@ def _graph_run(args: dict) -> dict:
     engine = _get_engine(args.get("workdir"))
     inputs = args.get("inputs") or {}
     on_event = args.pop("_on_event", None)
+    cancel_event = args.pop("_cancel_event", None)
     try:
-        run = engine.run_template(template_id, inputs, on_event=on_event)
+        run = engine.run_template(template_id, inputs, on_event=on_event, cancel_event=cancel_event)
     except ValueError as exc:
         return {"error": str(exc)}
     nodes = {
@@ -79,7 +128,12 @@ def _graph_run(args: dict) -> dict:
         }
         for nid, n in run.nodes.items()
     }
-    return {"run_id": run.run_id, "state": run.state.value, "nodes": nodes}
+    return {
+        "run_id": run.run_id,
+        "state": run.state.value,
+        "nodes": nodes,
+        "outputs": _resolve_template_outputs(engine.get_template(template_id), run),
+    }
 
 
 def _graph_status(args: dict) -> dict:
@@ -91,6 +145,37 @@ def _graph_status(args: dict) -> dict:
         return _get_engine(args.get("workdir")).status(run_id)
     except ValueError as exc:
         return {"error": str(exc)}
+
+
+def cancel_graphs_under(base_dir) -> int:
+    """Kill in-flight subprocesses ONLY for engines whose workdir is under
+    ``base_dir``.
+
+    Sessions run their graphs under ``<session_dir>/graphs``, so a stop click
+    passes the session dir here; other sessions' engines are untouched.
+    """
+    killed = 0
+    base = Path(base_dir).resolve()
+    for key, engine in _ENGINE_CACHE.items():
+        try:
+            workdir = Path(key).resolve()
+        except OSError:
+            continue
+        if workdir == base or base in workdir.parents:
+            killed += engine._cancel_executors()
+    return killed
+
+
+def cancel_running_graphs() -> int:
+    """Kill in-flight subprocesses across ALL cached engines.
+
+    Shutdown-level sweep only — per-session cancellation must use
+    cancel_graphs_under() so one stop click doesn't kill other sessions.
+    """
+    killed = 0
+    for engine in _ENGINE_CACHE.values():
+        killed += engine._cancel_executors()
+    return killed
 
 
 def register_graph_tools(registry) -> None:

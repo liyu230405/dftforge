@@ -6,6 +6,7 @@ submit -> remote sbatch/qsub; status -> squeue with sacct fallback
 
 from __future__ import annotations
 
+import shlex
 import time
 from typing import Optional, Tuple
 
@@ -64,11 +65,16 @@ class SlurmScheduler(SchedulerInterface):
                    ntasks=8, cpus_per_task=1, time_limit="24:00:00", memory=None):
         script_name = f"submit_{job_name}_{int(time.time())}.sh"
         script_path = f"{work_dir}/{script_name}"
-        heredoc = f"mkdir -p {work_dir} && cat > {script_path} << 'DFTFORGE_EOF'\n{script_text}\nDFTFORGE_EOF"
+        heredoc = (
+            f"mkdir -p {shlex.quote(work_dir)} && cat > {shlex.quote(script_path)} "
+            f"<< 'DFTFORGE_EOF'\n{script_text}\nDFTFORGE_EOF"
+        )
         result = self.runner.run(heredoc)
         if not result.ok:
             return False, f"failed to write script: {result.stderr.strip()}", None
-        result = self.runner.run(f"cd {work_dir} && sbatch {script_name}")
+        result = self.runner.run(
+            f"cd {shlex.quote(work_dir)} && sbatch {shlex.quote(script_name)}"
+        )
         if not result.ok:
             return False, result.stderr.strip() or "sbatch failed", None
         # stdout like "Submitted batch job 12345"
@@ -78,7 +84,7 @@ class SlurmScheduler(SchedulerInterface):
         return True, f"submitted {job_id}", job_id
 
     def get_job_status(self, job_id: str) -> Optional[JobStatus]:
-        result = self.runner.run(f"squeue -j {job_id} -h -o '%i|%T'")
+        result = self.runner.run(f"squeue -j {shlex.quote(job_id)} -h -o '%i|%T'")
         if result.ok:
             for line in result.stdout.strip().splitlines():
                 parts = line.split("|")
@@ -86,7 +92,7 @@ class SlurmScheduler(SchedulerInterface):
                     return self._map(parts[1])
         # squeue lags for finished jobs — fall back to sacct
         result = self.runner.run(
-            f"sacct -j {job_id} -n -o 'JobID,State' --parsable2"
+            f"sacct -j {shlex.quote(job_id)} -n -o 'JobID,State' --parsable2"
         )
         if not result.ok:
             return None
@@ -99,7 +105,7 @@ class SlurmScheduler(SchedulerInterface):
         return None
 
     def cancel_job(self, job_id: str) -> Tuple[bool, str]:
-        result = self.runner.run(f"scancel {job_id}")
+        result = self.runner.run(f"scancel {shlex.quote(job_id)}")
         return result.ok, "cancelled" if result.ok else result.stderr.strip()
 
     @classmethod
@@ -124,17 +130,22 @@ class PbsScheduler(SchedulerInterface):
                    ntasks=8, cpus_per_task=1, time_limit="24:00:00", memory=None):
         script_name = f"submit_{job_name}_{int(time.time())}.sh"
         script_path = f"{work_dir}/{script_name}"
-        heredoc = f"mkdir -p {work_dir} && cat > {script_path} << 'DFTFORGE_EOF'\n{script_text}\nDFTFORGE_EOF"
+        heredoc = (
+            f"mkdir -p {shlex.quote(work_dir)} && cat > {shlex.quote(script_path)} "
+            f"<< 'DFTFORGE_EOF'\n{script_text}\nDFTFORGE_EOF"
+        )
         result = self.runner.run(heredoc)
         if not result.ok:
             return False, f"failed to write script: {result.stderr.strip()}", None
-        result = self.runner.run(f"cd {work_dir} && qsub {script_name}")
+        result = self.runner.run(
+            f"cd {shlex.quote(work_dir)} && qsub {shlex.quote(script_name)}"
+        )
         if not result.ok or not result.stdout.strip():
             return False, result.stderr.strip() or "qsub failed", None
         return True, "submitted", result.stdout.strip().split(".")[0]
 
     def get_job_status(self, job_id: str) -> Optional[JobStatus]:
-        result = self.runner.run(f"qstat -f {job_id}")
+        result = self.runner.run(f"qstat -f {shlex.quote(job_id)}")
         if not result.ok:
             return None
         for line in result.stdout.splitlines():
@@ -144,7 +155,7 @@ class PbsScheduler(SchedulerInterface):
         return None
 
     def cancel_job(self, job_id: str) -> Tuple[bool, str]:
-        result = self.runner.run(f"qdel {job_id}")
+        result = self.runner.run(f"qdel {shlex.quote(job_id)}")
         return result.ok, "cancelled" if result.ok else result.stderr.strip()
 
 

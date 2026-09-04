@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import List, Optional
 
 from dft_forge.runtime.graph import GraphTemplate
 from dft_forge.runtime.run import GraphRun, NodeRun
 from dft_forge.runtime.states import NodeState, RunState, TERMINAL_RUN_STATES
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS graph_runs (
@@ -40,7 +44,7 @@ class SQLiteStateStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             conn.executescript(_SCHEMA)
 
     def _connect(self) -> sqlite3.Connection:
@@ -57,7 +61,7 @@ class SQLiteStateStore:
             "created_at": run.created_at,
             "updated_at": run.updated_at,
         }
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn, conn:
             conn.execute(
                 "INSERT OR REPLACE INTO graph_runs (id, template_id, status, data, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
@@ -66,22 +70,23 @@ class SQLiteStateStore:
             )
 
     def load_run(self, run_id: str, template: GraphTemplate) -> Optional[GraphRun]:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 "SELECT id, template_id, status, data FROM graph_runs WHERE id = ?", (run_id,)
             ).fetchone()
         if row is None:
             return None
         _, _, status, data = row
+        payload = json.loads(data)
         run = GraphRun(
             run_id=row[0],
             template_id=row[1],
             state=RunState(status),
-            inputs=json.loads(data).get("inputs", {}),
-            created_at=float(json.loads(data).get("created_at", time.time())),
-            updated_at=float(json.loads(data).get("updated_at", time.time())),
+            inputs=payload.get("inputs", {}),
+            created_at=float(payload.get("created_at", time.time())),
+            updated_at=float(payload.get("updated_at", time.time())),
         )
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             node_rows = conn.execute(
                 "SELECT node_id, status, data FROM node_runs WHERE run_id = ?", (run_id,)
             ).fetchall()
@@ -106,11 +111,21 @@ class SQLiteStateStore:
         return run
 
     def list_runs(self) -> List[dict]:
-        with self._connect() as conn:
+        # updated_at is stored as a float string — ORDER BY TEXT would sort
+        # "9.5" after "10.5"; cast to REAL for numeric ordering
+        with closing(self._connect()) as conn:
             rows = conn.execute(
-                "SELECT id, template_id, status, updated_at FROM graph_runs ORDER BY updated_at DESC"
+                "SELECT id, template_id, status, updated_at FROM graph_runs "
+                "ORDER BY CAST(updated_at AS REAL) DESC"
             ).fetchall()
         return [{"run_id": r[0], "template_id": r[1], "status": r[2], "updated_at": r[3]} for r in rows]
+
+    def template_id_for(self, run_id: str) -> Optional[str]:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT template_id FROM graph_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        return row[0] if row else None
 
     # ── Node runs ────────────────────────────────────────────────────────────
 
@@ -126,7 +141,7 @@ class SQLiteStateStore:
             "workdir": node.workdir,
             "updated_at": node.updated_at,
         }
-        with self._lock, self._connect() as conn:
+        with self._lock, closing(self._connect()) as conn, conn:
             conn.execute(
                 "INSERT OR REPLACE INTO node_runs (run_id, node_id, status, data, updated_at) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -149,7 +164,28 @@ class SQLiteStateStore:
             return run
         for node in run.nodes.values():
             if node.state in (NodeState.RUNNING, NodeState.READY, NodeState.REPAIRING):
+                # deliberate direct assignment: crash recovery resets
+                # in-flight states that the normal transition table forbids
                 node.state = NodeState.PENDING
+            self._warn_broken_symlinks(node)
         run.state = RunState.VALIDATED
         self.save_run(run)
         return run
+
+    @staticmethod
+    def _warn_broken_symlinks(node: NodeRun) -> None:
+        """Flag dead .save links before rescheduling: a node reusing a broken
+        upstream symlink fails with a confusing QE error instead of a hint."""
+        wd = Path(node.workdir) if node.workdir else None
+        if wd is None or not wd.is_dir():
+            return
+        try:
+            for entry in wd.iterdir():
+                if entry.is_symlink() and not entry.exists():
+                    logger.warning(
+                        "broken symlink in node %s: %s -> %s (upstream .save moved or "
+                        "deleted; the engine relinks it on dispatch)",
+                        node.node_id, entry.name, entry.readlink(),
+                    )
+        except OSError:
+            pass

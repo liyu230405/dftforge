@@ -52,6 +52,41 @@ class TestTemplates:
         assert params["material"] == "GaAs"
 
 
+class TestTimeoutRepair:
+    def _timeout_error(self):
+        return ToolError("pw.x failed: QE timed out after 600s", category="execution", repairable=True)
+
+    def test_timeout_reduces_band_path_points(self):
+        repairer = QEParamRepairer()
+        node = NodeRun(node_id="nscf", params={"nkpoints_bands": 100, "ecutwfc": 45.0})
+        assert repairer.repair(node, self._timeout_error()) is True
+        assert node.params["nkpoints_bands"] == 60
+        assert node.params["ecutwfc"] == 45.0  # cutoff must NOT grow on timeout
+
+    def test_timeout_repairs_stay_above_floor(self):
+        repairer = QEParamRepairer()
+        node = NodeRun(node_id="nscf", params={"nkpoints_bands": 100})
+        node.repair_attempts = 0
+        for expected in (60, 36, 24):
+            assert repairer.repair(node, self._timeout_error()) is True
+            assert node.params["nkpoints_bands"] == expected
+        # at the floor there is nothing left to shrink
+        assert repairer.repair(node, self._timeout_error()) is False
+
+    def test_timeout_reduces_uniform_mesh(self):
+        repairer = QEParamRepairer()
+        node = NodeRun(node_id="scf", params={"kpoints": [8, 8, 1, 1, 1, 1]})
+        assert repairer.repair(node, self._timeout_error()) is True
+        assert node.params["kpoints"] == [4, 4, 1, 1, 1, 1]
+
+    def test_convergence_still_bumps_cutoff(self):
+        repairer = QEParamRepairer()
+        err = ToolError("scf not converged", category="scf_not_converged", repairable=True)
+        node = NodeRun(node_id="scf", params={"ecutwfc": 45.0})
+        assert repairer.repair(node, err) is True
+        assert node.params["ecutwfc"] == 55.0
+
+
 class TestQECalcToolErrors:
     def _tool(self):
         return QECalcTool(executor=FakeExecutor())

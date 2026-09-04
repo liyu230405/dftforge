@@ -197,13 +197,19 @@ async function refreshSessions() {
     const when = isToday ? hhmm : `${d.getMonth() + 1}月${d.getDate()}日 ${hhmm}`;
     item.innerHTML = `
       <button class="s-del" title="删除会话">✕</button>
-      <div class="s-title" title="${esc(s.title)}">${esc(s.title)}</div>
+      <div class="s-title">${esc(s.title)}</div>
       <div class="s-meta">${when} · ${s.n_messages} 条</div>`;
+    item.querySelector(".s-title").title = s.title;
     item.addEventListener("click", () => loadSession(s.session_id));
     item.querySelector(".s-del").addEventListener("click", async (e) => {
       e.stopPropagation();
       if (!confirm("删除该会话及其计算记录？")) return;
-      await fetch(`/api/sessions/${s.session_id}`, { method: "DELETE" });
+      const deleted = await fetch(`/api/sessions/${s.session_id}`, { method: "DELETE" });
+      if (!deleted.ok) {
+        const body = await deleted.json().catch(() => ({}));
+        alert(body.detail || "删除失败，请先停止正在进行的计算");
+        return;
+      }
       if (s.session_id === sessionId) newSession();
       refreshSessions();
     });
@@ -284,10 +290,30 @@ async function send() {
   }, 1000);
   let finished = false;
 
+  const stopBtn = document.getElementById("stop");
+  const stop = async () => {
+    if (!sessionId) return;
+    stopBtn.disabled = true;
+    try {
+      const r = await fetch(`/api/sessions/${sessionId}/cancel`, { method: "POST" });
+      const d = await r.json();
+      phaseEl.textContent = d.cancelled ? "已请求停止…" : "无进行中的计算";
+      if (d.cancelled && d.processes_killed > 0) {
+        phaseEl.textContent += `（终止了 ${d.processes_killed} 个进程）`;
+      }
+    } catch { /* backend gone — stream will end on its own */ }
+    stopBtn.disabled = false;
+  };
+  const stopHandler = () => { stop(); };
+  stopBtn.hidden = false;
+  stopBtn.addEventListener("click", stopHandler);
+
   const finish = () => {
     if (finished) return;
     finished = true;
     clearInterval(timer);
+    stopBtn.hidden = true;
+    stopBtn.removeEventListener("click", stopHandler);
     card.classList.add("collapsed");
     phaseEl.textContent = "执行完成";
     setStatus("就绪");

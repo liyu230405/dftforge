@@ -256,11 +256,20 @@ PEROVSKITE_A: Dict[str, float] = {
     "SrSnO3": 4.034, "CaZrO3": 4.020, "PbZrO3": 4.155, "LaCrO3": 3.887,
     "YAlO3": 3.792, "NaTaO3": 3.929, "AgNbO3": 3.953, "BiFeO3": 3.965,
 }
-_III_V = {"B", "Al", "Ga", "In", "Tl"}
-_V_VI = {"N", "P", "As", "Sb", "Bi"}
 _DIAMOND_ELS = {"C", "Si", "Ge", "Sn"}
 _BCC_ELS = {"Fe", "Cr", "W", "Mo", "V", "Nb", "Ta", "K", "Na", "Li"}
 _HCP_ELS = {"Mg", "Zn", "Ti", "Zr", "Co", "Be", "Ru", "Os", "Sc", "Y", "Hf", "Re"}
+_FCC_ELS = {"Al", "Cu", "Ag", "Au", "Ni", "Ca", "Sr", "Ir", "Rh", "Pd", "Pt", "Pb"}
+_ZINCBLENDE_FORMULAS = {
+    "AlAs", "AlP", "AlSb", "CdS", "CdSe", "CdTe", "GaAs", "GaP", "GaSb",
+    "InAs", "InP", "InSb", "SiC", "ZnS", "ZnSe", "ZnTe",
+}
+_ROCKSALT_FORMULAS = {
+    "AgCl", "AgBr", "BaO", "CaO", "KBr", "KCl", "KF", "LiBr", "LiCl",
+    "LiF", "MgO", "NaBr", "NaCl", "NaF", "NiO", "SrO",
+}
+_FLUORITE_FORMULAS = {"BaF2", "CaF2", "CeO2", "SrF2", "ThO2", "UO2"}
+_ANTIFLUORITE_FORMULAS = {"K2O", "Li2O", "Na2O"}
 
 # 2H-layered TMD bulks: formula -> (metal, chalcogen, a [Å], M-X bond [Å],
 # interlayer gap [Å]). Built instead of the fluorite prototype — fluorite
@@ -298,18 +307,20 @@ def _cov_radius(el: str) -> float:
 
 
 def formula_atoms(formula: str) -> Tuple[Atoms, str]:
-    """Build a starting structure for any chemical formula via prototype matching.
+    """Build a starting structure for formulas with a trusted prototype.
 
     Prototypes: ABO3 perovskite, AB zincblende/rocksalt, AB2/A2B fluorite,
     elemental diamond/fcc/bcc/hcp. Lattice constants come from experiment
-    where tabulated, else from covalent-radius estimates — vc-relax then
-    refines the cell, so these only need to be physically sensible.
+    where tabulated, else from covalent-radius estimates. A formula does not
+    uniquely determine a crystal structure, so ambiguous compositions are
+    rejected and must be supplied as CIF/POSCAR instead of silently guessed.
 
     Returns (Atoms, prototype_name).
     """
     from pymatgen.core import Composition
 
     comp = Composition(str(formula)).as_dict()
+    formula_key = Composition(str(formula)).reduced_formula
     els = sorted(comp, key=lambda e: -comp[e])
     nums = [int(round(comp[e])) for e in els]
     if any(n <= 0 for n in nums):
@@ -335,16 +346,26 @@ def formula_atoms(formula: str) -> Tuple[Atoms, str]:
             cell = [[a, 0, 0], [-a / 2, a * math.sqrt(3) / 2, 0], [0, 0, c]]
             pos = [[1/3, 2/3, 0.25], [2/3, 1/3, 0.75]]
             return Atoms(el * 2, scaled_positions=pos, cell=cell, pbc=True), "hcp"
-        a = 2.0 * math.sqrt(2.0) * _cov_radius(el)  # fcc default for metals
+        if el not in _FCC_ELS:
+            raise ValueError(
+                f"no trusted elemental prototype for '{formula}'; provide a CIF/POSCAR structure"
+            )
+        a = 2.0 * math.sqrt(2.0) * _cov_radius(el)
         cell = np.eye(3) * a
         pos = [[0, 0, 0], [0.5, 0.5, 0], [0.5, 0, 0.5], [0, 0.5, 0.5]]
         return Atoms(el * 4, scaled_positions=pos, cell=cell, pbc=True), "fcc"
 
     # ABO3 perovskite: one A-site cation, one B-site, three O
-    if len(els) == 3 and "O" in els and sorted(nums) == [1, 1, 3] and comp.get("O") == 3:
+    if (
+        formula_key in PEROVSKITE_A
+        and len(els) == 3
+        and "O" in els
+        and sorted(nums) == [1, 1, 3]
+        and comp.get("O") == 3
+    ):
         a_site = _perovskite_a_site(els, comp)
         b_site = next(e for e in els if e != "O" and e != a_site)
-        a = PEROVSKITE_A.get(str(formula).replace(" ", ""), 1.414 * (_cov_radius(a_site) + _cov_radius("O")) * 1.02)
+        a = PEROVSKITE_A[formula_key]
         cell = np.eye(3) * a
         pos = [[0.5, 0.5, 0.5], [0, 0, 0], [0.5, 0, 0], [0, 0.5, 0], [0, 0, 0.5]]
         syms = [a_site, b_site, "O", "O", "O"]
@@ -352,38 +373,51 @@ def formula_atoms(formula: str) -> Tuple[Atoms, str]:
 
     # 2H-layered TMD bulk (MoS2 family) — before the generic AB2 fluorite
     # branch, which would otherwise emit a physically wrong structure
-    tmd_key = next((k for k in TMD_BULKS if k.lower() == str(formula).replace(" ", "").lower()), None)
+    tmd_key = next((k for k in TMD_BULKS if k.lower() == formula_key.lower()), None)
     if tmd_key is not None:
         return _tmd_bulk(tmd_key)
 
     # AB binary
     if len(els) == 2 and nums[0] == 1 and nums[1] == 1:
         e1, e2 = els
-        if (e1 in _III_V and e2 in _V_VI) or (e2 in _III_V and e1 in _V_VI):
+        if formula_key in _ZINCBLENDE_FORMULAS:
             a = 4.0 / math.sqrt(3.0) * (_cov_radius(e1) + _cov_radius(e2))
-            cell = np.eye(3) * a
+            # Zincblende is an fcc Bravais lattice with a two-atom basis.
+            # A simple-cubic cell here changes the space group to R3m.
+            cell = [[0, a / 2, a / 2], [a / 2, 0, a / 2], [a / 2, a / 2, 0]]
             pos = [[0, 0, 0], [0.25, 0.25, 0.25]]
             return Atoms(e1 + e2, scaled_positions=pos, cell=cell, pbc=True), "zincblende"
-        a = 2.0 * (_cov_radius(e1) + _cov_radius(e2)) * 1.15  # rocksalt
-        cell = np.eye(3) * a
+        if formula_key not in _ROCKSALT_FORMULAS:
+            raise ValueError(
+                f"formula '{formula}' has no unique trusted prototype; provide a CIF/POSCAR structure"
+            )
+        a = 2.0 * (_cov_radius(e1) + _cov_radius(e2)) * 1.15
+        # Rocksalt is also fcc.  The previous simple-cubic cell with atoms at
+        # (0,0,0)/(1/2,1/2,1/2) was the CsCl (B2) structure, not rocksalt.
+        cell = [[0, a / 2, a / 2], [a / 2, 0, a / 2], [a / 2, a / 2, 0]]
         pos = [[0, 0, 0], [0.5, 0.5, 0.5]]
         return Atoms(e1 + e2, scaled_positions=pos, cell=cell, pbc=True), "rocksalt"
 
     # AB2 / A2B fluorite-type
     if len(els) == 2 and sorted(nums) == [1, 2]:
+        if formula_key not in _FLUORITE_FORMULAS | _ANTIFLUORITE_FORMULAS:
+            raise ValueError(
+                f"formula '{formula}' is not a trusted fluorite/antifluorite material; "
+                "provide a CIF/POSCAR structure"
+            )
         a_el = els[nums.index(1)]
         b_el = els[nums.index(2)]
         a = 4.0 / math.sqrt(3.0) * (_cov_radius(a_el) + _cov_radius(b_el)) * 1.02
-        cell = np.eye(3) * a
-        pos = [[0, 0, 0], [0.75, 0.75, 0.75], [0.25, 0.25, 0.25],
-               [0.75, 0.25, 0.25], [0.25, 0.75, 0.25], [0.25, 0.25, 0.75],
-               [0.25, 0.75, 0.75], [0.75, 0.25, 0.75], [0.75, 0.75, 0.25]]
-        syms = [a_el] + [b_el] * 8
-        return Atoms(syms, scaled_positions=pos, cell=cell, pbc=True), "fluorite"
+        # Let ASE construct the primitive fluorite/antifluorite cell.  The old
+        # hand-written basis returned A B8 (nine atoms) for an AB2 formula.
+        from ase.build import bulk
+
+        atoms = bulk(f"{a_el}{b_el}2", "fluorite", a=a)
+        return atoms, "fluorite"
 
     raise ValueError(
-        f"no structure prototype for '{formula}' (supports: elemental, AB, ABO3, "
-        "AB2, TMD MoS2-family). Provide a CIF file or use structure.build2d "
+        f"no trusted structure prototype for '{formula}' (supports selected elemental, AB, "
+        "ABO3, AB2 and MoS2-family materials). Provide a CIF file or use structure.build2d "
         "for 2D monolayers."
     )
 
@@ -595,6 +629,7 @@ class QECompiler:
         lines.append(f'  outdir = "./"')
         lines.append(f'  pseudo_dir = "{self.pseudo_dir}"')
         lines.append(f"  nstep = {nstep}")
+        lines.append(f"  forc_conv_thr = {force_threshold:.6g}")
         lines.append("/")
         lines.append("")
         lines.append("&SYSTEM")
@@ -626,6 +661,7 @@ class QECompiler:
             lines.append("&CELL")
             lines.append(f'  cell_dynamics = "{cell_dynamics}"')
             lines.append("  press = 0.0")
+            lines.append(f"  press_conv_thr = {pressure_threshold:.6g}")
             lines.append("  wmass = 0.01")
             lines.append("/")
             lines.append("")

@@ -34,6 +34,9 @@ class NodeRun:
     attempt: int = 0
     repair_attempts: int = 0
     params: Dict[str, Any] = field(default_factory=dict)
+    # not persisted: False after load → re-resolve on resume (resolved params
+    # carry no ${} refs, so re-resolution is a no-op but keeps resume honest)
+    params_resolved: bool = False
     outputs: Dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
     job_id: Optional[str] = None
@@ -71,6 +74,8 @@ class ExecutionContext:
     base_dir: Path  # <workspace>/<run_id>
     run_id: str
     upstream: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # node_id -> outputs
+    # per-node walltime from NodeSpec.timeout_seconds; None = executor default
+    timeout_seconds: Optional[float] = None
 
     def node_workdir(self, node_id: str) -> Path:
         return self.base_dir / node_id
@@ -86,12 +91,19 @@ def resolve_value(value: Any, run: GraphRun) -> Any:
         if m:
             scope, key, out_key = m.groups()
             if scope == "inputs":
+                if key not in run.inputs:
+                    raise ValueError(f"reference to undeclared template input: {value}")
                 return run.inputs.get(key)
             if out_key is None:
                 raise ValueError(f"node reference without outputs key: {value}")
             upstream = run.nodes.get(key)
             if upstream is None or upstream.state != NodeState.SUCCEEDED:
                 raise ValueError(f"referenced node '{key}' has not succeeded")
+            if out_key not in upstream.outputs:
+                raise ValueError(
+                    f"referenced output '{out_key}' not produced by node '{key}' "
+                    f"(available: {sorted(upstream.outputs)})"
+                )
             return upstream.outputs.get(out_key)
         return value
     if isinstance(value, dict):

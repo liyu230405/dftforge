@@ -71,6 +71,7 @@ User-supplied compute (BYOC), mirroring CatGo:
 - **`runner.py`** — `CommandRunner` abstraction with `LocalRunner` / `SSHRunner` (subprocess-backed SSH, supports jump hosts, keys, timeouts). All remote operations are constructed internally; the LLM never generates shell/SSH strings.
 - **`scheduler.py`** — `SchedulerInterface` with `SlurmScheduler` (sbatch/squeue/sacct/scancel, sacct fallback for finished jobs) and `PbsScheduler` (qsub/qstat/qdel). Normalized `JobStatus` for both.
 - **`job_script.py`** — deterministic sbatch/qsub script rendering with parameter-priority resolution (params > job defaults > safe defaults) and alias mapping (e.g. `ppn` → `cpus_per_task`).
+- **`executor.SSHExecutor`** — grafted onto this layer (no longer a scaffold): every remote operation goes through an injectable `CommandRunner`, so tests script a fake runner. Two modes — direct (`scheduler="none"`, remote-side `timeout` wrapper, exit code via a stdout marker) and scheduler (`slurm`/`pbs`, submit + poll to a terminal state). File transport is chunked tar+base64 over the text channel with `.save` symlink dereference on upload. Not yet validated end-to-end on a live cluster.
 
 ## 3. Engine Tools (`dft_forge/engines/`)
 

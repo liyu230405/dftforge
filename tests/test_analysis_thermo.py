@@ -169,7 +169,8 @@ class TestParsePdos:
         assert parsed.n_energy_points == 5
         assert parsed.element_dos["Mg"][0] == pytest.approx(2.0)
         assert parsed.element_dos["O"][0] == pytest.approx(1.0)
-        assert parsed.energies[0] == pytest.approx(-1.0 * 13.6057, abs=0.01)  # Ry→eV
+        # pdos_atm files are already in eV — the axis must pass through as-is
+        assert parsed.energies[0] == pytest.approx(-1.0, abs=0.01)
 
     def test_fermi_from_xml(self, tmp_path):
         self._write(tmp_path, "mgo")

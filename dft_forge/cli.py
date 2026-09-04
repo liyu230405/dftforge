@@ -650,18 +650,7 @@ def cmd_job_submit(args: argparse.Namespace) -> int:
     }
 
     if backend_name == "local":
-        try:
-            result = executor.run_pw(input_file, workdir)
-        except TypeError:
-            # Fallback for executors without run_pw: stage + submit + poll
-            handle = executor.submit(input_file, workdir)
-            job_id = getattr(handle, "job_id", _local_job_id(workdir))
-            status = executor.status(handle)
-            while status and getattr(status, "state", None) not in {None, "done", "failed", "cancelled"}:
-                time.sleep(1)
-                status = executor.status(handle)
-            result = executor.fetch(handle)
-
+        result = executor.run_pw(input_file, workdir)
         job_id = getattr(result, "remote_path", None) or _local_job_id(workdir)
         data.update({
             "job_id": job_id,
@@ -676,14 +665,27 @@ def cmd_job_submit(args: argparse.Namespace) -> int:
             return _error_response("Local job failed", code=3, details=data)
         return _success_response(data, args.output)
 
-    # SSH backend
+    # SSH backend: one atomic command = upload + run + download.
+    # SSHExecutor's stage/submit/status/fetch lifecycle needs in-process
+    # state; CLI invocations are separate processes, so the synchronous
+    # run_pw round trip is the only contract that can actually work here.
     try:
-        handle = executor.submit(input_file, workdir)
+        result = executor.run_pw(input_file, workdir)
     except Exception as exc:
         return _error_response("Submit failed", details={"exception": str(exc), "backend": backend_name})
 
-    job_id = getattr(handle, "job_id", str(uuid.uuid4()))
-    data["job_id"] = job_id
+    data.update({
+        "job_id": result.scheduler_job_id or result.remote_path or str(uuid.uuid4()),
+        "remote_path": result.remote_path,
+        "scheduler_job_id": result.scheduler_job_id,
+        "success": result.success,
+        "exit_code": result.exit_code,
+        "walltime_sec": result.walltime_sec,
+        "job_done": result.job_done,
+        "output_files": result.output_files,
+    })
+    if not result.success:
+        return _error_response("SSH job failed", code=3, details=data)
     return _success_response(data, args.output)
 
 
@@ -711,15 +713,22 @@ def cmd_job_status(args: argparse.Namespace) -> int:
                 data.update({"state": "unknown"})
             return _success_response(data, args.output)
 
-        status = executor.status(None)
+        # SSH: job_id is the scheduler job id printed by submit (stateless
+        # query works across processes); direct-mode jobs run synchronously
+        # and leave nothing to query
+        adapter = getattr(executor, "scheduler_adapter", None)
+        if adapter is not None:
+            status = adapter.get_job_status(job_id)
+            data["state"] = status.value if status is not None else "unknown"
+        else:
+            data["state"] = "unknown"
+            data["note"] = "direct-mode SSH jobs run synchronously; there is no persistent job state to query"
     except NotImplementedError:
         data["state"] = "unknown"
         return _success_response(data, args.output)
     except Exception as exc:
         return _error_response("Status check failed", details={"exception": str(exc), "backend": backend_name})
 
-    state = getattr(status, "state", None) or getattr(status, "status", "unknown")
-    data["state"] = str(state)
     return _success_response(data, args.output)
 
 
@@ -732,12 +741,18 @@ def cmd_job_cancel(args: argparse.Namespace) -> int:
         "job_id": job_id,
     }
     try:
-        if hasattr(executor, "cancel"):
-            executor.cancel(None)
-            data["cancelled"] = True
+        if backend_name == "local":
+            data["cancelled"] = False
+            data["note"] = "local backend jobs are synchronous; there is nothing to cancel"
+        elif getattr(executor, "scheduler_adapter", None) is not None:
+            # stateless: job_id is the scheduler job id printed by submit
+            ok, msg = executor.scheduler_adapter.cancel_job(job_id)
+            data["cancelled"] = bool(ok)
+            if not ok:
+                data["note"] = msg
         else:
             data["cancelled"] = False
-            data["note"] = f"{backend_name} backend does not implement cancel"
+            data["note"] = "direct-mode SSH jobs are synchronous; there is nothing to cancel"
     except Exception as exc:
         return _error_response("Cancel failed", details={"exception": str(exc), "backend": backend_name})
     return _success_response(data, args.output)
@@ -765,8 +780,15 @@ def cmd_job_fetch(args: argparse.Namespace) -> int:
             data["fetched"] = str(output_dir)
             return _success_response(data, args.output)
 
-        result = executor.fetch(None)
-        data["fetched"] = getattr(result, "remote_path", str(output_dir))
+        # SSH: stateless download — job_id is the remote job directory that
+        # submit printed as remote_path
+        from dft_forge.executor import JobHandle
+
+        result = executor.fetch(JobHandle(job_id=job_id, remote_path=job_id), output_dir)
+        data["fetched"] = str(result.destination)
+        data["output_files"] = result.output_files
+        if not result.success:
+            return _error_response("Fetch failed", details={**data, "error": result.error_message})
     except NotImplementedError:
         data["fetched"] = str(output_dir)
     except Exception as exc:
@@ -817,6 +839,7 @@ def cmd_result_parse(args: argparse.Namespace) -> int:
 
 def cmd_result_verify(args: argparse.Namespace) -> int:
     from dft_forge.verifier import ScientificVerifier, ConvergenceReport
+    from dft_forge.protocol.schemas import VerificationInput
 
     result_path = Path(args.input)
     if not result_path.exists():
@@ -826,19 +849,14 @@ def cmd_result_verify(args: argparse.Namespace) -> int:
     task_type = getattr(args, "task_type", None) or result.get("task_type", "T1")
 
     verifier = ScientificVerifier()
-    # Reconstruct minimal job_result-like object
-    class FakeJobResult:
-        def __init__(self, result: Dict[str, Any]):
-            self.success = result.get("status") == "pass"
-            self.exit_code = 0 if self.success else 1
-            self.stdout = ""
-            self.output_files = result.get("output_files", [])
-            self.walltime_sec = float(result.get("walltime_sec", 0.0))
-            self.job_done = True
+    inp = VerificationInput(
+        stdout=result.get("stdout", ""),
+        stderr=result.get("stderr", ""),
+        job_success=result.get("status") == "pass" or bool(result.get("success", True)),
+        metadata=result,
+    )
 
-    job_result = FakeJobResult(result)
-
-    # Try to parse parsed data if present
+    # Reconstruct parsed data if present
     parsed = result.get("parsed") or result.get("physical_results") or {}
     if hasattr(parsed, "to_dict"):
         parsed_obj = parsed
@@ -846,20 +864,25 @@ def cmd_result_verify(args: argparse.Namespace) -> int:
         from types import SimpleNamespace
         parsed_obj = SimpleNamespace(**{k: v for k, v in parsed.items() if isinstance(v, (int, float, str, list, dict))})
 
-    if task_type == "T1":
-        report = verifier.verify_t1(job_result, parsed_obj)
-    elif task_type == "T2":
-        report = verifier.verify_t2_bands(job_result, parsed_obj)
+    if task_type == "T2":
+        xml_candidates = [
+            str(f) for f in (result.get("output_files") or []) if str(f).endswith(".xml")
+        ]
+        bands_xml = Path(xml_candidates[0]) if xml_candidates else Path(result.get("bands_xml", "missing_bands.xml"))
+        report = verifier.verify_t2_bands(inp.stdout, inp.stdout, bands_xml)
     else:
-        report = verifier.verify_t1(job_result, parsed_obj)
+        report = verifier.verify_t1(inp, parsed_obj)
 
+    # ConvergenceReport.checks is dict[str, dict] — serialize fields, not attributes
     if isinstance(report, ConvergenceReport):
         data = {
             "command": "result.verify",
             "task_type": task_type,
             "passed": report.passed,
-            "checks": {name: {"pass": c.pass_, "detail": c.detail, "value": c.value, "threshold": c.threshold} for name, c in report.checks.items()},
+            "checks": report.checks,
             "warnings": report.warnings,
+            "failure_reasons": report.failure_reasons,
+            "summary": report.summary,
         }
     else:
         data = {"command": "result.verify", "task_type": task_type, "passed": bool(report)}
@@ -1013,13 +1036,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
+def _add_backend_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--backend", default="local", choices=["local", "ssh"], help="Execution backend")
+    p.add_argument("--backend-config", default=None, help="Path to backend JSON config")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="dft-forge",
         description="DFT-Forge: agent-friendly Quantum ESPRESSO CLI",
     )
-    parser.add_argument("--backend", default="local", choices=["local", "ssh"], help="Execution backend")
-    parser.add_argument("--backend-config", default=None, help="Path to backend JSON config")
     parser.add_argument("--output", default=None, help="Write command output JSON to this file instead of stdout")
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
@@ -1119,23 +1145,29 @@ def main() -> int:
     ib.add_argument("--pseudo-dir", default=None)
     ib.add_argument("--output", default=None)
 
-    # job
+    # job — --backend lives on each job subcommand (argparse rejects it after
+    # the subcommand when declared on the main parser, which is where the
+    # docs tell users to put it)
     job = subparsers.add_parser("job", help="Job lifecycle commands")
     job_sub = job.add_subparsers(dest="job_command")
     js = job_sub.add_parser("submit", help="Submit a QE job")
     js.add_argument("input", help="Path to QE input file")
+    _add_backend_args(js)
     js.add_argument("--output", default=None)
 
     jst = job_sub.add_parser("status", help="Check job status")
-    jst.add_argument("job_id", help="Job identifier")
+    jst.add_argument("job_id", help="Job identifier (SSH: scheduler job id)")
+    _add_backend_args(jst)
     jst.add_argument("--output", default=None)
 
     jc = job_sub.add_parser("cancel", help="Cancel a job")
-    jc.add_argument("job_id", help="Job identifier")
+    jc.add_argument("job_id", help="Job identifier (SSH: scheduler job id)")
+    _add_backend_args(jc)
     jc.add_argument("--output", default=None)
 
     jf = job_sub.add_parser("fetch", help="Fetch job outputs")
-    jf.add_argument("job_id", help="Job identifier")
+    jf.add_argument("job_id", help="Job identifier (SSH: remote job directory)")
+    _add_backend_args(jf)
     jf.add_argument("--output-dir", default=".")
     jf.add_argument("--output", default=None)
 

@@ -29,6 +29,7 @@ import numpy as np
 from dft_forge.compiler import MATERIAL_DB, QECompiler
 from dft_forge.executor import Executor, FakeExecutor
 from dft_forge.parser import QEParser
+from dft_forge.protocol.schemas import VerificationInput
 from dft_forge.runtime.run import ExecutionContext, NodeRun, ToolError
 from dft_forge.verifier import ScientificVerifier
 
@@ -36,6 +37,18 @@ DEFAULT_PSEUDO_DIR = Path(__file__).resolve().parents[2] / "assets" / "pseudos"
 
 BOHR_TO_ANG = 0.529177210903
 BOHR3_TO_ANG3 = BOHR_TO_ANG ** 3
+
+
+def _as_float(params: dict, key: str, default: float) -> float:
+    """params.get(k, d) treats an explicit None (templates declare null) as a
+    real value and float(None) crashes — treat it as missing instead."""
+    v = params.get(key)
+    return float(v) if v is not None else default
+
+
+def _as_int(params: dict, key: str, default: int) -> int:
+    v = params.get(key)
+    return int(v) if v is not None else default
 
 
 class QECalcTool:
@@ -82,22 +95,22 @@ class QECalcTool:
             self._link_upstream_save(ctx, workdir, prefix)
 
         if calc == "vc-relax":
-            return self._run_vc_relax(material, prefix, params, workdir, atoms)
+            return self._run_vc_relax(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds)
         if calc == "scf":
-            return self._run_scf(material, prefix, params, workdir, atoms)
+            return self._run_scf(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds)
         if calc == "nscf":
-            return self._run_nscf(material, prefix, params, workdir, atoms)
+            return self._run_nscf(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds)
         if calc == "bands":
-            return self._run_bands(material, prefix, params, workdir, atoms)
+            return self._run_bands(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds)
         if calc == "dos":
-            return self._run_dos(material, prefix, params, workdir, atoms)
+            return self._run_dos(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds)
         if calc == "pdos":
-            return self._run_pdos(material, prefix, params, workdir, atoms)
+            return self._run_pdos(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds)
         raise ToolError(f"unknown qe calc type '{calc}'", category="config")
 
     # ── Calc implementations ─────────────────────────────────────────────────
 
-    def _run_vc_relax(self, material, prefix, params, workdir, atoms=None) -> Dict[str, Any]:
+    def _run_vc_relax(self, material, prefix, params, workdir, atoms=None, timeout=None) -> Dict[str, Any]:
         input_file = workdir / f"{prefix}_vcrelax.in"
         self.compiler.compile_t1(
             material,
@@ -108,10 +121,17 @@ class QECalcTool:
             kpoints=tuple(params["kpoints"]) if params.get("kpoints") else None,
             atoms=atoms,
         )
-        result = self._run_pw(input_file, workdir)
+        result = self._run_pw(input_file, workdir, timeout=timeout)
         xml = workdir / f"{prefix}.xml"
         parsed = QEParser.parse_vc_relax(result.stdout, xml if xml.exists() else None)
-        report = self.verifier.verify_t1(result, parsed)
+        report = self.verifier.verify_t1(
+            VerificationInput(
+                stdout=result.stdout,
+                xml_path=xml if xml.exists() else None,
+                job_success=bool(getattr(result, "success", True)),
+            ),
+            parsed,
+        )
         if not report.passed:
             raise ToolError(
                 "vc-relax verification failed: " + "; ".join(report.failure_reasons),
@@ -146,7 +166,7 @@ class QECalcTool:
                 outputs["analysis_error"] = str(exc)
         return outputs
 
-    def _run_scf(self, material, prefix, params, workdir, atoms=None) -> Dict[str, Any]:
+    def _run_scf(self, material, prefix, params, workdir, atoms=None, timeout=None) -> Dict[str, Any]:
         input_file = workdir / f"{prefix}_scf.in"
         self.compiler.compile_scf(
             material,
@@ -155,11 +175,11 @@ class QECalcTool:
             ecutwfc=params.get("ecutwfc"),
             ecutrho=params.get("ecutrho"),
             kpoints=tuple(params["kpoints"]) if params.get("kpoints") else None,
-            conv_thr=float(params.get("conv_thr", 1.0e-8)),
+            conv_thr=_as_float(params, "conv_thr", 1.0e-8),
             nbnd=params.get("nbnd"),
             atoms=atoms,
         )
-        result = self._run_pw(input_file, workdir)
+        result = self._run_pw(input_file, workdir, timeout=timeout)
         parsed = QEParser.parse_scf(result.stdout)
         report = self.verifier.verify_scf(result.stdout)
         if not report.passed:
@@ -177,7 +197,7 @@ class QECalcTool:
             "stdout_file": str(input_file.with_suffix(".out")),
         }
 
-    def _run_nscf(self, material, prefix, params, workdir, atoms=None) -> Dict[str, Any]:
+    def _run_nscf(self, material, prefix, params, workdir, atoms=None, timeout=None) -> Dict[str, Any]:
         input_file = workdir / f"{prefix}_nscf.in"
         self.compiler.compile_scf(
             material,
@@ -187,13 +207,13 @@ class QECalcTool:
             ecutwfc=params.get("ecutwfc"),
             ecutrho=params.get("ecutrho"),
             kpoints=tuple(params["kpoints"]) if params.get("kpoints") else None,
-            conv_thr=float(params.get("conv_thr", 1.0e-8)),
+            conv_thr=_as_float(params, "conv_thr", 1.0e-8),
             nbnd=params.get("nbnd"),
-            nkpoints_bands=int(params.get("nkpoints_bands", 60)),
+            nkpoints_bands=_as_int(params, "nkpoints_bands", 60),
             atoms=atoms,
             kmode=str(params.get("kmode", "path")),
         )
-        result = self._run_pw(input_file, workdir)
+        result = self._run_pw(input_file, workdir, timeout=timeout)
         parsed = QEParser.parse_scf(result.stdout)
         report = self.verifier.verify_nscf(result.stdout)
         if not report.passed:
@@ -208,16 +228,16 @@ class QECalcTool:
             "stdout_file": str(input_file.with_suffix(".out")),
         }
 
-    def _run_bands(self, material, prefix, params, workdir, atoms=None) -> Dict[str, Any]:
+    def _run_bands(self, material, prefix, params, workdir, atoms=None, timeout=None) -> Dict[str, Any]:
         input_file = workdir / f"{prefix}_bands.in"
         self.compiler.compile_bands_input(
             material,
             input_file,
             prefix=prefix,
-            nkpoints=int(params.get("nkpoints_bands", 100)),
+            nkpoints=_as_int(params, "nkpoints_bands", 100),
             atoms=atoms,
         )
-        result = self._run_tool("bands.x", input_file, workdir)
+        result = self._run_tool("bands.x", input_file, workdir, timeout=timeout)
         bands_xml = self._locate_bands_xml(workdir, prefix)
         if bands_xml is None:
             raise ToolError(
@@ -252,7 +272,7 @@ class QECalcTool:
 
             src = atoms if atoms is not None else build_atoms(material)
             pbc = tuple(bool(b) for b in src.pbc) if len(src.pbc) == 3 else None
-            bp = src.cell.bandpath(npoints=max(10, int(params.get("nkpoints_bands", 100))), pbc=pbc)
+            bp = src.cell.bandpath(npoints=max(10, _as_int(params, "nkpoints_bands", 100)), pbc=pbc)
             x, X, labels = bp.get_linear_kpoint_axis()
             outputs["k_axis"] = [round(float(v), 4) for v in x]
             outputs["k_ticks"] = [round(float(v), 4) for v in X]
@@ -263,17 +283,17 @@ class QECalcTool:
             outputs["eigenvalues_ev"] = np.round(parsed.eigenvalues, 4).tolist()
         return outputs
 
-    def _run_dos(self, material, prefix, params, workdir, atoms=None) -> Dict[str, Any]:
+    def _run_dos(self, material, prefix, params, workdir, atoms=None, timeout=None) -> Dict[str, Any]:
         input_file = workdir / f"{prefix}_dos.in"
         self.compiler.compile_dos_input(
             material,
             input_file,
             prefix=prefix,
-            deltae=float(params.get("dos_deltae", 0.01)),
-            fwhm=float(params.get("dos_fwhm", 0.05)),
+            deltae=_as_float(params, "dos_deltae", 0.01),
+            fwhm=_as_float(params, "dos_fwhm", 0.05),
             atoms=atoms,
         )
-        result = self._run_tool("dos.x", input_file, workdir)
+        result = self._run_tool("dos.x", input_file, workdir, timeout=timeout)
         dos_file = workdir / f"{prefix}.dos"
         if not dos_file.exists():
             candidates = sorted(workdir.glob("*.dos"))
@@ -310,18 +330,18 @@ class QECalcTool:
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
-    def _run_pdos(self, material, prefix, params, workdir, atoms=None) -> Dict[str, Any]:
+    def _run_pdos(self, material, prefix, params, workdir, atoms=None, timeout=None) -> Dict[str, Any]:
         """projwfc.x element-projected DOS. Requires upstream nscf save dir."""
         input_file = workdir / f"{prefix}_pdos.in"
         self.compiler.compile_pdos_input(
             material,
             input_file,
             prefix=prefix,
-            deltae=float(params.get("dos_deltae", 0.01)),
-            fwhm=float(params.get("dos_fwhm", 0.05)),
+            deltae=_as_float(params, "dos_deltae", 0.01),
+            fwhm=_as_float(params, "dos_fwhm", 0.05),
             atoms=atoms,
         )
-        result = self._run_projwfc(input_file, workdir)
+        result = self._run_projwfc(input_file, workdir, timeout=timeout)
         atm_files = sorted(workdir.glob(f"{prefix}.pdos_atm*"))
         if not atm_files:
             raise ToolError(
@@ -369,8 +389,8 @@ class QECalcTool:
         p = Path(str(path))
         return p.read_text() if p.exists() else ""
 
-    def _run_pw(self, input_file: Path, workdir: Path):
-        result = self.executor.run_pw(input_file, workdir)
+    def _run_pw(self, input_file: Path, workdir: Path, timeout=None):
+        result = self.executor.run_pw(input_file, workdir, timeout=timeout)
         if not result.success or "JOB DONE" not in (result.stdout or ""):
             raise ToolError(
                 f"pw.x failed: {self._qe_error_snippet(result) or result.error_message or result.stderr or 'no JOB DONE in stdout'}",
@@ -388,13 +408,13 @@ class QECalcTool:
             return f"{m.group(1)}: {m.group(2).strip()}"
         return None
 
-    def _run_tool(self, tool: str, input_file: Path, workdir: Path):
+    def _run_tool(self, tool: str, input_file: Path, workdir: Path, timeout=None):
         runner = {
             "bands.x": self.executor.run_bands_x,
             "dos.x": self.executor.run_dos_x,
             "projwfc.x": self.executor.run_projwfc_x,
         }
-        result = runner[tool](input_file, workdir)
+        result = runner[tool](input_file, workdir, timeout=timeout)
         if not result.success:
             raise ToolError(
                 f"{tool} failed: {result.error_message or result.stderr or 'exit != 0'}",
@@ -403,8 +423,8 @@ class QECalcTool:
             )
         return result
 
-    def _run_projwfc(self, input_file: Path, workdir: Path):
-        result = self.executor.run_projwfc_x(input_file, workdir)
+    def _run_projwfc(self, input_file: Path, workdir: Path, timeout=None):
+        result = self.executor.run_projwfc_x(input_file, workdir, timeout=timeout)
         if not result.success or "JOB DONE" not in (result.stdout or ""):
             raise ToolError(
                 f"projwfc.x failed: {self._qe_error_snippet(result) or result.error_message or result.stderr or 'no JOB DONE in stdout'}",
@@ -415,14 +435,25 @@ class QECalcTool:
 
     @staticmethod
     def _link_upstream_save(ctx: ExecutionContext, workdir: Path, prefix: str) -> None:
-        """Symlink the upstream {prefix}.save into this node's workdir."""
-        for dep_id in sorted(ctx.upstream):
+        """Symlink the upstream {prefix}.save into this node's workdir.
+
+        Prefer the nscf dependency when present: bands/dos/projwfc must reuse
+        the nscf wavefunctions and k-point set — linking scf's save instead
+        silently computes on the wrong k-mesh (alphabetical order only worked
+        by luck: 'nscf' < 'scf')."""
+        deps = list(ctx.upstream)
+        preferred = [d for d in deps if "nscf" in d] + [d for d in deps if "nscf" not in d]
+        for dep_id in preferred:
             # resolve() makes the link absolute — a relative base_dir would
             # otherwise produce a symlink broken from the node workdir
             dep_save = (ctx.base_dir / dep_id / f"{prefix}.save").resolve()
             if dep_save.exists():
                 target = workdir / f"{prefix}.save"
-                if target.exists() or target.is_symlink():
+                if target.is_symlink() and not target.exists():
+                    # stale link from a moved/renamed upstream — replace it,
+                    # otherwise the node would silently reuse the dead path
+                    target.unlink()
+                elif target.exists() or target.is_symlink():
                     return
                 target.symlink_to(dep_save, target_is_directory=True)
                 return
@@ -457,6 +488,10 @@ class QEParamRepairer:
             params["nbnd"] = bumped
             node.error = (node.error or "") + f" | repair: nbnd -> {bumped}"
             return True
+        # timeouts need LESS work, not more: a cutoff bump makes every retry
+        # slower and guarantees another timeout, so shrink k-point cost instead
+        if "timed out" in str(error).lower():
+            return self._repair_timeout(node, params)
         current = float(params.get("ecutwfc") or 45.0)
         if current >= self.MAX_ECUT:
             return False
@@ -464,3 +499,23 @@ class QEParamRepairer:
         params["ecutrho"] = params["ecutwfc"] * 8.0
         node.error = (node.error or "") + f" | repair: ecutwfc -> {params['ecutwfc']}"
         return True
+
+    MIN_BAND_PATH_POINTS = 24
+
+    def _repair_timeout(self, node: NodeRun, params: dict) -> bool:
+        """Reduce k-point cost: band-path sampling first, then uniform mesh."""
+        if params.get("nkpoints_bands"):
+            current = int(params["nkpoints_bands"])
+            if current <= self.MIN_BAND_PATH_POINTS:
+                return False
+            reduced = max(self.MIN_BAND_PATH_POINTS, int(current * 0.6))
+            params["nkpoints_bands"] = reduced
+            node.error = (node.error or "") + f" | repair: nkpoints_bands -> {reduced}"
+            return True
+        kpts = params.get("kpoints")
+        if isinstance(kpts, (list, tuple)) and len(kpts) >= 3 and any(n > 2 for n in kpts[:3]):
+            reduced = [max(2, int(n) // 2) if n > 2 else int(n) for n in kpts[:3]]
+            params["kpoints"] = reduced + [int(n) for n in kpts[3:]]
+            node.error = (node.error or "") + f" | repair: kpoints -> {params['kpoints']}"
+            return True
+        return False

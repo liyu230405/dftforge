@@ -3,11 +3,30 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 WHITE, GRAY, BLACK = 0, 1, 2
+
+# template-level output contract: "${nodes.<id>.outputs.<key>}"
+OUTPUT_REF_RE = re.compile(r"^\$\{nodes\.([A-Za-z0-9_]+)\.outputs\.([A-Za-z0-9_]+)\}$")
+PARAM_REF_RE = re.compile(
+    r"^\$\{(inputs|nodes)\.([A-Za-z0-9_]+)(?:\.outputs\.([A-Za-z0-9_]+))?\}$"
+)
+NODE_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def _iter_param_strings(value: Any):
+    if isinstance(value, str):
+        yield value.strip()
+    elif isinstance(value, dict):
+        for nested in value.values():
+            yield from _iter_param_strings(nested)
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            yield from _iter_param_strings(nested)
 
 
 @dataclass
@@ -41,8 +60,9 @@ class GraphTemplate:
     def validate(self, known_tools: Optional[Set[str]] = None) -> List[str]:
         """Return a list of validation errors (empty = valid).
 
-        Checks: id non-empty, unique node ids, deps exist, no self-dep,
-        no cycles (3-color DFS), tool known (when a registry is given).
+        Checks structural constraints and parameter references before a run is
+        created, so malformed templates fail at load time instead of halfway
+        through an expensive calculation.
         """
         errors: List[str] = []
         if not self.template_id.strip():
@@ -58,15 +78,61 @@ class GraphTemplate:
 
         known = set(ids)
         for n in self.nodes:
+            if n.id and not NODE_ID_RE.fullmatch(n.id):
+                errors.append(f"node '{n.id}' contains unsupported characters")
+            if not n.tool.strip():
+                errors.append(f"node '{n.id}' tool must be non-empty")
+            if n.max_attempts < 1:
+                errors.append(f"node '{n.id}' max_attempts must be >= 1")
+            if n.max_repair_attempts < 0:
+                errors.append(f"node '{n.id}' max_repair_attempts must be >= 0")
+            if n.timeout_seconds is not None and n.timeout_seconds <= 0:
+                errors.append(f"node '{n.id}' timeout_seconds must be > 0")
+            if n.execution_mode not in {"local", "hpc"}:
+                errors.append(
+                    f"node '{n.id}' execution_mode must be 'local' or 'hpc', got {n.execution_mode!r}"
+                )
+            if len(set(n.depends_on)) != len(n.depends_on):
+                errors.append(f"node '{n.id}' has duplicate dependencies")
             for dep in n.depends_on:
                 if dep not in known:
                     errors.append(f"node '{n.id}' depends on unknown node '{dep}'")
             if n.id in n.depends_on:
                 errors.append(f"node '{n.id}' depends on itself")
 
+            for raw in _iter_param_strings(n.params):
+                if not raw.startswith("${"):
+                    continue
+                match = PARAM_REF_RE.fullmatch(raw)
+                if match is None:
+                    errors.append(f"node '{n.id}' has malformed parameter reference: {raw!r}")
+                    continue
+                scope, key, output_key = match.groups()
+                if scope == "inputs" and (output_key is not None or key not in self.inputs):
+                    errors.append(f"node '{n.id}' references unknown input '{key}'")
+                elif scope == "nodes":
+                    if output_key is None:
+                        errors.append(f"node '{n.id}' node reference needs an outputs key: {raw!r}")
+                    elif key not in known:
+                        errors.append(f"node '{n.id}' references unknown node '{key}'")
+                    elif key not in n.depends_on:
+                        errors.append(
+                            f"node '{n.id}' references '{key}' without declaring it in depends_on"
+                        )
+
         cycle = self._detect_cycle()
         if cycle:
             errors.append("cycle detected: " + " -> ".join(cycle))
+
+        for name, ref in self.outputs.items():
+            if not isinstance(ref, str) or not OUTPUT_REF_RE.match(ref):
+                errors.append(
+                    f"template output '{name}' must be a '${{nodes.<id>.outputs.<key>}}' reference, got: {ref!r}"
+                )
+                continue
+            node_id = OUTPUT_REF_RE.match(ref).group(1)
+            if node_id not in ids:
+                errors.append(f"template output '{name}' references unknown node '{node_id}'")
 
         if known_tools is not None:
             for n in self.nodes:

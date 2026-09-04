@@ -13,6 +13,7 @@ Parses stdout (regex) and XML fallback for:
 
 from __future__ import annotations
 
+import logging
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -22,6 +23,10 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 RY_TO_EV = 13.605693122994
+HA_TO_EV = 27.211386245988
+HA_TO_RY = HA_TO_EV / RY_TO_EV  # 2.0
+
+logger = logging.getLogger(__name__)
 
 
 # ── Data structures ───────────────────────────────────────────────────────────
@@ -143,13 +148,15 @@ class QEParser:
         if fermi_match:
             result.fermi_energy_ev = float(fermi_match.group(1))
         
-        # Number of K-points
-        kpts_match = re.search(r"number of k points\s+=\s+(\d+)", stdout)
+        # Number of K-points — QE 7.5 prints "number of k points=   63" (no
+        # space before =); older/newer variants use " = "
+        kpts_match = re.search(r"number of k points\s*=\s*(\d+)", stdout)
         if kpts_match:
             result.k_points = int(kpts_match.group(1))
-        
-        # Number of bands (from &SYSTEM nbnd)
-        nbnd_match = re.search(r"nbnd\s+=\s+(\d+)", stdout)
+
+        # Number of bands — stdout never echoes nbnd; it prints the resolved
+        # "number of Kohn-Sham states" line instead
+        nbnd_match = re.search(r"number of Kohn-Sham states\s*=\s*(\d+)", stdout)
         if nbnd_match:
             result.n_bands = int(nbnd_match.group(1))
         
@@ -170,7 +177,25 @@ class QEParser:
         )
         if energy_matches:
             result.final_energy_ry = float(energy_matches[-1])
-            result.converged = True
+        # Electronic SCF convergence occurs at every ionic step and therefore
+        # does not prove that the geometry optimization converged.  Require a
+        # geometry-specific BFGS/final-coordinate marker.
+        geometry_done = bool(
+            re.search(
+                r"bfgs converged in|End of BFGS Geometry Optimization",
+                stdout,
+                re.IGNORECASE,
+            )
+        )
+        geometry_failed = bool(
+            re.search(
+                r"maximum number of steps has been reached|"
+                r"geometry optimization did not converge",
+                stdout,
+                re.IGNORECASE,
+            )
+        )
+        result.converged = geometry_done and not geometry_failed
         
         # Convergence message
         conv_matches = re.findall(
@@ -184,17 +209,28 @@ class QEParser:
         if pressure_matches:
             result.pressure_kbar = float(pressure_matches[-1])
         
-        # Forces: find all force lines directly; QE may or may not wrap them in
-        # a "Forces acting on atoms" header, so we avoid relying on that block.
-        force_lines = re.findall(
-            r"atom\s+\d+.*?force\s+=\s*([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)",
-            stdout
-        )
-        if force_lines:
+        # Forces: only the FINAL configuration matters — the whole-trajectory
+        # max includes early steps far from equilibrium and misjudges a
+        # converged relax as failed (verifier compares against a threshold)
+        final_marker = "Begin final coordinates"
+        search_text = stdout.split(final_marker)[-1] if final_marker in stdout else stdout
+        force_blocks = list(re.finditer(
+            r"(?:^[ \t]*atom[ \t]+\d+.*?force[ \t]*=[ \t]*[-\d.eE+]+[ \t]+[-\d.eE+]+[ \t]+[-\d.eE+]+[ \t]*$\n?)+",
+            search_text,
+            re.MULTILINE,
+        ))
+        if force_blocks:
             all_forces = []
-            for fx, fy, fz in force_lines:
-                all_forces.extend([abs(float(fx)), abs(float(fy)), abs(float(fz))])
-            result.max_force_ry_bohr = max(all_forces)
+            for line in force_blocks[-1].group(0).splitlines():
+                m = re.search(
+                    r"force[ \t]*=[ \t]*([-\d.eE+]+)[ \t]+([-\d.eE+]+)[ \t]+([-\d.eE+]+)",
+                    line,
+                )
+                if m:
+                    components = [float(g) for g in m.groups()]
+                    all_forces.append(sum(v * v for v in components) ** 0.5)
+            if all_forces:
+                result.max_force_ry_bohr = max(all_forces)
         
         # Cell parameters (last block)
         cell_blocks = re.findall(
@@ -370,13 +406,17 @@ class QEParser:
                 cbm = float(np.min(empty))
                 if cbm > vbm:
                     result.band_gap_ev = cbm - vbm
-                    result.is_metal = False
+                    # gaps below 2×degauss (0.01 Ry ≈ 0.27 eV) are smaller than
+                    # the smearing resolution — the system is effectively metal
+                    result.is_metal = result.band_gap_ev < 0.272
                 else:
                     result.band_gap_ev = 0.0
                     result.is_metal = True
 
-        except Exception:
-            pass
+        except Exception as exc:
+            # swallow-and-continue is what let empty results "pass" before:
+            # log loudly so a broken XML is visible, verifier will fail it
+            logger.warning("parse_bands failed for %s: %s", xml_path, exc)
 
         return result
 
@@ -389,24 +429,37 @@ class QEParser:
             return result
         
         try:
+            header = ""
+            with open(dos_file) as fh:
+                for _ in range(3):
+                    line = fh.readline()
+                    if not line:
+                        break
+                    header += line
             data = np.loadtxt(dos_file)
             if data.ndim == 2 and data.shape[1] >= 2:
-                energies = data[:, 0] * RY_TO_EV  # Convert Ry to eV
+                # QE dos.x writes the first column in eV (header: "E (eV)").
+                # Multiplying by RY_TO_EV here inflates the whole axis ×13.6.
+                energies = data[:, 0]
                 dos = data[:, 1]
                 result.energies = energies
                 result.dos = dos
                 result.n_energy_points = len(energies)
-                
-                # Find Fermi level (energy where DOS changes behavior)
-                # Simple: use middle of energy range for insulators
-                mid_idx = len(energies) // 2
-                result.fermi_energy_ev = energies[mid_idx]
-                
-                # DOS at Fermi level
-                result.dos_at_fermi = float(np.interp(result.fermi_energy_ev, energies, dos))
-        except Exception:
-            pass
-        
+
+                # Fermi level is stated in the file header ("EFermi = ... eV");
+                # the old midpoint fallback put it at a meaningless energy
+                m = re.search(r"EFermi\s*=\s*([-\d.Ee+]+)", header)
+                if m:
+                    result.fermi_energy_ev = float(m.group(1))
+                else:
+                    result.fermi_energy_ev = None
+
+                if result.fermi_energy_ev is not None:
+                    # DOS at Fermi level
+                    result.dos_at_fermi = float(np.interp(result.fermi_energy_ev, energies, dos))
+        except Exception as exc:
+            logger.warning("parse_dos failed for %s: %s", dos_file, exc)
+
         return result
 
     @staticmethod
@@ -452,7 +505,7 @@ class QEParser:
                 continue
             if data.ndim != 2 or data.shape[1] < 2:
                 continue
-            e = data[:, 0] * RY_TO_EV
+            e = data[:, 0]  # pdos_atm files are already in eV ("# E (eV)")
             ldos = data[:, 1]
             if energies is None:
                 energies = e
@@ -539,23 +592,36 @@ class QEParser:
             tree = ET.parse(xml_path)
             root = tree.getroot()
             ns = {'qes': 'http://www.quantum-espresso.org/ns/qes/qes-1.0'}
-            
-            output = root.find('output', ns)
+
+            def _find(parent, path):
+                """QE writes child elements UNPREFIXED under a prefixed root
+                (<qes:espresso><output>…), but some tools emit prefixed tags —
+                try both or every lookup silently misses and the whole XML
+                fallback is dead."""
+                hit = parent.find(path)
+                if hit is not None:
+                    return hit
+                return parent.find("qes:" + path.replace("/", "/qes:"), ns)
+
+            output = _find(root, "output")
+            if output is None:
+                # tolerate a document whose root IS the output element
+                output = root if root.tag.split("}")[-1] == "output" else None
             if output is None:
                 return result
-            
-            # Total energy
-            etot_elem = output.find('qes:total_energy/qes:etot', ns)
+
+            # Total energy — QE XML writes etot in Hartree, NOT Ry
+            etot_elem = _find(output, "total_energy/etot")
             if etot_elem is not None:
-                result["total_energy_ry"] = float(etot_elem.text)
-            
+                result["total_energy_ry"] = float(etot_elem.text) * HA_TO_RY
+
             # Cell parameters
-            atomic_struct = output.find('qes:atomic_structure', ns)
+            atomic_struct = _find(output, "atomic_structure")
             if atomic_struct is not None:
                 alat = float(atomic_struct.get('alat', 0))
                 ibrav = int(atomic_struct.get('bravais_index', 0))
-                
-                cell_elem = atomic_struct.find('qes:cell', ns)
+
+                cell_elem = _find(atomic_struct, "cell")
                 if cell_elem is not None and alat > 0:
                     a1 = np.array([float(x) for x in cell_elem[0].text.split()]) * alat
                     a2 = np.array([float(x) for x in cell_elem[1].text.split()]) * alat

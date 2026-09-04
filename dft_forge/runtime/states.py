@@ -47,7 +47,7 @@ TERMINAL_RUN_STATES: Set[RunState] = {
 ALLOWED_NODE_TRANSITIONS: Dict[NodeState, Set[NodeState]] = {
     NodeState.PENDING: {NodeState.READY, NodeState.BLOCKED, NodeState.SKIPPED, NodeState.CANCELLED},
     NodeState.READY: {NodeState.RUNNING, NodeState.SKIPPED, NodeState.CANCELLED},
-    NodeState.RUNNING: {NodeState.SUCCEEDED, NodeState.FAILED, NodeState.REPAIRING, NodeState.CANCELLED},
+    NodeState.RUNNING: {NodeState.SUCCEEDED, NodeState.FAILED, NodeState.REPAIRING, NodeState.READY, NodeState.CANCELLED},
     NodeState.REPAIRING: {NodeState.READY, NodeState.FAILED, NodeState.CANCELLED},
     NodeState.SUCCEEDED: set(),
     NodeState.FAILED: {NodeState.PENDING},  # explicit retry() only

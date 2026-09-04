@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -27,7 +28,7 @@ from dft_forge.executor import (
     QEExecutor,
 )
 from dft_forge.parser import QEParser, ParsedVCResult, ParsedBands, ParsedDOS
-from dft_forge.protocol.schemas import EvidenceBundle, TaskSpec
+from dft_forge.protocol.schemas import EvidenceBundle, TaskSpec, VerificationInput
 from dft_forge.recovery import RecoveryController
 from dft_forge.verifier import ScientificVerifier, ConvergenceReport
 
@@ -78,6 +79,15 @@ class TaskRunner:
         self.recovery_controller = RecoveryController()
         self.ledger = ledger
 
+    @staticmethod
+    def _qe_version_from_stdout(*outputs: str) -> str:
+        """Read the actual QE program version instead of forging a constant."""
+        for stdout in outputs:
+            match = re.search(r"\bProgram\s+\S+\s+v\.?([^\s]+)", stdout or "", re.IGNORECASE)
+            if match:
+                return match.group(1).rstrip(",")
+        return "unknown"
+
     def run_t1(
         self,
         task_id: str,
@@ -114,7 +124,14 @@ class TaskRunner:
 
         xml_path = workdir / f"{material}_vcrelax.save" / "data-file-schema.xml"
         parsed = QEParser.parse_vc_relax(job_result.stdout, xml_path=xml_path if xml_path.exists() else None)
-        report = self.verifier.verify_t1(job_result, parsed)
+        report = self.verifier.verify_t1(
+            VerificationInput(
+                stdout=job_result.stdout,
+                xml_path=xml_path if xml_path.exists() else None,
+                job_success=bool(getattr(job_result, "success", True)),
+            ),
+            parsed,
+        )
 
         kind = self.recovery_controller.classify(report, task_spec.task_type, parsed)
         actions = self.recovery_controller.plan_actions(kind, task_spec.parameters, len(self.run_records) + 1)
@@ -270,7 +287,7 @@ class TaskRunner:
             status="pass" if report.passed else "fail",
             input_hash=f"{scf_hash}:{nscf_hash}:{bands_hash}",
             pseudo_hashes=pseudo_hashes,
-            qe_version="7.5",
+            qe_version=self._qe_version_from_stdout(scf_result.stdout, nscf_result.stdout),
             parser_version="0.1.0",
             commands=all_commands,
             walltimes_sec=all_walltimes,
@@ -472,7 +489,7 @@ class TaskRunner:
             status="pass" if report.passed else "fail",
             input_hash=f"{scf_hash}:{nscf_hash}:{dos_hash}",
             pseudo_hashes=pseudo_hashes,
-            qe_version="7.5",
+            qe_version=self._qe_version_from_stdout(scf_result.stdout, nscf_result.stdout),
             parser_version="0.1.0",
             commands=all_commands,
             walltimes_sec=all_walltimes,
@@ -578,7 +595,7 @@ class TaskRunner:
             status="pass" if report.passed else "fail",
             input_hash=input_hash,
             pseudo_hashes=pseudo_hashes,
-            qe_version="7.5",
+            qe_version=self._qe_version_from_stdout(job_result.stdout),
             parser_version="0.1.0",
             commands=[f"pw.x -in {task_spec.material}_vcrelax.in"],
             walltimes_sec=[job_result.walltime_sec],

@@ -257,6 +257,8 @@ body {
 }
 .composer button:hover { background: var(--blue-deep); }
 .composer button:disabled { opacity: 0.55; cursor: default; }
+.composer .stop-btn { background: var(--red); }
+.composer .stop-btn:hover { background: #7F2F24; }
 
 .statusline {
   flex: none; padding: 4px 26px 10px; font-size: 11px; color: var(--ink-3);

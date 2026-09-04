@@ -103,8 +103,20 @@ dft-forge/
 - Space-group detection via spglib
 
 ### Executors
-- Local executor
-- SSH executor with scheduler support: Slurm, PBS
+- Local executor (real subprocess pw.x/bands.x/dos.x runs)
+- SSH executor (`--backend ssh`): real remote execution grafted onto the
+  `hpc/` layer (SSHRunner + SLURM/PBS scheduler adapters)
+  - Two modes: `scheduler="none"` runs the QE binary directly under a
+    remote-side `timeout`; `scheduler="slurm"|"pbs"` renders an sbatch/qsub
+    script and polls squeue/sacct (or qstat) to completion
+  - File transport is chunked tar+base64 over the SSH command channel; the
+    upload dereferences `.save` symlink chains so scf→nscf→bands carry real
+    wavefunctions to the remote side
+  - Status: transport and both execution modes are covered by offline tests
+    against a scripted fake runner; they have not yet been validated
+    end-to-end on a live cluster, and multi-GB wavefunction dirs will be
+    slow over the text-channel transport — prefer scheduler mode for
+    production runs
 - Fake executor for offline testing
 
 ### Verification

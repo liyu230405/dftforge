@@ -26,12 +26,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import re
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-
-from dft_forge.protocol.schemas import VerificationResult
+from dft_forge.protocol.schemas import VerificationInput
 from dft_forge.parser import QEParser, ParsedVCResult
 
 
@@ -61,20 +56,34 @@ class ScientificVerifier:
         self.pressure_threshold_kbar = pressure_threshold_kbar
         self.energy_threshold_ry = energy_threshold_ry
 
-    def verify_t1(self, job_result: Any, parsed: ParsedVCResult) -> ConvergenceReport:
+    def verify_t1(
+        self,
+        inp: VerificationInput,
+        parsed: Optional[ParsedVCResult] = None,
+    ) -> ConvergenceReport:
         """Verify T1 vc-relax calculation.
-        
+
         Args:
-            job_result: QE JobResult from executor
-            parsed: ParsedVCResult from parser
-        
+            inp: unified verification input (stdout + optional XML + job status)
+            parsed: pre-parsed vc-relax result; when omitted it is parsed
+                internally from ``inp`` (callers that already parsed reuse it)
+
         Returns:
             ConvergenceReport with all checks
         """
         report = ConvergenceReport(passed=True)
-        stdout = job_result.stdout if hasattr(job_result, 'stdout') else ""
-        
-        # Check 0: Data quality
+        if parsed is None:
+            xml = inp.xml_path if (inp.xml_path is not None and inp.xml_path.exists()) else None
+            parsed = QEParser.parse_vc_relax(inp.stdout, xml)
+        stdout = inp.stdout
+
+        # Check 0: Executor-reported failure
+        if not inp.job_success:
+            report.passed = False
+            report.failure_reasons.append("Job execution failed (non-zero exit / backend error)")
+            report.checks["job_success"] = {"pass": False}
+
+        # Check 0.5: Data quality
         if (parsed.final_energy_ry == 0.0 and parsed.pressure_kbar == 0.0 
             and parsed.natoms == 0):
             report.passed = False
@@ -92,6 +101,14 @@ class ScientificVerifier:
             report.checks["job_done"] = {"pass": False}
         else:
             report.checks["job_done"] = {"pass": True}
+
+        # Electronic convergence is not ionic/cell convergence.  A vc-relax
+        # can contain many successful SCF cycles and still stop before BFGS
+        # converges (for example at nstep).  Keep this as an independent gate.
+        if not parsed.converged:
+            report.passed = False
+            report.failure_reasons.append("Geometry optimization did not converge")
+        report.checks["geometry_convergence"] = {"pass": parsed.converged}
         
         # Check 2: SCF converged
         scf = QEParser.parse_scf(stdout)
@@ -104,27 +121,43 @@ class ScientificVerifier:
             "threshold": scf.convergence_thr,
         }
         
-        # Check 3: Forces below threshold
-        if parsed.max_force_ry_bohr > self.force_threshold_ry:
+        # Check 3: Forces below threshold.  Zero is a valid force, so parser
+        # defaults cannot distinguish a real zero from a missing force block;
+        # require the source block explicitly before accepting the value.
+        force_present = bool(re.search(r"\batom\s+\d+.*?\bforce\s*=", stdout, re.IGNORECASE))
+        if not force_present:
+            report.passed = False
+            report.failure_reasons.append("No atomic-force block found in vc-relax output")
+        elif parsed.max_force_ry_bohr > self.force_threshold_ry:
             report.passed = False
             report.failure_reasons.append(
                 f"Max force {parsed.max_force_ry_bohr:.2e} Ry/Bohr exceeds "
                 f"threshold {self.force_threshold_ry:.0e}"
             )
         report.checks["forces"] = {
-            "pass": parsed.max_force_ry_bohr <= self.force_threshold_ry,
+            "pass": force_present and parsed.max_force_ry_bohr <= self.force_threshold_ry,
+            "present": force_present,
             "value": parsed.max_force_ry_bohr,
             "threshold": self.force_threshold_ry,
         }
         
         # Check 4: Pressure
-        if abs(parsed.pressure_kbar) > self.pressure_threshold_kbar:
-            report.warnings.append(
+        # A vc-relax ending above the pressure threshold has not actually
+        # relaxed the cell — this is a failure, not a warning (a warning here
+        # used to leave report.passed=True with checks.pressure.pass=False)
+        pressure_present = bool(re.search(r"\bP\s*=\s*[-+\d.]", stdout))
+        if not pressure_present:
+            report.passed = False
+            report.failure_reasons.append("No pressure value found in vc-relax output")
+        elif abs(parsed.pressure_kbar) > self.pressure_threshold_kbar:
+            report.passed = False
+            report.failure_reasons.append(
                 f"Pressure {parsed.pressure_kbar:.2f} kbar exceeds "
                 f"threshold {self.pressure_threshold_kbar}"
             )
         report.checks["pressure"] = {
-            "pass": abs(parsed.pressure_kbar) <= self.pressure_threshold_kbar,
+            "pass": pressure_present and abs(parsed.pressure_kbar) <= self.pressure_threshold_kbar,
+            "present": pressure_present,
             "value": parsed.pressure_kbar,
             "threshold": self.pressure_threshold_kbar,
         }
@@ -151,9 +184,13 @@ class ScientificVerifier:
             else:
                 report.passed = False
                 report.failure_reasons.append(f"Unreasonable cell: a={a}")
+        else:
+            report.passed = False
+            report.failure_reasons.append("No final cell parameters found in vc-relax output")
+            report.checks["cell_params"] = {"pass": False, "present": False}
         
         # Check 7: Ion convergence (vc-relax specific)
-        if "bfgs" in stdout or "vc-relax" in stdout:
+        if "bfgs" in stdout.lower() or "vc-relax" in stdout.lower():
             if parsed.max_force_ry_bohr > self.force_threshold_ry:
                 report.failure_reasons.append(
                     "vc-relax did not converge: forces still above threshold"
@@ -219,6 +256,9 @@ class ScientificVerifier:
         if not band_calc_done:
             report.passed = False
             report.failure_reasons.append("NSCF diagonalization did not complete")
+        if not job_done:
+            report.passed = False
+            report.failure_reasons.append("JOB DONE not found in NSCF output")
         if not has_fermi:
             report.passed = False
             report.failure_reasons.append("No Fermi/highest-occupied energy in NSCF output")
@@ -250,7 +290,7 @@ class ScientificVerifier:
             report.passed = False
             report.failure_reasons.append("SCF stage failed")
         report.checks["scf"] = scf_report.checks.get("scf", {})
-        
+
         # Check NSCF
         nscf_report = self.verify_nscf(nscf_stdout)
         if not nscf_report.passed:
@@ -269,7 +309,10 @@ class ScientificVerifier:
             # Parse bands
             bands = QEParser.parse_bands(bands_xml)
             if bands.n_bands == 0:
-                report.warnings.append("No bands parsed from XML")
+                # an empty parse is NOT success — without this the node
+                # "succeeds" while every downstream number is missing
+                report.passed = False
+                report.failure_reasons.append("bands XML parsed but empty (no eigenvalues)")
             report.checks["bands_data"] = {
                 "pass": bands.n_bands > 0,
                 "n_bands": bands.n_bands,
@@ -298,6 +341,14 @@ class ScientificVerifier:
             report.passed = False
             report.failure_reasons.append("SCF stage failed")
         report.checks["scf"] = scf_report.checks.get("scf", {})
+
+        # DOS is meaningful only when the preceding uniform-grid NSCF stage
+        # completed.  A non-empty DOS file alone is not sufficient evidence.
+        nscf_report = self.verify_nscf(nscf_stdout)
+        if not nscf_report.passed:
+            report.passed = False
+            report.failure_reasons.append("NSCF stage did not pass")
+        report.checks["nscf"] = nscf_report.checks.get("nscf", {})
         
         # Check DOS file
         if not dos_file.exists():
@@ -306,6 +357,9 @@ class ScientificVerifier:
             report.checks["dos_file"] = {"pass": False}
         else:
             dos = QEParser.parse_dos(dos_file)
+            if dos.n_energy_points == 0:
+                report.passed = False
+                report.failure_reasons.append("DOS file parsed but empty (no energy points)")
             report.checks["dos_file"] = {
                 "pass": dos.n_energy_points > 0,
                 "n_points": dos.n_energy_points,

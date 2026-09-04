@@ -33,3 +33,12 @@ si_bands_calc/
 work/
 .impeccable/
 .DS_Store
+
+# persisted chat sessions (moved out of /tmp)
+sessions/
+graphene_N_bands/
+
+# QE runtime artifacts
+CRASH
+*.in.tmp
+input_tmp.in

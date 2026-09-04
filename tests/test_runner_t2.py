@@ -64,14 +64,17 @@ def _make_bands_xml(tmp_path, prefix="si", n_bands=8, n_kpoints=200, band_gap=0.
 
 
 def _make_dos_dat(tmp_path, prefix="si", n_points=1000):
-    """Create a minimal dos.dat file for testing."""
+    """Create a minimal dos.dat file for testing (real QE header format)."""
     import numpy as np
     energies = np.linspace(-10, 10, n_points)
     # Gaussian-like DOS centered at 0
     dos = np.exp(-energies**2 / 2.0)
     data = np.column_stack([energies, dos])
     dos_path = tmp_path / f"{prefix}_dos.dat"
-    np.savetxt(dos_path, data)
+    header = f"#  E (eV)   dos(E)     EFermi =    0.5000 eV\n"
+    with open(dos_path, "w") as fh:
+        fh.write(header)
+        np.savetxt(fh, data)
     return dos_path
 
 

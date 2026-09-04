@@ -9,6 +9,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -26,20 +28,33 @@ from dft_forge.tools.registry import registry
 
 app = FastAPI(title="DFT-Forge Chat")
 
+_CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get(
+        "DFT_FORGE_WEB_ORIGINS",
+        "http://127.0.0.1:8000,http://localhost:8000",
+    ).split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_CORS_ORIGINS,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Content-Type"],
 )
 
 register_default_tools()
 
 agent_loop = AgentLoop()
 WEB_SESSION_CTX: Dict[str, Dict[str, Any]] = {}
+# session_id -> {"task": asyncio.Task, "cancel": threading.Event, "ts": float}
+# tracks in-flight chat runs so POST /api/sessions/{id}/cancel can stop them
+WEB_ACTIVE_RUNS: Dict[str, Dict[str, Any]] = {}
 
 CLI = [sys.executable, "-m", "dft_forge.cli"]
-WEB_WORKDIR = Path(os.environ.get("DFT_FORGE_WEB_WORKDIR", "/tmp/dft-forge-web"))
+# 默认落在项目根目录 sessions/ 下：/tmp 会随系统重启清空，计算结果必须持久化
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+WEB_WORKDIR = Path(os.environ.get("DFT_FORGE_WEB_WORKDIR", _PROJECT_ROOT / "sessions"))
 WEB_WORKDIR.mkdir(parents=True, exist_ok=True)
 
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
@@ -117,8 +132,28 @@ def save_config(req: ConfigRequest) -> Dict[str, Any]:
     return _config_state()
 
 
+_SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _session_dir(session_id: str) -> Path:
+    """Validated session directory.
+
+    session_id arrives from the client and lands in filesystem paths, so it
+    must be a safe token (no separators, no '..', bounded length) AND the
+    resolved directory must stay inside WEB_WORKDIR — a symlink planted at
+    sessions/<id> must not turn delete/download into an arbitrary-path tool.
+    """
+    if not isinstance(session_id, str) or not _SAFE_SESSION_ID.match(session_id):
+        raise HTTPException(status_code=400, detail="Invalid session id")
+    root = WEB_WORKDIR.resolve()
+    d = (WEB_WORKDIR / session_id).resolve()
+    if d.parent != root:
+        raise HTTPException(status_code=400, detail="Invalid session id")
+    return d
+
+
 def _session_file(session_id: str) -> Path:
-    return WEB_WORKDIR / session_id / "session.json"
+    return _session_dir(session_id) / "session.json"
 
 
 def _load_session(session_id: str) -> Dict[str, Any]:
@@ -138,13 +173,59 @@ def _load_session(session_id: str) -> Dict[str, Any]:
     return fresh
 
 
+_BULKY_NODE_OUTPUTS = (
+    "eigenvalues_ev", "dos_curve", "pdos_curve", "k_axis", "k_ticks", "k_labels",
+)
+
+
+def _slim_for_disk(session: Dict[str, Any]) -> Dict[str, Any]:
+    """Disk copy of a session: keep only the newest chart/viewer and strip
+    bulky node-output arrays. The live in-memory session keeps everything;
+    frontend restoreFigures only needs the newest of each payload, and the
+    chart dict already embeds its own copy of the curves."""
+    slim = json.loads(json.dumps(session, ensure_ascii=False, default=str))
+    keep_chart = keep_viewer = False
+    for msg in reversed(slim.get("messages", [])):
+        for r in msg.get("results") or []:
+            if r.get("chart"):
+                if keep_chart:
+                    r.pop("chart")
+                else:
+                    keep_chart = True
+            if r.get("viewer"):
+                if keep_viewer:
+                    r.pop("viewer")
+                else:
+                    keep_viewer = True
+            j = r.get("json")
+            if isinstance(j, dict):
+                for node in (j.get("nodes") or {}).values():
+                    outs = node.get("outputs")
+                    if isinstance(outs, dict):
+                        for k in _BULKY_NODE_OUTPUTS:
+                            outs.pop(k, None)
+    return slim
+
+
 def _save_session(session_id: str) -> None:
     session = WEB_SESSION_CTX.get(session_id)
     if session is None:
         return
     sf = _session_file(session_id)
     sf.parent.mkdir(parents=True, exist_ok=True)
-    sf.write_text(json.dumps(session, ensure_ascii=False, default=str))
+    payload = json.dumps(_slim_for_disk(session), ensure_ascii=False, default=str)
+    # Replace atomically so a crash cannot leave a half-written session.json.
+    tmp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=sf.parent, prefix=".session-", delete=False
+        ) as tmp:
+            tmp.write(payload)
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, sf)
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
 
 FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
 
@@ -253,11 +334,46 @@ def get_session(session_id: str) -> Dict[str, Any]:
 
 @app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str) -> Dict[str, Any]:
+    d = _session_dir(session_id)  # 400 on traversal/symlink escape
+    if session_id in WEB_ACTIVE_RUNS:
+        raise HTTPException(
+            status_code=409,
+            detail="Session is running; stop the calculation before deleting it",
+        )
     WEB_SESSION_CTX.pop(session_id, None)
-    d = WEB_WORKDIR / session_id
     if d.exists():
         shutil.rmtree(d, ignore_errors=True)
     return {"deleted": session_id}
+
+
+@app.post("/api/sessions/{session_id}/cancel")
+async def cancel_session(session_id: str) -> Dict[str, Any]:
+    """Stop an in-flight calculation: signal the scheduler AND kill pw.x.
+
+    Two-pronged because the scheduler only notices its event between ticks —
+    the process kill is what actually frees the CPU within milliseconds.
+    Only THIS session's engine is swept: sessions get their own engine under
+    <session_dir>/graphs, and a global sweep would kill other sessions' runs.
+    """
+    session_dir = _session_dir(session_id)
+    entry = WEB_ACTIVE_RUNS.get(session_id)
+    if entry is None:
+        return {"cancelled": False, "reason": "no active run for this session"}
+
+    entry["cancel"].set()
+    killed = 0
+    try:
+        from dft_forge.tools.graph_tools import cancel_graphs_under
+
+        killed = cancel_graphs_under(session_dir)
+    except Exception:
+        pass
+    return {"cancelled": True, "processes_killed": killed}
+
+
+@app.get("/api/sessions/{session_id}/running")
+def session_running(session_id: str) -> Dict[str, Any]:
+    return {"running": session_id in WEB_ACTIVE_RUNS}
 
 
 def _history_for(session: Dict[str, Any], limit: int = 8) -> List[Dict[str, Any]]:
@@ -272,7 +388,7 @@ def _history_for(session: Dict[str, Any], limit: int = 8) -> List[Dict[str, Any]
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
     session_id = req.session_id or str(uuid.uuid4())
-    session_dir = WEB_WORKDIR / session_id
+    session_dir = _session_dir(session_id)
     session_dir.mkdir(parents=True, exist_ok=True)
 
     session = _load_session(session_id)
@@ -308,7 +424,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
 async def chat_stream(req: ChatRequest):
     """SSE stream of the agent's execution chain: plan → steps → nodes → reply."""
     session_id = req.session_id or str(uuid.uuid4())
-    session_dir = WEB_WORKDIR / session_id
+    session_dir = _session_dir(session_id)
     session_dir.mkdir(parents=True, exist_ok=True)
 
     session = _load_session(session_id)
@@ -320,11 +436,14 @@ async def chat_stream(req: ChatRequest):
 
     q: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
+    cancel_event = threading.Event()
 
     def emit(ev) -> None:
         loop.call_soon_threadsafe(q.put_nowait, ev)
 
     async def worker() -> None:
+        # the graph scheduler polls this event and kills pw.x when it fires
+        ctx["cancel_event"] = cancel_event
         try:
             result = await agent_loop.run(
                 message, session_dir, ctx=ctx, history=_history_for(session), on_event=emit
@@ -341,12 +460,22 @@ async def chat_stream(req: ChatRequest):
             })
             session["updated_at"] = time.time()
             _save_session(session_id)
+            if cancel_event.is_set():
+                messages.append({
+                    "role": "agent",
+                    "text": "计算已停止（进行中的计算被终止；已完成的结果保留在会话中）。",
+                    "ts": time.time(),
+                })
+                _save_session(session_id)
         except Exception as exc:  # noqa: BLE001
             emit({"type": "error", "message": str(exc)})
         finally:
+            ctx.pop("cancel_event", None)
+            WEB_ACTIVE_RUNS.pop(session_id, None)
             emit(None)
 
     task = asyncio.create_task(worker())
+    WEB_ACTIVE_RUNS[session_id] = {"task": task, "cancel": cancel_event, "ts": time.time()}
 
     async def gen():
         yield "data: " + json.dumps({"type": "start", "session_id": session_id}, ensure_ascii=False) + "\n\n"

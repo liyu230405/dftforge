@@ -32,6 +32,7 @@
     .composer input { flex: 1; padding: 10px 12px; border-radius: 10px; border: 1px solid #334155; background: #0b1220; color: #e2e8f0; outline: none; }
     .composer button { padding: 10px 14px; border-radius: 10px; border: 0; background: #2563eb; color: white; font-weight: 600; cursor: pointer; }
     .composer button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .composer .stop-btn { background: #dc2626; }
     .empty { color: #94a3b8; font-size: 13px; text-align: center; margin-top: 18vh; }
     .status { font-size: 12px; color: #94a3b8; }
     .status.error { color: #f87171; }
@@ -55,6 +56,7 @@
     </div>
     <form id="form" class="composer">
       <input id="msg" autocomplete="off" placeholder="输入材料计算请求..." />
+      <button id="stop" type="button" class="stop-btn" hidden>停止</button>
       <button id="send" type="submit">发送</button>
     </form>
   </div>

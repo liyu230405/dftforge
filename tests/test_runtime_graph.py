@@ -34,6 +34,7 @@ class TestStates:
         assert can_transition(NodeState.PENDING, NodeState.READY)
         assert can_transition(NodeState.RUNNING, NodeState.REPAIRING)
         assert can_transition(NodeState.REPAIRING, NodeState.READY)
+        assert can_transition(NodeState.RUNNING, NodeState.READY)  # plain retry
         assert can_transition(NodeState.FAILED, NodeState.PENDING)  # explicit retry
 
     def test_illegal_transitions(self):
@@ -132,6 +133,18 @@ class TestCreateRunAndBindings:
         with pytest.raises(ValueError, match="not succeeded"):
             resolve_params(linear_template().nodes[1].params, run)
 
+    def test_resolve_params_missing_output_key_raises(self):
+        run = create_run(linear_template())
+        run.nodes["a"].state = NodeState.SUCCEEDED
+        run.nodes["a"].outputs = {"other": 1}
+        with pytest.raises(ValueError, match="not produced by node"):
+            resolve_params(linear_template().nodes[1].params, run)
+
+    def test_resolve_params_undeclared_input_raises(self):
+        run = create_run(linear_template())
+        with pytest.raises(ValueError, match="undeclared template input"):
+            resolve_params({"x": "${inputs.nope}"}, run)
+
 
 class TestStore:
     def _populated(self, tmp_path):
@@ -174,6 +187,26 @@ class TestStore:
         store, template, run = self._populated(tmp_path)
         listing = store.list_runs()
         assert any(entry["run_id"] == run.run_id for entry in listing)
+
+    def test_list_runs_numeric_ordering(self, tmp_path):
+        # updated_at is stored as a float string; TEXT ordering would put
+        # "9.5" after "10.5" — force both digit widths and check the order
+        store, template, run = self._populated(tmp_path)
+        import sqlite3
+
+        with sqlite3.connect(tmp_path / "state.db") as conn:
+            conn.execute("UPDATE graph_runs SET updated_at = '10.5' WHERE id = ?", (run.run_id,))
+            conn.execute(
+                "INSERT INTO graph_runs (id, template_id, status, data, created_at, updated_at) "
+                "VALUES ('run_other', 't_test', 'created', '{}', '1.0', '9.5')"
+            )
+        listing = store.list_runs()
+        assert [e["run_id"] for e in listing][:2] == [run.run_id, "run_other"]
+
+    def test_template_id_for(self, tmp_path):
+        store, template, run = self._populated(tmp_path)
+        assert store.template_id_for(run.run_id) == "t_test"
+        assert store.template_id_for("missing") is None
 
     def test_load_missing_returns_none(self, tmp_path):
         store = SQLiteStateStore(tmp_path / "state.db")

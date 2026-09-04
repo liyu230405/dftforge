@@ -128,6 +128,20 @@ class PlanPatch:
 # ── Verification result ───────────────────────────────────────────────────────
 
 @dataclass
+class VerificationInput:
+    """Unified, typed input for the Scientific Verifier.
+
+    Replaces duck-typed job-result objects (and the CLI-side FakeJobResult):
+    one shape for real executions, CLI replay of result JSON, and tests.
+    """
+    stdout: str = ""
+    stderr: str = ""
+    xml_path: Optional[Path] = None
+    job_success: bool = True
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class VerificationResult:
     """Deterministic verdict from the Scientific Verifier."""
     passed: bool

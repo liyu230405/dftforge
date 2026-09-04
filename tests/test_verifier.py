@@ -4,22 +4,13 @@ import pytest
 from pathlib import Path
 from dft_forge.verifier import ScientificVerifier, ConvergenceReport
 from dft_forge.parser import QEParser, ParsedVCResult, ParsedCell
+from dft_forge.protocol.schemas import VerificationInput
 
 
-class TestScientificVerifier:
-    @pytest.fixture
-    def verifier(self):
-        return ScientificVerifier(
-            force_threshold_ry=1.0e-3,
-            pressure_threshold_kbar=0.5,
-        )
-    
-    @pytest.fixture
-    def passing_job_result(self):
-        """A job result that passed."""
-        class FakeJob:
-            stdout = """
+PASSING_STDOUT = """
      convergence has been achieved in  24    iterations
+     bfgs converged in  24 scf cycles and   8 bfgs steps
+     End of BFGS Geometry Optimization
      !
      !    total energy              =     -15.67916468 Ry
      !
@@ -33,8 +24,20 @@ class TestScientificVerifier:
       0.500000000  0.500000000  0.000000000
      number of atoms/cell =           2
 """
-        return FakeJob()
-    
+
+
+class TestScientificVerifier:
+    @pytest.fixture
+    def verifier(self):
+        return ScientificVerifier(
+            force_threshold_ry=1.0e-3,
+            pressure_threshold_kbar=0.5,
+        )
+
+    @pytest.fixture
+    def passing_inp(self):
+        return VerificationInput(stdout=PASSING_STDOUT)
+
     @pytest.fixture
     def passing_parsed(self):
         return ParsedVCResult(
@@ -47,22 +50,33 @@ class TestScientificVerifier:
             natoms=2,
             cell=ParsedCell(a_bohr=10.26, b_bohr=10.26, c_bohr=10.26, ibrav=2),
         )
-    
-    def test_pass_converged(self, verifier, passing_job_result, passing_parsed):
-        report = verifier.verify_t1(passing_job_result, passing_parsed)
+
+    def test_pass_converged(self, verifier, passing_inp, passing_parsed):
+        report = verifier.verify_t1(passing_inp, passing_parsed)
         assert report.passed is True
         assert report.checks["job_done"]["pass"] is True
         assert report.checks["scf_convergence"]["pass"] is True
         assert report.checks["forces"]["pass"] is True
-    
+
+    def test_parses_internally_when_parsed_omitted(self, verifier, passing_inp):
+        report = verifier.verify_t1(passing_inp)
+        assert report.passed is True
+        assert report.checks["forces"]["pass"] is True
+
     def test_fail_no_job_done(self, verifier, passing_parsed):
-        class BadJob:
-            stdout = "Calculation finished normally without completion marker"
-        report = verifier.verify_t1(BadJob(), passing_parsed)
+        inp = VerificationInput(stdout="Calculation finished normally without completion marker")
+        report = verifier.verify_t1(inp, passing_parsed)
         assert report.passed is False
         assert any("JOB DONE" in r for r in report.failure_reasons)
-    
-    def test_fail_high_forces(self, verifier, passing_job_result):
+
+    def test_fail_job_execution_failed(self, verifier, passing_inp, passing_parsed):
+        inp = VerificationInput(stdout=PASSING_STDOUT, job_success=False)
+        report = verifier.verify_t1(inp, passing_parsed)
+        assert report.passed is False
+        assert report.checks["job_success"]["pass"] is False
+        assert any("Job execution failed" in r for r in report.failure_reasons)
+
+    def test_fail_high_forces(self, verifier, passing_inp):
         bad_parsed = ParsedVCResult(
             final_energy_ry=-15.0,
             max_force_ry_bohr=0.01,  # Above threshold
@@ -71,11 +85,11 @@ class TestScientificVerifier:
             converged=True,
             cell=ParsedCell(a_bohr=10.26, b_bohr=10.26, c_bohr=10.26, ibrav=2),
         )
-        report = verifier.verify_t1(passing_job_result, bad_parsed)
+        report = verifier.verify_t1(passing_inp, bad_parsed)
         assert report.passed is False
         assert any("force" in r.lower() for r in report.failure_reasons)
-    
-    def test_fail_bad_cell(self, verifier, passing_job_result):
+
+    def test_fail_bad_cell(self, verifier, passing_inp):
         bad_parsed = ParsedVCResult(
             final_energy_ry=-15.0,
             max_force_ry_bohr=0.0,
@@ -84,23 +98,26 @@ class TestScientificVerifier:
             converged=True,
             cell=ParsedCell(a_bohr=0.5, b_bohr=0.5, c_bohr=0.5, ibrav=2),  # Too small
         )
-        report = verifier.verify_t1(passing_job_result, bad_parsed)
+        report = verifier.verify_t1(passing_inp, bad_parsed)
         assert report.passed is False
         assert any("cell" in r.lower() for r in report.failure_reasons)
-    
-    def test_warning_high_pressure(self, verifier, passing_job_result, passing_parsed):
+
+    def test_high_pressure_fails_verification(self, verifier, passing_inp, passing_parsed):
+        # a vc-relax ending above the pressure threshold has not relaxed the
+        # cell — this is a failure, not a warning (the old warning-only
+        # behavior left passed=True with checks.pressure.pass=False)
         high_p_parsed = ParsedVCResult(
             final_energy_ry=-15.0,
             max_force_ry_bohr=0.0,
-            pressure_kbar=10.0,  # Above threshold but only warning
+            pressure_kbar=10.0,  # above the 0.5 kbar threshold
             natoms=2,
             converged=True,
             cell=ParsedCell(a_bohr=10.26, b_bohr=10.26, c_bohr=10.26, ibrav=2),
         )
-        report = verifier.verify_t1(passing_job_result, high_p_parsed)
-        # Pressure is warning, not failure
-        assert report.passed is True
-        assert any("pressure" in w.lower() for w in report.warnings)
+        report = verifier.verify_t1(passing_inp, high_p_parsed)
+        assert report.passed is False
+        assert report.checks["pressure"]["pass"] is False
+        assert any("pressure" in r.lower() for r in report.failure_reasons)
 
 
 class TestVerifyT2Bands:
