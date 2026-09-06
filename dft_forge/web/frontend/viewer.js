@@ -167,4 +167,6 @@ export function clear() {
   currentCif = null;
   const legend = document.getElementById("atomLegend");
   if (legend) legend.innerHTML = "";
+  const caption = document.getElementById("viewerCaption");
+  if (caption) caption.textContent = "本次请求尚无结构 — 成功生成或导入后会显示在这里";
 }

@@ -33,9 +33,9 @@
     <header class="masthead">
       <div class="masthead-inner">
         <h1 class="masthead-title">DFT&#8209;Forge</h1>
-        <p class="masthead-sub">第一性原理计算代理 · <span class="mono">Quantum ESPRESSO</span></p>
+        <p class="masthead-sub">可复现科学计算代理 · <span class="mono">Quantum ESPRESSO</span> 首个引擎</p>
         <div class="masthead-status" id="engineStatus"><span class="dot"></span>检查环境…</div>
-        <button class="btn-settings" id="btnSettings" type="button" title="配置 LLM API">⚙ LLM</button>
+        <button class="btn-settings" id="btnSettings" type="button" title="模型与算力连接中心">连接中心</button>
       </div>
     </header>
 
@@ -53,6 +53,19 @@
       </aside>
 
       <main class="col-body">
+        <div class="run-strip" aria-label="计算方法设置">
+          <button class="run-chip" id="attachStructure" type="button">＋ 结构文件</button>
+          <input id="structureFile" type="file" accept=".cif,.vasp,.poscar,.contcar,.xyz" hidden />
+          <span class="attachment-chip" id="attachmentChip" hidden></span>
+          <label class="run-select">模式
+            <select id="runMode"><option value="research">科研</option><option value="demo">演示</option></select>
+          </label>
+          <label class="run-select">精度
+            <select id="runAccuracy"><option value="balanced">均衡</option><option value="quick">快速</option><option value="precise">精细</option><option value="custom">自定义</option></select>
+          </label>
+          <button class="run-chip method-open" id="openMethod" type="button">方法参数</button>
+          <span class="run-context" id="runContext">等待结构与任务</span>
+        </div>
         <section class="dialogue" id="chat" aria-live="polite"></section>
         <form class="composer" id="form">
           <input id="msg" autocomplete="off" placeholder="描述你的计算需求，例如：帮我算 Si 的能带结构" aria-label="输入消息" />
@@ -63,11 +76,17 @@
       </main>
 
       <aside class="col-figures" id="colFigures">
+        <div class="panel-tabs" role="tablist">
+          <button class="panel-tab active" data-panel="observe" type="button">观察</button>
+          <button class="panel-tab" data-panel="files" type="button">文件</button>
+          <button class="panel-tab" data-panel="evidence" type="button">证据</button>
+          <button class="btn-fold" id="foldRight" type="button" title="折叠图表栏">⟩</button>
+        </div>
+        <section class="side-panel active" id="panelObserve">
         <div class="col-head"><span>结构</span>
           <span class="fig-actions">
             <label class="toggle mono"><input type="checkbox" id="toggleCell" checked />晶胞框</label>
             <label class="toggle mono"><input type="checkbox" id="toggleReplica" />邻胞 2×2</label>
-            <button class="btn-fold" id="foldRight" type="button" title="折叠图表栏">⟩</button>
           </span>
         </div>
         <div class="fig-structure">
@@ -79,31 +98,75 @@
         <div class="fig-charts" id="charts">
           <div class="fig-empty">完成一次计算后，能带、态密度与关键数值出现在这里</div>
         </div>
+        </section>
+        <section class="side-panel" id="panelFiles">
+          <div class="panel-toolbar"><span>会话产物</span><button id="refreshArtifacts" type="button">刷新</button></div>
+          <div class="artifact-list" id="artifactList"><div class="fig-empty">当前会话还没有文件</div></div>
+        </section>
+        <section class="side-panel" id="panelEvidence">
+          <div class="evidence-card">
+            <span class="eyebrow">REPRODUCIBILITY</span>
+            <h3>可复现记录</h3>
+            <p>汇总模型、计算后端、方法参数、工具调用、图运行与文件哈希。</p>
+            <button id="exportEvidence" type="button">导出记录 JSON</button>
+          </div>
+          <div class="run-list" id="runList"><div class="fig-empty">当前会话还没有图任务</div></div>
+          <div class="run-actions">
+            <button id="retryRun" type="button">重试失败节点</button>
+            <button id="resumeRun" type="button">恢复暂停任务</button>
+          </div>
+        </section>
       </aside>
     </div>
   </div>
 
-  <dialog id="settingsDlg" class="settings-dlg">
+  <dialog id="settingsDlg" class="settings-dlg connection-dlg">
     <form id="settingsForm" method="dialog">
-      <h3>LLM 接入设置</h3>
-      <p class="cfg-intro">填入任意 OpenAI 兼容服务的密钥后，代理将用大模型理解需求、规划计算，并以自然语言汇报结果。</p>
-      <label class="cfg-field">API 地址
-        <input id="cfgBaseUrl" placeholder="https://api.openai.com/v1" autocomplete="off" />
-      </label>
-      <label class="cfg-field">模型
-        <input id="cfgModel" placeholder="gpt-4o-mini / deepseek-chat / qwen-plus" autocomplete="off" />
-      </label>
-      <label class="cfg-field">API Key
-        <input id="cfgApiKey" type="password" placeholder="sk-…（仅存本地 .env）" autocomplete="new-password" />
-      </label>
-      <p class="cfg-hint" id="cfgHint">未配置 — 当前使用内置规则规划。</p>
-      <div class="cfg-actions">
-        <span class="cfg-error mono" id="cfgError"></span>
-        <button type="button" class="cfg-btn ghost" id="cfgClose">取消</button>
-        <button type="button" class="cfg-btn" id="cfgSave">保存</button>
-      </div>
+      <div class="dialog-title"><div><span class="eyebrow">CONNECTIONS</span><h3>模型与算力</h3></div><button type="button" class="dialog-x" id="cfgClose" aria-label="关闭">×</button></div>
+      <div class="cfg-tabs"><button type="button" class="cfg-tab active" data-tab="model">语言模型</button><button type="button" class="cfg-tab" data-tab="compute">计算后端</button></div>
+      <section class="cfg-pane active" id="cfgPaneModel">
+        <p class="cfg-intro">选择服务商，再填模型和密钥。密钥只保存在本机，不会发送给 DFT-Forge 之外的服务。</p>
+        <div class="provider-grid" id="providerGrid"></div>
+        <div class="cfg-grid">
+          <label class="cfg-field wide">API 地址<input id="cfgBaseUrl" placeholder="https://api.example.com/v1" autocomplete="off" /></label>
+          <label class="cfg-field">模型<input id="cfgModel" placeholder="输入服务商模型 ID" autocomplete="off" /></label>
+          <label class="cfg-field">API Key<input id="cfgApiKey" type="password" placeholder="仅保存在本机" autocomplete="new-password" /></label>
+        </div>
+        <p class="cfg-hint" id="cfgHint">未配置 — 当前使用内置规则规划。</p>
+        <div class="connection-result" id="cfgTestResult" hidden></div>
+        <div class="cfg-actions"><span class="cfg-error mono" id="cfgError"></span><button type="button" class="cfg-btn ghost" id="cfgTest">测试连接</button><button type="button" class="cfg-btn" id="cfgSave">保存模型</button></div>
+      </section>
+      <section class="cfg-pane" id="cfgPaneCompute">
+        <p class="cfg-intro">本地运行适合开发；SSH 可连接自有工作站或 SLURM/PBS 集群。</p>
+        <div class="compute-choice"><button type="button" class="compute-option active" data-executor="local"><strong>本地</strong><span>自动发现 Quantum ESPRESSO</span></button><button type="button" class="compute-option" data-executor="ssh"><strong>SSH / HPC</strong><span>连接远程工作站或队列</span></button><button type="button" class="compute-option" data-executor="fake"><strong>演示</strong><span>不启动真实计算</span></button></div>
+        <div class="cfg-grid" id="localFields"><label class="cfg-field wide">QE bin 目录<input id="cfgQeBin" placeholder="留空则从 PATH 自动发现" /></label></div>
+        <div class="cfg-grid" id="sshFields" hidden>
+          <label class="cfg-field wide">SSH 主机<input id="cfgSshHost" placeholder="user@cluster.example.edu" /></label>
+          <label class="cfg-field wide">私钥路径<input id="cfgSshKey" placeholder="~/.ssh/id_ed25519（留空保持当前值）" /></label>
+          <label class="cfg-field">调度器<select id="cfgScheduler"><option value="none">直连</option><option value="slurm">SLURM</option><option value="pbs">PBS</option></select></label>
+          <label class="cfg-field">最长运行时间（秒）<input id="cfgWalltime" type="number" min="30" max="604800" value="1800" /></label>
+          <label class="cfg-field">远程工作目录<input id="cfgRemoteWorkdir" placeholder="/scratch/user/dft-forge" /></label>
+          <label class="cfg-field">远程 QE bin<input id="cfgRemoteQeBin" placeholder="/opt/qe/bin" /></label>
+        </div>
+        <div class="cfg-actions"><span class="cfg-error mono" id="computeError"></span><button type="button" class="cfg-btn" id="computeSave">保存算力</button></div>
+      </section>
     </form>
   </dialog>
-  <script type="module" src="/frontend/app.js?v=2"></script>
+
+  <dialog id="methodDlg" class="settings-dlg method-dlg">
+    <form method="dialog">
+      <div class="dialog-title"><div><span class="eyebrow">RUN REVIEW</span><h3>确认计算方法</h3></div><button type="button" class="dialog-x" id="methodClose">×</button></div>
+      <div class="method-summary" id="methodSummary"></div>
+      <div class="custom-method" id="customMethod" hidden>
+        <label class="cfg-field">ecutwfc (Ry)<input id="methodEcut" type="number" min="1" /></label>
+        <label class="cfg-field">k 点网格<input id="methodKpoints" placeholder="6,6,6" /></label>
+        <label class="cfg-field">空能带数 nbnd<input id="methodNbnd" type="number" min="1" /></label>
+        <label class="cfg-field">能带路径点数<input id="methodBandPoints" type="number" min="10" /></label>
+      </div>
+      <div class="method-warning">科研模式下，确认意味着你已检查结构、伪势适用性和收敛参数。DFT-Forge 会保留本次选择。</div>
+      <div class="cfg-actions"><button type="button" class="cfg-btn ghost" id="methodCancel">取消</button><button type="button" class="cfg-btn" id="methodConfirm">确认并运行</button></div>
+    </form>
+  </dialog>
+  <script type="module" src="/frontend/app.js?v=10"></script>
 </body>
 </html>

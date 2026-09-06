@@ -7,12 +7,21 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dft_forge.agent_loop.helpers import _CHAT_SKIP_TOOLS
+from dft_forge.agent_loop.planning import PlanIR, capability_catalog_text, compile_plan
 from dft_forge.agent_loop.step_validator import validate_steps
 
 logger = logging.getLogger(__name__)
+
+
+def _is_confirmation(message: str) -> bool:
+    """Whether a terse follow-up confirms the immediately prior offer."""
+    import re
+
+    return bool(re.fullmatch(r"\s*(?:需要|可以|好的|好|继续|是的|要|请|提取|拿出来)\s*[。！!,.，]?\s*", message or ""))
 
 
 class LLMPlanner:
@@ -25,6 +34,7 @@ class LLMPlanner:
         self.registry = registry_obj
         self._provider = None
         self._checked = False
+        self.last_plan_ir: Optional[PlanIR] = None
 
     def _get_provider(self):
         if self._checked:
@@ -34,7 +44,8 @@ class LLMPlanner:
 
         if os.environ.get("DFT_FORGE_LLM_PROVIDER", "dummy").lower() not in ("openai", "openai_compatible", "openai-compatible"):
             return None
-        if not os.environ.get("DFT_FORGE_LLM_API_KEY"):
+        vendor = os.environ.get("DFT_FORGE_LLM_VENDOR", "custom").lower()
+        if not os.environ.get("DFT_FORGE_LLM_API_KEY") and vendor != "ollama":
             return None
         try:
             from dft_forge.llm import get_llm_provider
@@ -48,13 +59,9 @@ class LLMPlanner:
     def _catalog(self) -> str:
         from dft_forge.compiler import MATERIAL_DB
 
-        lines = []
-        for t in self.registry.list_all():
-            if t.id in _CHAT_SKIP_TOOLS:
-                continue
-            props = t.input_schema.get("properties", {}) if isinstance(t.input_schema, dict) else {}
-            args = ", ".join(f"{k}:{v.get('type', '?')}" for k, v in props.items())
-            lines.append(f"- {t.id} | args: {args} | {t.description}")
+        lines = [line for line in capability_catalog_text(
+            self.registry, Path(__file__).resolve().parents[2] / "templates"
+        ).splitlines() if not any(f"(tool={skip})" in line for skip in _CHAT_SKIP_TOOLS)]
         lines.append(f"Available bulk materials: {', '.join(sorted(MATERIAL_DB))}")
         return "\n".join(lines)
 
@@ -63,17 +70,39 @@ class LLMPlanner:
         provider = self._get_provider()
         if provider is None:
             return None, None
+        self.last_plan_ir = None
+        # Short confirmations are common after the agent has offered to
+        # inspect a completed run. Route them deterministically so a model
+        # cannot turn "需要" into another generic one-step calculation.
+        if ctx.get("last_run_id") and _is_confirmation(message):
+            self.last_plan_ir = PlanIR.from_steps(message, [{
+                "tool": "graph.status",
+                "args": {"run_id": ctx["last_run_id"]},
+                "description": "读取上一次计算的详细输出并提取关键数值",
+            }], source="follow-up")
+            return ([{
+                "tool": "graph.status",
+                "args": {"run_id": ctx["last_run_id"]},
+                "description": "读取上一次计算的详细输出并提取关键数值",
+            }], None)
         system = f"""You are the planner of DFT-Forge, a DFT computation agent (Quantum ESPRESSO).
 Convert the user's request into a JSON plan of tool calls.
 
 Rules:
 - Reply with ONLY one JSON object, no markdown fences:
-  {{"reply": string, "steps": [{{"tool": string, "args": {{}}, "description": string}}]}}
+  {{"reply": string, "goal": string, "constraints": {{}},
+    "assumptions": [string], "expected_outputs": [string],
+    "actions": [{{"capability": string, "args": {{}}, "description": string}}],
+    "steps": [{{"tool": string, "args": {{}}, "description": string}}]}}
+- First express the objective, constraints, assumptions and expected outputs.
+  Then express actions using semantic capability ids from the catalog. The
+  legacy steps field is accepted for compatibility, but actions are preferred.
 - Use ONLY the tool ids listed below; args keys must match exactly.
-- ANY chemical formula works directly: pass it as inputs.material of graph.run
-  (e.g. CaTiO3, SrTiO3, GaAs, MoS2). Unknown formulas are auto-built into
-  prototype structures — NEVER ask the user to import a file for a plain
-  bulk crystal. Bulk MoS2/WS2/MoSe2/WSe2 build the real 2H layered crystal.
+- Known catalog materials and trusted prototype formulas can be passed as
+  inputs.material of graph.run (e.g. CaTiO3, SrTiO3, GaAs, MoS2). A chemical
+  formula does NOT uniquely determine a crystal: when a composition is not in
+  the catalog, ask the user to upload CIF/POSCAR instead of inventing a phase.
+  Bulk MoS2/WS2/MoSe2/WSe2 build the trusted 2H layered crystal.
 - For a full verified calculation prefer graph.run with a template_id
   (t1_vc_relax = structure optimization, t2_bands = band structure, t2_dos = density of states).
   "算 X 的能带" → one graph.run t2_bands step; combining several targets emits one step each.
@@ -125,6 +154,9 @@ Rules:
 - If the context contains 上次失败, the user asking to retry (再试/重跑/继续)
   refers to that failure — plan the same calculation again; do not ask what
   they mean.
+- If the user confirms a previous offer to inspect/extract results (例如“需要”
+  /“可以”/“继续”), and context has last_run_id, call graph.status with that
+  run_id and report its numeric outputs; do not start a new graph.run.
 - 能量差距/能量对比/哪个更稳定 → t0_scf total energies compared via
   analysis.compare metric "energy" (per-atom energies matter when atom counts
   differ). 能带隙/带隙对比 → t2_bands + metric "band_gap". These are DIFFERENT
@@ -141,7 +173,7 @@ Rules:
 
 Tools:
 {self._catalog()}"""
-        ctx_summary = {k: ctx.get(k) for k in ("last_structure_source", "last_formula", "last_input_file", "last_job_id") if ctx.get(k)}
+        ctx_summary = {k: ctx.get(k) for k in ("last_structure_source", "last_formula", "last_input_file", "last_job_id", "last_run_id", "last_execution", "last_plan") if ctx.get(k)}
         last_failures = ctx.get("last_failures") or []
         if last_failures:
             ctx_summary["上次失败"] = "; ".join(str(f)[:160] for f in last_failures[-3:])
@@ -171,7 +203,6 @@ Tools:
             if lines:
                 user += "\n对话历史（旧→新）:\n" + "\n".join(lines)
         user += f"\nUser: {message}"
-        known = {t.id for t in self.registry.list_all()}
         steps, reply, err = None, None, None
         # one retry with the error fed back: a bad first answer is usually
         # fixable (unknown tool id, malformed JSON), and without the retry the
@@ -191,22 +222,22 @@ Tools:
                 err = "response is not a JSON object"
                 user = "Your previous answer was not a JSON object. Reply again with ONLY one JSON object."
                 continue
-            bad = [s.get("tool") for s in (data.get("steps") or [])
-                   if not isinstance(s, dict) or s.get("tool") not in known]
-            if bad:
-                err = f"unknown tool ids: {bad}"
-                logger.warning("LLM planner attempt %d used unknown tools %s", attempt, bad)
+            plan_ir = PlanIR.from_payload(data, source="llm")
+            if not plan_ir.goal:
+                plan_ir.goal = message[:240]
+            steps = compile_plan(
+                plan_ir, self.registry,
+                templates_dir=Path(__file__).resolve().parents[2] / "templates",
+            )
+            if plan_ir.validation:
+                err = "; ".join(plan_ir.validation[:4])
+                logger.warning("LLM planner attempt %d used unknown capabilities: %s", attempt, err)
                 if attempt == 1:
-                    user = (f"Your plan used unknown tool ids {bad}. "
-                            "Use ONLY the listed tool ids. Reply again with ONLY one JSON object.") + f"\nUser: {message}"
+                    user = (f"Your plan used unknown capabilities ({err}). "
+                            "Use ONLY capability ids from the catalog. Reply again with ONLY one JSON object.") + f"\nUser: {message}"
                 continue
-            steps = []
-            for s in (data.get("steps") or [])[:8]:
-                steps.append({
-                    "tool": s["tool"],
-                    "args": s.get("args") or {},
-                    "description": str(s.get("description", ""))[:120],
-                })
+            if not plan_ir.expected_outputs:
+                plan_ir.expected_outputs = PlanIR.from_steps(message, steps, source="llm").expected_outputs
             schema_errors = validate_steps(steps, self.registry)
             if schema_errors and attempt == 1:
                 err = "; ".join(schema_errors[:4])
@@ -226,6 +257,7 @@ Tools:
                     "LLM planner args still invalid after retry (%s); passing through", schema_errors
                 )
             reply = str(data.get("reply") or "").strip()
+            self.last_plan_ir = plan_ir
             return steps, (reply if reply and not steps else None)
         if err:
             logger.warning("LLM planner giving up after retry (%s); falling back to rules", err)

@@ -5,6 +5,7 @@ Deterministic fallback when the LLM planner is unavailable or failed.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 from dft_forge.agent_loop.helpers import _2D_KIND_NAMES, _ELEMENTS
@@ -21,6 +22,15 @@ class RulePlanner:
 
     def plan(self, message: str, ctx: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         ctx = ctx or {}
+        if ctx.get("last_run_id") and re.fullmatch(
+            r"\s*(?:需要|可以|好的|好|继续|是的|要|请|提取|拿出来)\s*[。！!,.，]?\s*",
+            message or "",
+        ):
+            return [{
+                "tool": "graph.status",
+                "args": {"run_id": ctx["last_run_id"]},
+                "description": "读取上一次计算的详细输出并提取关键数值",
+            }]
         sig = detect_intents(message, ctx)
         lower = message.lower()
         steps: List[Dict[str, Any]] = []

@@ -55,6 +55,16 @@ def narrate(provider, message: str, commands: List[dict], results: List[dict], c
                     # comparison detail rows carry the numbers the narrator
                     # must quote verbatim — never drop them in flattening
                     flat[k] = v[:8]
+            # Graph tools wrap headline values in outputs/nodes. Include those
+            # scalars in the narrator prompt so it cannot honestly claim that
+            # a successful calculation returned only a status.
+            for k, v in (data.get("outputs") or {}).items() if isinstance(data.get("outputs"), dict) else []:
+                if isinstance(v, (int, float, str, bool)) or v is None:
+                    flat[f"output.{k}"] = v
+            for node_id, node in (data.get("nodes") or {}).items() if isinstance(data.get("nodes"), dict) else []:
+                for k, v in (node.get("outputs") or {}).items():
+                    if isinstance(v, (int, float, str, bool)) or v is None:
+                        flat[f"{node_id}.{k}"] = v
             brief["out"] = flat
         steps.append(brief)
     system = (

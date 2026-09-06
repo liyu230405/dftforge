@@ -116,6 +116,8 @@ def handle_tool_result(
         }
     elif tool_id == "graph.run" and data.get("run_id"):
         _handle_graph_run(data, args, description, state, result_dict, reply_parts)
+    elif tool_id == "graph.status":
+        _handle_graph_status(data, args, description, state, result_dict, reply_parts)
     elif tool_id == "input.build" and data.get("input_file"):
         ctx["last_input_file"] = data.get("input_file")
         ctx["last_calc_type"] = data.get("calc_type")
@@ -173,6 +175,7 @@ def _handle_graph_run(
 ) -> None:
     ctx = state.ctx
     ctx["last_run_id"] = data.get("run_id")
+    ctx["last_execution"] = _execution_context(data, args, description)
     _nodes = data.get("nodes") or {}
     lines = [f"图计算完成: {data.get('state')}  (运行ID: {data.get('run_id')})"]
     # ── session computation ledger: every finished graph run ──
@@ -238,6 +241,9 @@ def _handle_graph_run(
                     f"  键长 {pair}: {st['mean_angstrom']} Å (均值, {st['count']} 条)"
                 )
     reply_parts.append("\n".join(lines))
+    facts = _graph_facts(data)
+    if facts:
+        result_dict["facts"] = facts
     chart = _extract_charts(data.get("nodes") or {})
     if chart:
         result_dict["chart"] = chart
@@ -247,6 +253,91 @@ def _handle_graph_run(
         viewer = _viewer_payload_from_file(_inputs["structure"])
     if viewer:
         result_dict["viewer"] = viewer
+
+
+def _execution_context(data: Dict[str, Any], args: Dict[str, Any], description: str) -> Dict[str, Any]:
+    """Small, durable summary used by follow-up planning (never raw stdout)."""
+    outputs = data.get("outputs") if isinstance(data.get("outputs"), dict) else {}
+    return {
+        "run_id": data.get("run_id"),
+        "template_id": args.get("template_id") or data.get("template_id"),
+        "state": data.get("state"),
+        "description": description[:160],
+        "outputs": {
+            k: v for k, v in outputs.items()
+            if isinstance(v, (int, float, str, bool)) or v is None
+        },
+    }
+
+
+def _graph_facts(data: Dict[str, Any]) -> str:
+    """Format headline values that must survive LLM narration."""
+    out: Dict[str, Any] = {}
+    top = data.get("outputs") if isinstance(data.get("outputs"), dict) else {}
+    for key in (
+        "energy_ry", "scf_energy_ry", "a_angstrom", "volume_a3", "pressure_kbar",
+        "max_force_ry_bohr", "band_gap_ev", "fermi_ev", "is_metal", "natoms",
+        "n_iterations",
+    ):
+        if top.get(key) is not None:
+            out[key] = top[key]
+    for node_id, info in (data.get("nodes") or {}).items():
+        node_out = info.get("outputs") or {}
+        for key in (
+            "energy_ry", "a_angstrom", "volume_a3", "pressure_kbar", "band_gap_ev",
+            "fermi_ev", "is_metal", "natoms", "n_iterations",
+        ):
+            if node_out.get(key) is not None and key not in out:
+                out[key] = node_out[key]
+        analysis = node_out.get("analysis") or {}
+        symmetry = analysis.get("symmetry") or {}
+        conventional = symmetry.get("conventional_cell") or {}
+        if conventional.get("a_angstrom") is not None:
+            out.setdefault("conventional_a_angstrom", conventional["a_angstrom"])
+        if symmetry.get("space_group"):
+            out.setdefault("space_group", symmetry["space_group"])
+    if not out:
+        return ""
+    labels = {
+        "energy_ry": "总能量 (Ry)", "scf_energy_ry": "总能量 (Ry)",
+        "a_angstrom": "平衡晶格参数 a (Å)", "conventional_a_angstrom": "常规胞 a (Å)",
+        "volume_a3": "体积 (Å³)", "pressure_kbar": "压力 (kbar)",
+        "max_force_ry_bohr": "最大力 (Ry/Bohr)", "band_gap_ev": "带隙 (eV)",
+        "fermi_ev": "费米能级 (eV)", "is_metal": "是否金属", "natoms": "原子数",
+        "n_iterations": "迭代次数", "space_group": "空间群",
+    }
+    parts = []
+    for key, value in out.items():
+        if isinstance(value, float):
+            value = round(value, 6)
+        parts.append(f"{labels.get(key, key)}={value}")
+    return "关键计算结果（来自执行输出）：" + "；".join(parts)
+
+
+def _handle_graph_status(
+    data: Dict[str, Any],
+    args: Dict[str, Any],
+    description: str,
+    state: RunState,
+    result_dict: Dict[str, Any],
+    reply_parts: List[str],
+) -> None:
+    """Turn a status lookup into a useful answer instead of just '完成'."""
+    if data.get("error"):
+        reply_parts.append(f"{description}: {data['error']}")
+        return
+    state.ctx["last_run_id"] = data.get("run_id") or args.get("run_id")
+    state.ctx["last_execution"] = _execution_context(data, args, description)
+    facts = _graph_facts(data)
+    if facts:
+        result_dict["facts"] = facts
+    nodes = data.get("nodes") or {}
+    states = "、".join(f"{nid}: {info.get('state')}" for nid, info in nodes.items())
+    reply_parts.append(
+        f"任务 {data.get('run_id') or args.get('run_id')}: {data.get('state', 'unknown')}"
+        + (f"（{states}）" if states else "")
+        + (f"\n{facts}" if facts else "\n执行记录中没有可汇报的数值输出。")
+    )
 
 
 def _handle_structure_analyze(

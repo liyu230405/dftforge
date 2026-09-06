@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -16,7 +18,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -57,18 +59,28 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 WEB_WORKDIR = Path(os.environ.get("DFT_FORGE_WEB_WORKDIR", _PROJECT_ROOT / "sessions"))
 WEB_WORKDIR.mkdir(parents=True, exist_ok=True)
 
-ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
-_LLM_ENV_KEYS = ("DFT_FORGE_LLM_PROVIDER", "DFT_FORGE_LLM_BASE_URL", "DFT_FORGE_LLM_MODEL", "DFT_FORGE_LLM_API_KEY")
+ENV_FILE = _PROJECT_ROOT / ".env"
+_LLM_ENV_KEYS = (
+    "DFT_FORGE_LLM_PROVIDER", "DFT_FORGE_LLM_VENDOR", "DFT_FORGE_LLM_BASE_URL",
+    "DFT_FORGE_LLM_MODEL", "DFT_FORGE_LLM_API_KEY",
+)
 
-
-def _mask(secret: str) -> str:
-    if len(secret) <= 8:
-        return "*" * len(secret)
-    return f"{secret[:4]}…{secret[-4:]}"
+LLM_PROVIDERS = [
+    {"id": "rules", "name": "内置规则", "base_url": "", "model": "", "needs_key": False},
+    {"id": "openai", "name": "OpenAI", "base_url": "https://api.openai.com/v1", "model": "", "needs_key": True},
+    {"id": "deepseek", "name": "DeepSeek", "base_url": "https://api.deepseek.com/v1", "model": "deepseek-chat", "needs_key": True},
+    {"id": "qwen", "name": "通义千问", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-plus", "needs_key": True},
+    {"id": "moonshot", "name": "Moonshot", "base_url": "https://api.moonshot.cn/v1", "model": "", "needs_key": True},
+    {"id": "ollama", "name": "Ollama", "base_url": "http://127.0.0.1:11434/v1", "model": "", "needs_key": False},
+    {"id": "custom", "name": "OpenAI Compatible", "base_url": "", "model": "", "needs_key": False},
+]
 
 
 def _update_env_file(values: Dict[str, str]) -> None:
-    """Persist DFT_FORGE_LLM_* settings into .env, preserving unrelated lines."""
+    """Persist settings into .env, preserving unrelated lines."""
+    for key, value in values.items():
+        if "\n" in value or "\r" in value:
+            raise HTTPException(status_code=400, detail=f"Invalid newline in {key}")
     lines: List[str] = []
     if ENV_FILE.exists():
         lines = ENV_FILE.read_text().splitlines()
@@ -85,11 +97,24 @@ def _update_env_file(values: Dict[str, str]) -> None:
     for key, val in values.items():
         if key not in seen:
             out.append(f"{key}={val}")
-    ENV_FILE.write_text("\n".join(out) + "\n")
+    payload = "\n".join(out) + "\n"
+    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=ENV_FILE.parent, prefix=".env-", delete=False
+        ) as tmp:
+            tmp.write(payload)
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, ENV_FILE)
+    finally:
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
 
 
 class ConfigRequest(BaseModel):
     provider: Optional[str] = None
+    vendor: Optional[str] = None
     base_url: Optional[str] = None
     model: Optional[str] = None
     api_key: Optional[str] = None
@@ -98,27 +123,39 @@ class ConfigRequest(BaseModel):
 def _config_state() -> Dict[str, Any]:
     provider = os.environ.get("DFT_FORGE_LLM_PROVIDER", "dummy").lower()
     key = os.environ.get("DFT_FORGE_LLM_API_KEY", "")
-    ready = provider in ("openai", "openai_compatible", "openai-compatible") and bool(key)
+    vendor = os.environ.get("DFT_FORGE_LLM_VENDOR", "custom").lower()
+    ready = provider in ("openai", "openai_compatible", "openai-compatible") and (
+        bool(key) or vendor == "ollama"
+    )
     return {
         "provider": provider,
+        "vendor": vendor,
         "base_url": os.environ.get("DFT_FORGE_LLM_BASE_URL", ""),
         "model": os.environ.get("DFT_FORGE_LLM_MODEL", ""),
         "has_api_key": bool(key),
-        "api_key_hint": _mask(key) if key else "",
+        # Never send any portion of a credential to the browser.  Keep the
+        # legacy field as a null value for clients that still deserialize it.
+        "api_key_hint": None,
         "llm_ready": ready,
     }
 
 
 @app.get("/api/config")
 def get_config() -> Dict[str, Any]:
-    return _config_state()
+    return {**_config_state(), "compute": _compute_state(), "providers": LLM_PROVIDERS}
 
 
 @app.post("/api/config")
 def save_config(req: ConfigRequest) -> Dict[str, Any]:
     updates: Dict[str, str] = {}
     if req.provider is not None:
+        if req.provider not in {"dummy", "openai", "openai_compatible", "openai-compatible"}:
+            raise HTTPException(status_code=400, detail="Unsupported LLM provider")
         updates["DFT_FORGE_LLM_PROVIDER"] = req.provider
+    if req.vendor is not None:
+        if req.vendor.strip().lower() not in {item["id"] for item in LLM_PROVIDERS}:
+            raise HTTPException(status_code=400, detail="Unsupported LLM vendor")
+        updates["DFT_FORGE_LLM_VENDOR"] = req.vendor.strip().lower()
     if req.base_url is not None:
         updates["DFT_FORGE_LLM_BASE_URL"] = req.base_url.strip()
     if req.model is not None:
@@ -130,6 +167,108 @@ def save_config(req: ConfigRequest) -> Dict[str, Any]:
         os.environ.update(updates)
         agent_loop.reset_llm()
     return _config_state()
+
+
+class ConfigTestRequest(ConfigRequest):
+    pass
+
+
+@app.post("/api/config/test")
+async def test_config(req: ConfigTestRequest) -> Dict[str, Any]:
+    """Make one tiny real request without persisting the submitted settings."""
+    from urllib.parse import urlparse
+
+    from dft_forge.llm import OpenAICompatProvider
+
+    current = _config_state()
+    base_url = (req.base_url or current.get("base_url") or "").strip().rstrip("/")
+    model = (req.model or current.get("model") or "").strip()
+    key = req.api_key if req.api_key is not None else os.environ.get("DFT_FORGE_LLM_API_KEY", "")
+    vendor = (req.vendor or current.get("vendor") or "custom").lower()
+    parsed_url = urlparse(base_url)
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+        raise HTTPException(status_code=400, detail="请输入有效的 http(s) API 地址")
+    if not model:
+        raise HTTPException(status_code=400, detail="请填写模型名称")
+    if not key and vendor != "ollama":
+        raise HTTPException(status_code=400, detail="请填写 API Key")
+    provider = OpenAICompatProvider(
+        base_url=base_url,
+        api_key=key or "ollama",
+        model=model,
+        timeout=20.0,
+        max_attempts=1,
+    )
+    started = time.perf_counter()
+    try:
+        reply = await asyncio.to_thread(provider.chat, "Reply with exactly: OK", "connection test")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)[:500]) from exc
+    return {
+        "ok": True,
+        "latency_ms": round((time.perf_counter() - started) * 1000),
+        "model": model,
+        "reply": str(reply).strip()[:80],
+    }
+
+
+class ComputeConfigRequest(BaseModel):
+    executor: str = "local"
+    qe_bin: Optional[str] = None
+    ssh_host: Optional[str] = None
+    ssh_key: Optional[str] = None
+    scheduler: str = "none"
+    remote_workdir: Optional[str] = None
+    remote_qe_bin: Optional[str] = None
+    walltime: int = 1800
+
+
+def _compute_state() -> Dict[str, Any]:
+    key_path = os.environ.get("DFT_FORGE_SSH_KEY", "")
+    return {
+        "executor": os.environ.get("DFT_FORGE_EXECUTOR", "local"),
+        "qe_bin": os.environ.get("DFT_FORGE_QE_BIN", ""),
+        "ssh_host": os.environ.get("DFT_FORGE_SSH_HOST", ""),
+        "has_ssh_key": bool(key_path),
+        "ssh_key_name": Path(key_path).name if key_path else "",
+        "scheduler": os.environ.get("DFT_FORGE_SCHEDULER", "none"),
+        "remote_workdir": os.environ.get("DFT_FORGE_REMOTE_WORKDIR", "/root/workspace"),
+        "remote_qe_bin": os.environ.get("DFT_FORGE_REMOTE_QE_BIN", "/opt/qe/bin"),
+        "walltime": int(os.environ.get("DFT_FORGE_WALLTIME", "1800")),
+    }
+
+
+@app.post("/api/config/compute")
+def save_compute_config(req: ComputeConfigRequest) -> Dict[str, Any]:
+    if WEB_ACTIVE_RUNS:
+        raise HTTPException(status_code=409, detail="有计算正在运行，停止后才能切换算力后端")
+    executor = req.executor.strip().lower()
+    scheduler = req.scheduler.strip().lower()
+    if executor not in {"local", "fake", "ssh"}:
+        raise HTTPException(status_code=400, detail="executor must be local, fake or ssh")
+    if scheduler not in {"none", "slurm", "pbs"}:
+        raise HTTPException(status_code=400, detail="scheduler must be none, slurm or pbs")
+    if executor == "ssh" and not (req.ssh_host or "").strip():
+        raise HTTPException(status_code=400, detail="SSH 模式必须填写主机")
+    if not 30 <= req.walltime <= 604800:
+        raise HTTPException(status_code=400, detail="walltime must be between 30 and 604800 seconds")
+    updates = {
+        "DFT_FORGE_EXECUTOR": executor,
+        "DFT_FORGE_QE_BIN": (req.qe_bin or "").strip(),
+        "DFT_FORGE_SSH_HOST": (req.ssh_host or "").strip(),
+        "DFT_FORGE_SCHEDULER": scheduler,
+        "DFT_FORGE_REMOTE_WORKDIR": (req.remote_workdir or "/root/workspace").strip(),
+        "DFT_FORGE_REMOTE_QE_BIN": (req.remote_qe_bin or "/opt/qe/bin").strip(),
+        "DFT_FORGE_WALLTIME": str(req.walltime),
+    }
+    if req.ssh_key is not None:
+        updates["DFT_FORGE_SSH_KEY"] = req.ssh_key.strip()
+    _update_env_file(updates)
+    os.environ.update(updates)
+    from dft_forge.tools.graph_tools import reset_engine_cache
+
+    reset_engine_cache()
+    return _compute_state()
 
 
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -156,6 +295,18 @@ def _session_file(session_id: str) -> Path:
     return _session_dir(session_id) / "session.json"
 
 
+def _inside_session(session_dir: Path, value: str) -> Path:
+    """Resolve a client-supplied artifact path without allowing traversal."""
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = session_dir / candidate
+    resolved = candidate.resolve()
+    root = session_dir.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise HTTPException(status_code=400, detail="Artifact path escapes the session")
+    return resolved
+
+
 def _load_session(session_id: str) -> Dict[str, Any]:
     """Session memory: {ctx, messages}. Reloaded from disk so restarts survive."""
     if session_id in WEB_SESSION_CTX:
@@ -164,6 +315,8 @@ def _load_session(session_id: str) -> Dict[str, Any]:
     if sf.exists():
         try:
             data = json.loads(sf.read_text())
+            if isinstance(data.get("ctx"), dict):
+                data["ctx"].pop("cancel_event", None)
             WEB_SESSION_CTX[session_id] = data
             return data
         except (OSError, ValueError):
@@ -184,6 +337,10 @@ def _slim_for_disk(session: Dict[str, Any]) -> Dict[str, Any]:
     frontend restoreFigures only needs the newest of each payload, and the
     chart dict already embeds its own copy of the curves."""
     slim = json.loads(json.dumps(session, ensure_ascii=False, default=str))
+    # Runtime-only handles must never become conversational context after a
+    # restart (the cancel event is intentionally process-local).
+    if isinstance(slim.get("ctx"), dict):
+        slim["ctx"].pop("cancel_event", None)
     keep_chart = keep_viewer = False
     for msg in reversed(slim.get("messages", [])):
         for r in msg.get("results") or []:
@@ -247,6 +404,9 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     backend: Optional[str] = "local"
     backend_config: Optional[Dict[str, Any]] = None
+    structure_path: Optional[str] = None
+    run_config: Optional[Dict[str, Any]] = None
+    approved: bool = False
 
 
 class ChatResponse(BaseModel):
@@ -254,6 +414,227 @@ class ChatResponse(BaseModel):
     reply: str
     commands: List[Dict[str, Any]]
     results: List[Dict[str, Any]]
+
+
+def _apply_request_context(req: ChatRequest, session_dir: Path, ctx: Dict[str, Any]) -> None:
+    if req.run_config:
+        allowed = {"mode", "accuracy", "ecutwfc", "kpoints", "nbnd", "nkpoints_bands"}
+        clean = {k: v for k, v in req.run_config.items() if k in allowed}
+        clean["approved"] = bool(req.approved)
+        if clean.get("mode") == "research" and not req.approved:
+            raise HTTPException(status_code=409, detail="科研模式需要先确认计算方法")
+        ctx["run_config"] = clean
+    if req.structure_path:
+        structure = _inside_session(session_dir, req.structure_path)
+        if not structure.is_file():
+            raise HTTPException(status_code=400, detail="Uploaded structure no longer exists")
+        ctx["last_structure_source"] = str(structure)
+        ctx["last_structure_file"] = str(structure)
+
+
+_STRUCTURE_SUFFIXES = {".cif", ".vasp", ".poscar", ".contcar", ".xyz"}
+
+
+@app.post("/api/sessions/{session_id}/structure")
+async def upload_structure(session_id: str, file: UploadFile = File(...)) -> Dict[str, Any]:
+    """Upload, validate and normalize a structure for this session."""
+    session_dir = _session_dir(session_id)
+    upload_dir = session_dir / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    original_name = Path(file.filename or "structure.cif").name
+    suffix = Path(original_name).suffix.lower()
+    if suffix not in _STRUCTURE_SUFFIXES and original_name.upper() not in {"POSCAR", "CONTCAR"}:
+        raise HTTPException(status_code=400, detail="支持 CIF、POSCAR、CONTCAR、VASP 和 XYZ")
+    content = await file.read(20 * 1024 * 1024 + 1)
+    if not content:
+        raise HTTPException(status_code=400, detail="结构文件为空")
+    if len(content) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="结构文件不能超过 20 MB")
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", original_name)[:100] or "structure.cif"
+    original = upload_dir / f"{uuid.uuid4().hex[:8]}_{safe_name}"
+    original.write_bytes(content)
+    normalized = upload_dir / f"structure_{uuid.uuid4().hex[:8]}.cif"
+    try:
+        from ase.io import write as ase_write
+
+        from dft_forge.compiler import read_structure
+
+        atoms = read_structure(original)
+        if len(atoms) == 0:
+            raise ValueError("structure contains no atoms")
+        ase_write(str(normalized), atoms, format="cif")
+    except Exception as exc:
+        original.unlink(missing_ok=True)
+        normalized.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"无法解析结构文件：{exc}") from exc
+    session = _load_session(session_id)
+    ctx = session.setdefault("ctx", {})
+    ctx["last_structure_source"] = str(normalized)
+    ctx["last_structure_file"] = str(normalized)
+    ctx["last_formula"] = atoms.get_chemical_formula()
+    session.setdefault("attachments", []).append({
+        "name": original_name,
+        "path": str(normalized),
+        "formula": atoms.get_chemical_formula(),
+        "natoms": len(atoms),
+        "ts": time.time(),
+    })
+    _save_session(session_id)
+    return {
+        "ok": True,
+        "name": original_name,
+        "path": str(normalized),
+        "formula": atoms.get_chemical_formula(),
+        "natoms": len(atoms),
+        "cif": normalized.read_text(errors="replace"),
+    }
+
+
+def _artifact_kind(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in _STRUCTURE_SUFFIXES or path.name.upper() in {"POSCAR", "CONTCAR"}:
+        return "structure"
+    if suffix in {".in", ".pwi"}:
+        return "input"
+    if suffix in {".out", ".err", ".log", ".xml"}:
+        return "output"
+    if "evidence" in path.name.lower() or "manifest" in path.name.lower():
+        return "evidence"
+    if suffix in {".db", ".sqlite", ".sqlite3", ".db-wal", ".db-shm"}:
+        return "state"
+    return "data"
+
+
+def _session_artifacts(session_id: str) -> List[Dict[str, Any]]:
+    root = _session_dir(session_id)
+    if not root.exists():
+        return []
+    artifacts: List[Dict[str, Any]] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.name == "session.json" or path.is_symlink():
+            continue
+        try:
+            relative = path.relative_to(root).as_posix()
+            stat = path.stat()
+        except OSError:
+            continue
+        digest = None
+        if stat.st_size <= 32 * 1024 * 1024:
+            try:
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                pass
+        artifacts.append({
+            "path": relative,
+            "name": path.name,
+            "kind": _artifact_kind(path),
+            "size": stat.st_size,
+            "updated_at": stat.st_mtime,
+            "sha256": digest,
+            "download_url": f"/api/sessions/{session_id}/artifacts/{relative}",
+        })
+    return artifacts
+
+
+@app.get("/api/sessions/{session_id}/artifacts")
+def list_session_artifacts(session_id: str) -> Dict[str, Any]:
+    return {"artifacts": _session_artifacts(session_id)}
+
+
+@app.get("/api/sessions/{session_id}/artifacts/{artifact_path:path}")
+def download_session_artifact(session_id: str, artifact_path: str) -> FileResponse:
+    root = _session_dir(session_id)
+    path = _inside_session(root, artifact_path)
+    if not path.is_file() or path.is_symlink():
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return FileResponse(path, filename=path.name)
+
+
+def _graph_runs_for_session(session_id: str) -> List[Dict[str, Any]]:
+    db = _session_dir(session_id) / "graphs" / "graph_state.db"
+    if not db.exists():
+        return []
+    try:
+        with sqlite3.connect(db) as conn:
+            rows = conn.execute(
+                "SELECT id, template_id, status, updated_at FROM graph_runs "
+                "ORDER BY CAST(updated_at AS REAL) DESC"
+            ).fetchall()
+    except (sqlite3.Error, OSError):
+        return []
+    return [
+        {"run_id": row[0], "template_id": row[1], "status": row[2], "updated_at": row[3]}
+        for row in rows
+    ]
+
+
+@app.get("/api/runs")
+def list_product_runs() -> Dict[str, Any]:
+    runs: List[Dict[str, Any]] = []
+    for session_path in WEB_WORKDIR.iterdir() if WEB_WORKDIR.exists() else []:
+        if not session_path.is_dir() or not _SAFE_SESSION_ID.match(session_path.name):
+            continue
+        for item in _graph_runs_for_session(session_path.name):
+            item["session_id"] = session_path.name
+            item["active"] = session_path.name in WEB_ACTIVE_RUNS
+            runs.append(item)
+    runs.sort(key=lambda item: float(item.get("updated_at") or 0), reverse=True)
+    return {"runs": runs[:100]}
+
+
+@app.get("/api/sessions/{session_id}/reproducibility")
+def reproducibility_manifest(session_id: str) -> Dict[str, Any]:
+    session = _load_session(session_id)
+    safe_config = _config_state()
+    safe_config.pop("api_key_hint", None)
+    return {
+        "schema": "dft-forge/reproducibility-v1",
+        "session_id": session_id,
+        "created_at": time.time(),
+        "llm": {k: safe_config.get(k) for k in ("vendor", "base_url", "model")},
+        "compute": {
+            key: _compute_state().get(key)
+            for key in ("executor", "scheduler", "remote_qe_bin", "walltime")
+        },
+        "run_config": session.get("ctx", {}).get("run_config", {}),
+        "structure": session.get("ctx", {}).get("last_structure_source"),
+        "requests": [m.get("text") for m in session.get("messages", []) if m.get("role") == "user"],
+        "tool_calls": [
+            command
+            for message in session.get("messages", [])
+            for command in (message.get("commands") or [])
+        ],
+        "runs": _graph_runs_for_session(session_id),
+        "artifacts": _session_artifacts(session_id),
+    }
+
+
+class RunActionRequest(BaseModel):
+    action: str = "retry"
+    run_id: Optional[str] = None
+
+
+@app.post("/api/sessions/{session_id}/runs/action")
+async def run_action(session_id: str, req: RunActionRequest) -> Dict[str, Any]:
+    if session_id in WEB_ACTIVE_RUNS:
+        raise HTTPException(status_code=409, detail="该会话已有任务正在运行")
+    runs = _graph_runs_for_session(session_id)
+    run_id = req.run_id or (runs[0]["run_id"] if runs else None)
+    if not run_id:
+        raise HTTPException(status_code=404, detail="该会话没有可恢复的图任务")
+    from dft_forge.tools.graph_tools import _get_engine
+
+    engine = _get_engine(str(_session_dir(session_id) / "graphs"))
+    try:
+        if req.action == "resume":
+            run = await asyncio.to_thread(engine.resume, run_id)
+        elif req.action == "retry":
+            run = await asyncio.to_thread(engine.retry, run_id)
+        else:
+            raise HTTPException(status_code=400, detail="action must be retry or resume")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return engine.status(run.run_id)
 
 
 def _ensure_pythonpath() -> Path:
@@ -329,6 +710,7 @@ def get_session(session_id: str) -> Dict[str, Any]:
         "title": session.get("title") or "",
         "messages": session.get("messages", []),
         "ctx": session.get("ctx", {}),
+        "attachments": session.get("attachments", []),
     }
 
 
@@ -393,6 +775,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
     session = _load_session(session_id)
     ctx = session.setdefault("ctx", {})
+    _apply_request_context(req, session_dir, ctx)
     messages = session.setdefault("messages", [])
     if not session.get("title"):
         session["title"] = req.message.strip()[:40]
@@ -424,11 +807,14 @@ async def chat(req: ChatRequest) -> ChatResponse:
 async def chat_stream(req: ChatRequest):
     """SSE stream of the agent's execution chain: plan → steps → nodes → reply."""
     session_id = req.session_id or str(uuid.uuid4())
+    if session_id in WEB_ACTIVE_RUNS:
+        raise HTTPException(status_code=409, detail="该会话已有任务正在运行")
     session_dir = _session_dir(session_id)
     session_dir.mkdir(parents=True, exist_ok=True)
 
     session = _load_session(session_id)
     ctx = session.setdefault("ctx", {})
+    _apply_request_context(req, session_dir, ctx)
     messages = session.setdefault("messages", [])
     if not session.get("title"):
         session["title"] = req.message.strip()[:40]

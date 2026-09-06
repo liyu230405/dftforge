@@ -204,8 +204,13 @@ class QEParser:
         if conv_matches:
             result.n_iterations = int(conv_matches[-1])
         
-        # Pressure (last occurrence, QE 7.5 format: "P=  37.54")
-        pressure_matches = re.findall(r"P=\s+([\d.-]+)", stdout)
+        # Use the last pressure that belongs to the BFGS trajectory. QE may
+        # append a final fixed-cell SCF after "End of BFGS" with a changed
+        # plane-wave basis; its Pulay stress is not the value used by the
+        # vc-relax convergence criterion.
+        end_bfgs = re.search(r"End of BFGS Geometry Optimization", stdout, re.IGNORECASE)
+        pressure_text = stdout[:end_bfgs.start()] if end_bfgs else stdout
+        pressure_matches = re.findall(r"P=\s+([-+\d.eE]+)", pressure_text)
         if pressure_matches:
             result.pressure_kbar = float(pressure_matches[-1])
         

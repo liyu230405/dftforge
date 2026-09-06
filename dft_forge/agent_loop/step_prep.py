@@ -89,8 +89,14 @@ def prepare_step_args(
         args["output"] = str(session_dir / f"doped_{src}_{el}.cif")
     elif tool_id == "structure.analyze" and str(args.get("output", "")).endswith(".json"):
         args["output"] = str(session_dir / "structure_analysis.json")
-    elif tool_id == "structure.analyze" and args.get("source") == "__generated__":
-        args["source"] = ctx.get("last_structure_source") or args.get("source")
+    elif tool_id == "structure.analyze":
+        source = str(args.get("source") or "")
+        # LLMs often preserve a conversational filename (e.g. nacl.cif)
+        # instead of the session-generated path. Prefer the known current
+        # structure only when that literal path does not exist.
+        current = built_structure or ctx.get("last_structure_source")
+        if source == "__generated__" or (current and not Path(source).is_file() and Path(str(current)).is_file()):
+            args["source"] = str(current) if current else source
     elif tool_id == "structure.molecule":
         if not args.get("output"):
             mk = re.sub(r"[^a-z0-9]", "", str(args.get("kind", "mol")))
@@ -147,10 +153,14 @@ def prepare_step_args(
         args["workdir"] = str(session_dir / "graphs")
         if tool_id == "graph.run":
             inputs = dict(args.get("inputs") or {})
-            if built_structure and not inputs.get("structure"):
+            previous_structure = ctx.get("last_structure_source")
+            effective_structure = built_structure or (
+                previous_structure if previous_structure and Path(str(previous_structure)).is_file() else None
+            )
+            if effective_structure and not inputs.get("structure"):
                 # a structure built earlier in this plan is authoritative —
                 # it overrides any material name the planner guessed
-                inputs["structure"] = built_structure
+                inputs["structure"] = effective_structure
                 inputs.pop("material", None)
                 # scale band-path density with system size: a supercell's
                 # folded BZ needs far fewer path points than a primitive
@@ -159,16 +169,32 @@ def prepare_step_args(
                     try:
                         from ase.io import read as _ase_read
 
-                        _na = len(_ase_read(str(built_structure)))
+                        _na = len(_ase_read(str(effective_structure)))
                         if _na > 4:
                             inputs["nkpoints_bands"] = 60 if _na <= 12 else 40
                     except Exception:
                         pass
                 args["inputs"] = inputs
-            elif not built_structure and not inputs.get("material") and not inputs.get("structure"):
+            elif not effective_structure and not inputs.get("material") and not inputs.get("structure"):
                 # nothing to chain: running the template default (Si) would
                 # silently produce wrong physics for E_ads/formation flows
                 return "no structure to chain (previous build step failed) and no material given"
+
+            # Product-level method card: only inject values declared by the
+            # selected template. This keeps approval visible and reproducible
+            # without letting UI-only metadata leak into GraphTemplate inputs.
+            run_config = ctx.get("run_config") or {}
+            template_id = str(args.get("template_id") or "")
+            approved_keys = {
+                "t0_scf": ("ecutwfc", "kpoints"),
+                "t1_vc_relax": ("ecutwfc", "kpoints"),
+                "t2_bands": ("ecutwfc", "kpoints", "nbnd", "nkpoints_bands"),
+                "t2_dos": ("ecutwfc", "kpoints", "nbnd"),
+            }.get(template_id, ())
+            for key in approved_keys:
+                if run_config.get(key) not in (None, ""):
+                    inputs[key] = run_config[key]
+            args["inputs"] = inputs
 
             def _node_cb(ev, _idx=idx, _log=node_log):
                 _log.append({"node": ev.get("node"), "state": ev.get("state")})

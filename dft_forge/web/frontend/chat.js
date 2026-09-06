@@ -1,5 +1,6 @@
 import { renderCif, clear as clearViewer, toggleReplica, toggleCellFrame } from "./viewer.js";
 import { renderCharts } from "./charts.js";
+import { approveRequest, clearWorkspace, refreshWorkspace, requestContext, restoreAttachment } from "./workspace.js";
 
 const chat = document.getElementById("chat");
 const form = document.getElementById("form");
@@ -68,9 +69,60 @@ function makeChainCard() {
       </button>
       <span class="chain-elapsed mono"></span>
     </div>
+    <div class="chain-live-note">展示可审计的工作进展与执行摘要，不回显模型隐藏思维。</div>
+    <div class="chain-progress" aria-label="执行阶段">
+      <span class="cp-stage active" data-stage="planning"><i></i>理解</span>
+      <span class="cp-line"></span>
+      <span class="cp-stage" data-stage="plan"><i></i>规划</span>
+      <span class="cp-line"></span>
+      <span class="cp-stage" data-stage="tools"><i></i>调用工具</span>
+      <span class="cp-line"></span>
+      <span class="cp-stage" data-stage="verify"><i></i>验证</span>
+      <span class="cp-line"></span>
+      <span class="cp-stage" data-stage="done"><i></i>总结</span>
+    </div>
+    <div class="chain-activity" aria-label="实时活动"></div>
     <div class="chain-steps"></div>`;
   root.querySelector(".chain-toggle").addEventListener("click", () => root.classList.toggle("collapsed"));
+  // Give the user immediate feedback while the planner is working. The
+  // planner can take several seconds (especially for a remote LLM), so an
+  // empty card looks indistinguishable from a stalled request.
+  const stepsEl = root.querySelector(".chain-steps");
+  [
+    { description: "识别计算目标与输入", tool: "planner" },
+    { description: "检查结构、材料与约束", tool: "context" },
+    { description: "生成可执行步骤", tool: "plan" },
+  ].forEach((step, index) => {
+    const el = addChainStep(stepsEl, step);
+    el.className = `chain-step ${index === 0 ? "running" : "pending"}`;
+    el.querySelector(".cs-icon").textContent = STEP_ICONS[index === 0 ? "running" : "pending"];
+  });
   return root;
+}
+
+function addActivity(card, text, kind = "status") {
+  const list = card.querySelector(".chain-activity");
+  if (!list || !text) return;
+  const row = document.createElement("div");
+  row.className = `chain-activity-row ${kind}`;
+  const icon = document.createElement("span");
+  icon.className = "ca-icon";
+  icon.textContent = kind === "command" ? ">_" : kind === "edit" ? "✎" : "·";
+  const label = document.createElement("span");
+  label.textContent = text;
+  row.append(icon, label);
+  list.appendChild(row);
+  list.scrollIntoView({ block: "nearest" });
+}
+
+function setChainStage(card, stage) {
+  const order = ["planning", "plan", "tools", "verify", "done"];
+  const current = Math.max(0, order.indexOf(stage));
+  for (const el of card.querySelectorAll(".cp-stage")) {
+    const idx = order.indexOf(el.dataset.stage);
+    el.classList.toggle("active", idx === current);
+    el.classList.toggle("complete", idx < current);
+  }
 }
 
 function addChainStep(stepsEl, step) {
@@ -108,11 +160,15 @@ function renderChain(chain) {
   if (new URLSearchParams(location.search).get("chain") !== "open") {
     card.classList.add("collapsed");
   }
+  const activity = card.querySelector(".chain-activity");
+  activity.replaceChildren();
+  addActivity(card, `已完成执行 · ${chain.length} 步${nErr ? ` · ${nErr} 步失败` : ""}`, nErr ? "error" : "edit");
   for (const s of chain) {
     const el = addChainStep(stepsEl, s);
     el.className = `chain-step ${s.status || "done"}`;
     el.querySelector(".cs-icon").textContent = STEP_ICONS[s.status] || "·";
     if (s.summary) el.querySelector(".cs-summary").textContent = s.summary;
+    addActivity(card, `${s.status === "error" ? "执行失败" : "已完成"}：${s.description || s.tool || "步骤"}`, s.status === "error" ? "error" : "command");
     for (const n of s.nodes || []) setNodeRow(el, n.node, n.state);
   }
   return card;
@@ -162,15 +218,15 @@ function applyFigures(results) {
   for (const r of results || []) applyFigure(r.viewer, r.chart);
 }
 
-/* Session restore: the structure may come from an early message while the
-   latest chart replaces the panel — walk every message, keep the newest of each. */
+/* Session restore: figures are scoped to the latest assistant turn. Scanning
+   every historical message makes a failed/text-only follow-up resurrect the
+   previous turn's structure in the viewer. */
 function restoreFigures(messages) {
   let viewerPayload = null, chartPayload = null;
-  for (const m of messages) {
-    for (const r of m.results || []) {
-      if (r.viewer?.cif) viewerPayload = r.viewer;
-      if (r.chart) chartPayload = r.chart;
-    }
+  const latestAgent = [...messages].reverse().find((m) => m.role === "agent");
+  for (const r of latestAgent?.results || []) {
+    if (r.viewer?.cif) viewerPayload = r.viewer;
+    if (r.chart) chartPayload = r.chart;
   }
   if (viewerPayload) {
     renderCif(viewerPayload.cif, viewerPayload);
@@ -229,6 +285,8 @@ async function loadSession(id) {
   }
   if (!data.messages?.length) showWelcome();
   restoreFigures(data.messages || []);
+  restoreAttachment(data);
+  refreshWorkspace(id);
   refreshSessions();
 }
 
@@ -239,6 +297,7 @@ function newSession() {
   showWelcome();
   renderCharts(chartsEl, null);
   clearViewer();
+  clearWorkspace();
   refreshSessions();
 }
 
@@ -247,7 +306,7 @@ function showWelcome() {
   w.className = "welcome";
   w.innerHTML = `
     <h2>开始一次计算</h2>
-    <p>用一句话描述需求，代理会规划工具、生成输入、驱动 pw.x 计算并验证结果。结构与图表自动出现在右侧。</p>
+    <p>上传结构或直接描述目标。运行前可确认方法与精度，代理会规划工具、驱动计算、验证结果并保留可复现记录。</p>
     <div class="suggestions">
       <button class="suggestion">帮我算 GaAs 的结构优化</button>
       <button class="suggestion">算 Si 的能带结构</button>
@@ -265,6 +324,12 @@ function showWelcome() {
 async function send() {
   const text = input.value.trim();
   if (!text) return;
+  const approved = await approveRequest(text);
+  if (!approved) return;
+  // A figure belongs to the current request. Do not let a failed or
+  // text-only follow-up inherit the previous turn's structure/chart.
+  clearViewer();
+  renderCharts(chartsEl, null);
   input.value = "";
   sendBtn.disabled = true;
   setStatus("执行中…", "busy");
@@ -314,7 +379,6 @@ async function send() {
     clearInterval(timer);
     stopBtn.hidden = true;
     stopBtn.removeEventListener("click", stopHandler);
-    card.classList.add("collapsed");
     phaseEl.textContent = "执行完成";
     setStatus("就绪");
     sendBtn.disabled = false;
@@ -327,29 +391,49 @@ async function send() {
       case "start":
         sessionId = ev.session_id;
         localStorage.setItem("dftforge_session", sessionId);
+        addActivity(card, "已接收请求");
+        refreshWorkspace(sessionId);
         break;
       case "phase":
         phaseEl.textContent = ev.label || ev.phase;
         card.classList.toggle("phase-planning", ev.phase === "planning");
+        setChainStage(card, ev.phase === "narrating" ? "verify" : "planning");
+        addActivity(card, ev.label || ev.phase);
+        break;
+      case "context":
+        addActivity(card, ev.label || "已加载会话上下文");
         break;
       case "plan":
         stepsEl.innerHTML = "";
         phaseEl.textContent = `${ev.planner === "llm" ? "LLM" : "规则"}规划 · ${ev.steps.length} 步`;
+        setChainStage(card, "plan");
+        addActivity(card, `${ev.planner === "llm" ? "LLM" : "规则"} 已生成执行计划 · ${ev.steps.length} 步`, "command");
+        if (ev.summary) addActivity(card, ev.summary, "status");
+        if (ev.goal) addActivity(card, `目标已确认：${ev.goal}`, "status");
+        if (ev.constraints && Object.keys(ev.constraints).length) {
+          addActivity(card, `约束：${Object.entries(ev.constraints).map(([k, v]) => `${k}=${v}`).join(" · ")}`, "status");
+        }
+        if (ev.assumptions?.length) addActivity(card, `假设：${ev.assumptions.join("；")}`, "status");
+        if (ev.expected_outputs?.length) addActivity(card, `预期结果：${ev.expected_outputs.join("、")}`, "status");
         for (const s of ev.steps) addChainStep(stepsEl, s);
         chat.scrollTop = chat.scrollHeight;
         break;
       case "step": {
+        setChainStage(card, "tools");
         const el = stepsEl.children[ev.index];
         if (!el) break;
         el.className = `chain-step ${ev.status}`;
         el.querySelector(".cs-icon").textContent = STEP_ICONS[ev.status] || "·";
         if (ev.summary) el.querySelector(".cs-summary").textContent = ev.summary;
+        const stepLabel = el.querySelector(".cs-desc")?.textContent || `步骤 ${ev.index + 1}`;
+        addActivity(card, `${ev.status === "running" ? "正在执行" : ev.status === "done" ? "已完成" : "执行失败"}：${stepLabel}`, ev.status === "error" ? "error" : "command");
         chat.scrollTop = chat.scrollHeight;
         break;
       }
       case "node": {
         const el = stepsEl.children[ev.step];
         if (el) setNodeRow(el, ev.node, ev.state);
+        addActivity(card, `${ev.node} · ${NODE_LABELS[ev.state] || ev.state}`, ev.state === "failed" ? "error" : "status");
         chat.scrollTop = chat.scrollHeight;
         break;
       }
@@ -357,6 +441,8 @@ async function send() {
         applyFigure(ev.viewer, ev.chart);
         break;
       case "reply":
+        setChainStage(card, "done");
+        addActivity(card, "已整理结果并生成回答", "edit");
         bubble.textContent = ev.text;
         if (!bubble.parentNode) msgDiv.insertBefore(bubble, card);
         chat.scrollTop = chat.scrollHeight;
@@ -367,6 +453,7 @@ async function send() {
         phaseEl.textContent = "执行出错";
         break;
       case "done":
+        setChainStage(card, "done");
         finish();
         break;
     }
@@ -376,7 +463,7 @@ async function send() {
     const res = await fetch("/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text, session_id: sessionId }),
+      body: JSON.stringify({ message: text, session_id: sessionId, ...requestContext(text, approved) }),
     });
     if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
     const reader = res.body.getReader();
@@ -402,6 +489,7 @@ async function send() {
     setStatus("错误", "error");
   } finally {
     finish();
+    refreshWorkspace(sessionId);
   }
 }
 
@@ -413,10 +501,15 @@ export function initChat() {
   document.getElementById("toggleReplica").addEventListener("change", (e) => toggleReplica(e.target.checked));
   document.getElementById("toggleCell").addEventListener("change", (e) => toggleCellFrame(e.target.checked));
 
-  fetch("/doctor").then((r) => r.json()).then((d) => {
-    const hasQe = Boolean(d.qe_binary);
+  window.addEventListener("dftforge:session", (event) => { sessionId = event.detail.sessionId; });
+
+  Promise.all([fetch("/doctor").then((r) => r.json()), fetch("/api/config").then((r) => r.json())]).then(([doctor, cfg]) => {
+    const remote = cfg.compute?.executor === "ssh";
+    const demo = cfg.compute?.executor === "fake";
+    const hasQe = Boolean(doctor.qe_binary) || remote || demo;
+    const label = remote ? `HPC · ${cfg.compute.scheduler || "direct"}` : demo ? "演示后端" : doctor.qe_binary ? "pw.x 已就绪" : "QE 未检出";
     engineStatus.className = `masthead-status ${hasQe ? "ok" : "warn"}`;
-    engineStatus.innerHTML = `<span class="dot"></span>${hasQe ? "pw.x 已就绪" : "QE 未检出 · 离线模式"}`;
+    engineStatus.innerHTML = `<span class="dot"></span>${label}`;
   }).catch(() => {
     engineStatus.className = "masthead-status warn";
     engineStatus.innerHTML = '<span class="dot"></span>后端未知状态';

@@ -45,7 +45,7 @@ MATERIALS: Dict[str, Dict[str, Any]] = {
         "nspecies": 1,
         "species": ["Al"],
         "masses": [26.982],
-        "pseudos": {"Al": "Al.pbe-n-rrkjus_psl.1.0.2.UPF"},
+        "pseudos": {"Al": "Al.upf"},
         "occupations": "smearing",
         "smearing": "mp",
         "degauss": 0.02,

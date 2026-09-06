@@ -305,6 +305,7 @@ class TestWebCancelEndpoint:
             assert data["cancelled"] is True
             assert ev.is_set()
             task.cancel()
+            loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
         finally:
             loop.close()
             web_mod.WEB_ACTIVE_RUNS.pop("sess1", None)

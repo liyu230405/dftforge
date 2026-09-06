@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from dft_forge.agent_loop.helpers import _dedupe_node_log
 from dft_forge.agent_loop.narration import compare_block, narrate
+from dft_forge.agent_loop.planning import PlanIR
 from dft_forge.agent_loop.result_views import RunState, handle_tool_result
 from dft_forge.agent_loop.step_prep import check_self_doping, prepare_step_args
 
@@ -36,6 +37,13 @@ async def run_session(
             pass
 
     emit({"type": "phase", "phase": "planning", "label": "理解需求，规划步骤…"})
+    if ctx.get("last_run_id") or ctx.get("last_formula") or ctx.get("last_structure_source"):
+        context_bits = []
+        if ctx.get("last_formula"):
+            context_bits.append(f"结构 {ctx['last_formula']}")
+        if ctx.get("last_run_id"):
+            context_bits.append(f"上次运行 {ctx['last_run_id']}")
+        emit({"type": "context", "label": "已加载会话上下文：" + " · ".join(context_bits)})
     llm_steps, llm_reply = await asyncio.to_thread(llm_planner.plan, message, ctx, history)
     if llm_reply is not None:
         emit({"type": "reply", "text": llm_reply})
@@ -49,10 +57,21 @@ async def run_session(
         }
     steps = llm_steps if llm_steps is not None else rule_planner.plan(message, ctx)
     planner_name = "llm" if llm_steps is not None else "rules"
+    plan_ir = getattr(llm_planner, "last_plan_ir", None)
+    if not isinstance(plan_ir, PlanIR) or planner_name != "llm":
+        plan_ir = PlanIR.from_steps(message, steps, source=planner_name)
+    # Persist only explainable planning metadata; execution handles and raw
+    # prompts never become part of the session context.
+    ctx["last_plan"] = plan_ir.to_dict()
     emit({
         "type": "plan",
         "planner": planner_name,
         "steps": [{"tool": s.get("tool"), "description": s.get("description", "")} for s in steps],
+        "summary": _plan_summary(message, steps),
+        "goal": plan_ir.goal,
+        "constraints": plan_ir.constraints,
+        "assumptions": plan_ir.assumptions,
+        "expected_outputs": plan_ir.expected_outputs,
     })
     commands: List[Dict[str, Any]] = []
     results: List[Dict[str, Any]] = []
@@ -252,6 +271,12 @@ async def run_session(
                 compare_blocks.append(block)
     if compare_blocks:
         reply = reply.rstrip() + "\n" + "\n".join(compare_blocks)
+    # Narration is allowed to be natural language, but it must not erase
+    # deterministic values that the graph/status tools returned.
+    fact_blocks = [str(r["facts"]) for r in results if r.get("facts")]
+    for block in fact_blocks:
+        if block not in reply:
+            reply = reply.rstrip() + "\n" + block
     if ctx.get("last_failures"):
         ctx["last_failures"] = ctx["last_failures"][-5:]
     emit({"type": "reply", "text": reply})
@@ -263,3 +288,24 @@ async def run_session(
         "ctx": ctx,
         "planner": planner_name,
     }
+
+
+def _plan_summary(message: str, steps: List[Dict[str, Any]]) -> str:
+    """Explain the chosen execution contract without exposing hidden CoT."""
+    template_labels = {
+        "t0_scf": "单点能",
+        "t1_vc_relax": "变胞结构优化",
+        "t2_bands": "能带结构",
+        "t2_dos": "态密度",
+    }
+    templates = [
+        template_labels.get(str((step.get("args") or {}).get("template_id")), str((step.get("args") or {}).get("template_id")))
+        for step in steps
+        if (step.get("args") or {}).get("template_id")
+    ]
+    tools = [str(step.get("tool")) for step in steps if step.get("tool")]
+    if templates:
+        return f"目标：{message[:80]} · 选择{ '、'.join(templates) }流程 · 预期回传能量/结构参数"
+    if tools:
+        return f"目标：{message[:80]} · 执行链：{' → '.join(tools)}"
+    return f"目标：{message[:80]} · 无需调用计算工具"

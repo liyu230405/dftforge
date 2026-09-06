@@ -20,6 +20,12 @@ DEFAULT_TEMPLATES = Path(__file__).resolve().parents[2] / "templates"
 _ENGINE_CACHE: dict = {}
 
 
+def reset_engine_cache() -> None:
+    """Drop cached engines after compute-backend settings change."""
+    cancel_running_graphs()
+    _ENGINE_CACHE.clear()
+
+
 def _get_engine(workdir: Optional[str] = None):
     """Lazily construct a GraphEngine with the QE tool (FakeExecutor offline)."""
     key = str(workdir or DEFAULT_WORKSPACE)

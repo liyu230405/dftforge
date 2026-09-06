@@ -41,7 +41,7 @@ class TestQECompiler:
         assert out_file.exists()
         assert 'calculation = "vc-relax"' in content
         assert 'prefix = "al"' in content
-        assert "Al.pbe-n-rrkjus_psl.1.0.2.UPF" in content
+        assert "Al.upf" in content
         assert "degauss = 0.02" in content  # Metal
     
     def test_compile_mgo_vcrelax(self, tmp_path, pseudo_dir):
@@ -243,4 +243,3 @@ class TestCompileDOSInput:
         content = compiler.compile_dos_input("MgO", out_file, prefix="mgo")
         assert 'prefix = "mgo"' in content
         assert "&dos" in content
-
