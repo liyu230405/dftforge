@@ -1,6 +1,6 @@
 """Render SLURM (sbatch) and PBS (qsub) job scripts.
 
-Parameter resolution order (CatGo convention):
+Parameter resolution order:
     node params > job_defaults > built-in fallbacks.
 Optional directives with empty values are stripped.
 """

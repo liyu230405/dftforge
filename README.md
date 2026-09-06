@@ -1,6 +1,6 @@
 # DFT-Forge
 
-**General-purpose scientific computation agent** — a CatGo-inspired graph runtime with Quantum ESPRESSO as its first engine.
+**General-purpose scientific computation agent** — a graph runtime with Quantum ESPRESSO as its first engine.
 
 > "LLM 只决定做什么；确定性程序决定输入文件如何生成、程序如何运行、结果如何解析和是否可信。"
 
@@ -8,15 +8,13 @@
 
 DFT-Forge is an agent-friendly CLI and web toolchain for scientific computing workflows. It is designed to be used by coding agents, chat UIs, and researchers who want structured, inspectable, and recoverable computation workflows:
 
-- **Graph runtime** (CatGo-style): JSON-declared DAG templates, node/run state machines, dependency-driven scheduling, crash-safe SQLite persistence, repair & retry.
+- **Graph runtime**: JSON-declared DAG templates, node/run state machines, dependency-driven scheduling, crash-safe SQLite persistence, repair & retry.
 - **Engine-agnostic core**: the runtime knows nothing about DFT; QE is one engine (`engines/qe.py`). New engines (VASP/ABINIT/LAMMPS/…) plug in as tools.
 - **User-supplied compute (BYOC)**: local, SSH, or HPC schedulers (SLURM/PBS) — the LLM never generates shell/SSH/scheduler strings.
 - **Agent-friendly CLI**: every command does one thing and outputs JSON.
 - **Deterministic kernels**: compiler (input generation), executor, parser, verifier — no LLM in the execution path.
 - **Evidence ledger**: SQLite-backed audit trail of runs, failures, and recovery actions.
 - **Tool registry + MCP server**: structured tools that external agents can call.
-
-This project is independent and written from scratch. It does not copy benchmark runners from other repos as its core identity; those repos are used only as external references.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full layered design and the "adding a new engine" guide.
 
@@ -212,7 +210,6 @@ elements get higher ecut; metals get denser k-meshes and stronger smearing).
 - DFT-Forge code in this repository is provided under the repository root license.
 - Quantum ESPRESSO is licensed under the GPL. This project does not redistribute QE binaries; users must provide their own installation.
 - Pseudopotentials in `assets/pseudos/` are subject to their original distribution licenses. Check individual file headers before redistribution.
-- This project does not redistribute or embed CatGo code. CatGo is used only as an external reference for architecture and UX ideas.
 
 ## Notes
 

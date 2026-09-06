@@ -1,4 +1,4 @@
-"""SLURM and PBS scheduler adapters (CatGo SchedulerInterface design).
+"""SLURM and PBS scheduler adapters.
 
 submit -> remote sbatch/qsub; status -> squeue with sacct fallback
 (SLURM's squeue lags for finished jobs); cancel -> scancel/qdel.

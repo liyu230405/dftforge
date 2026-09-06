@@ -1,4 +1,4 @@
-"""SQLite state persistence for graph runs (CatGo-style two-table schema)."""
+"""SQLite state persistence for graph runs."""
 
 from __future__ import annotations
 

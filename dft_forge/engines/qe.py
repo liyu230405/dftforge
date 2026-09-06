@@ -1,6 +1,6 @@
 """QE engine tool: one graph node = one QE calculation.
 
-Bridges the CatGo-style graph runtime to the deterministic compiler /
+Bridges the graph runtime to the deterministic compiler /
 executor / parser / verifier stack. The tool never shells out directly —
 it reuses the Executor abstraction (Local/SSH/Fake), so a node can run
 locally or on an HPC backend without the graph knowing.
@@ -12,7 +12,7 @@ Calc types:
 - bands    : bands.x band-structure extraction (needs nscf upstream)
 - dos      : dos.x density-of-states         (needs nscf upstream)
 
-Data flow follows QE physics plus CatGo-style bindings: nscf/bands/dos nodes
+Data flow follows QE physics plus graph bindings: nscf/bands/dos nodes
 symlink the upstream ``{prefix}.save`` directory into their workdir, and the
 T2 verifiers receive upstream stdout files through
 ``${nodes.<id>.outputs.stdout_file}`` param references.

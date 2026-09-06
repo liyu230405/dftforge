@@ -1,4 +1,4 @@
-"""Graph workflow runtime (CatGo-style kernel, clean-room Python).
+"""Graph workflow runtime.
 
 Layers:
 - states: node/run state machines with legal transition table

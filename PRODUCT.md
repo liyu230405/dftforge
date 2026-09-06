@@ -20,7 +20,7 @@ DFT-Forge is a computation agent: natural language in, verified QE calculations 
 
 ## Positioning
 
-LLM planner (OpenAI-compatible API) + deterministic graph runtime (CatGo-style DAG engine) + real QE binaries on local/SSH/HPC — the agent owns the whole pipeline, not just input generation.
+LLM planner (OpenAI-compatible API) + deterministic graph runtime (DAG engine) + real QE binaries on local/SSH/HPC — the agent owns the whole pipeline, not just input generation.
 
 ## Operating Context
 

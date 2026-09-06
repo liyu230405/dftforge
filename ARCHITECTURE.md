@@ -1,6 +1,6 @@
 # DFT-Forge Architecture
 
-**A general-purpose scientific computation agent** — built around a CatGo-inspired graph runtime. Quantum ESPRESSO is the first *engine*, not the identity of the project.
+**A general-purpose scientific computation agent** — built around a graph runtime. Quantum ESPRESSO is the first *engine*, not the identity of the project.
 
 > Design principle: LLM plans; deterministic code executes. The runtime, scheduling, HPC submission, parsing, and verification never depend on an LLM.
 
@@ -14,7 +14,7 @@
 │  Tools Layer        tools/ (registry + MCP bindings)    │
 │                     graph.run / graph.status / ...      │
 ├─────────────────────────────────────────────────────────┤
-│  Graph Engine       runtime/ (CatGo-style core)         │
+│  Graph Engine       runtime/ (generic core)             │
 │  ┌───────────────────────────────────────────────────┐  │
 │  │ GraphEngine  facade: create/start/pause/resume/   │  │
 │  │               retry/status                        │  │
@@ -66,7 +66,7 @@ Cross-node data flows through `${nodes.<id>.outputs.<key>}` bindings — e.g. th
 
 ## 2. HPC Layer (`dft_forge/hpc/`)
 
-User-supplied compute (BYOC), mirroring CatGo:
+User-supplied compute (BYOC):
 
 - **`runner.py`** — `CommandRunner` abstraction with `LocalRunner` / `SSHRunner` (subprocess-backed SSH, supports jump hosts, keys, timeouts). All remote operations are constructed internally; the LLM never generates shell/SSH strings.
 - **`scheduler.py`** — `SchedulerInterface` with `SlurmScheduler` (sbatch/squeue/sacct/scancel, sacct fallback for finished jobs) and `PbsScheduler` (qsub/qstat/qdel). Normalized `JobStatus` for both.

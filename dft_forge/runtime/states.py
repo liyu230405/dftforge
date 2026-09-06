@@ -62,7 +62,7 @@ def can_transition(source: NodeState, target: NodeState) -> bool:
 
 
 def determine_run_status(states: Iterable[NodeState]) -> RunState:
-    """Final run status from node states (CatGo priority order).
+    """Final run status from node states (priority order).
 
     all succeeded > cancelled-without-success > any succeeded > failed.
     """

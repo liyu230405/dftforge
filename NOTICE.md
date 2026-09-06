@@ -19,7 +19,6 @@ DFT-Forge depends on the following open-source packages:
 - **seekpath** (BSD) — High-symmetry path generator
 - **NumPy**, **SciPy**, **h5py**, **matplotlib** — scientific computing
 
-No code from CatGo or SilicoLab is copied or imported.
 
 ## Pseudopotential Library
 

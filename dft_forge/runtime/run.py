@@ -16,9 +16,9 @@ from dft_forge.runtime.states import NodeState, RunState, can_transition
 class ToolError(RuntimeError):
     """Raised by a tool when a node fails.
 
-    `repairable` + `category` feed the repair-handler registry, mirroring
-    CatGo's Repairing state: a matching handler may mutate node params and
-    send the node back to Ready instead of failing the graph.
+    `repairable` + `category` feed the repair-handler registry. A matching
+    handler may mutate node params and send the node back to Ready instead of
+    failing the graph.
     """
 
     def __init__(self, message: str, *, category: str = "unknown", repairable: bool = False):

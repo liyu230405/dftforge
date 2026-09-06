@@ -1,7 +1,7 @@
 """Command runners: execute a shell command locally or over SSH.
 
 Commands are wrapped in ``bash -l -c`` (login shell) so module-managed
-binaries (sbatch, qsub, pw.x) are on PATH — same trick CatGo uses.
+binaries (sbatch, qsub, pw.x) are on PATH.
 The runner is the only place remote execution happens, so tests inject a
 fake runner and no network is ever touched.
 """

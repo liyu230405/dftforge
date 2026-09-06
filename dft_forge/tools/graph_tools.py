@@ -1,4 +1,4 @@
-"""MCP tool bindings for the graph runtime (CatGo-style graph tools).
+"""MCP tool bindings for the graph runtime.
 
 graph.templates : list available graph templates
 graph.run       : create + run a template to completion (local executor)

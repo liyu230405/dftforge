@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class GraphEngine:
-    """Single entry point for graph-based workflows (CatGo GraphEngine analogue).
+    """Single entry point for graph-based workflows.
 
     Owns the tool registry, repair handlers, the state store, and template
     registry. ``base_dir`` is the workspace under which each run gets
