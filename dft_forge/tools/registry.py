@@ -54,6 +54,16 @@ class ToolRegistry:
         if not tool.execute_fn:
             return ToolResult(data={}, output_type=tool.output_type, tool_id=tool_id, error=f"Tool missing executor: {tool_id}")
 
+        execution_mode = str(kwargs.get("execution_mode") or "execute").lower()
+        if execution_mode == "plan" and tool.side_effect != "read_only":
+            return ToolResult(
+                data={}, output_type=tool.output_type, tool_id=tool_id,
+                error=(
+                    f"Execution blocked in plan-only mode: {tool_id} is "
+                    f"classified as {tool.side_effect}"
+                ),
+            )
+
         violation = self._schema_violation(tool, arguments)
         if violation:
             # Execution boundary: the planner's pre-check is advisory (it may

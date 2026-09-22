@@ -13,6 +13,9 @@ const engineStatus = document.getElementById("engineStatus");
 const chartsEl = document.getElementById("charts");
 
 let sessionId = localStorage.getItem("dftforge_session") || null;
+let activeStream = null;
+let sessionLoadSerial = 0;
+let approvalPending = false;
 
 function esc(s) {
   return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -21,6 +24,217 @@ function esc(s) {
 function setStatus(text, cls = "") {
   statusEl.textContent = text;
   statusEl.className = `statusline mono ${cls}`.trim();
+}
+
+function addApprovalRetry(msgDiv, bubble, text) {
+  if (msgDiv.querySelector(".approval-retry")) return;
+  const action = document.createElement("button");
+  action.type = "button";
+  action.className = "approval-retry";
+  action.textContent = "确认方法后重试";
+  action.addEventListener("click", () => {
+    input.value = text;
+    send(true);
+  });
+  bubble.appendChild(action);
+}
+
+function contractValue(value) {
+  if (value === undefined || value === null || value === "") return "未提供";
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+function effectiveSummary(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return contractValue(value);
+  return Object.entries(value)
+    .filter(([key]) => key !== "scan_points")
+    .map(([key, item]) => `${key}=${contractValue(item)}`)
+    .concat(Array.isArray(value.scan_points) ? [`扫描组合=${value.scan_points.length} 组`] : [])
+    .join(" · ") || "未提供";
+}
+
+function contractEntries(value) {
+  return Object.entries(value || {}).map(([key, detail]) => {
+    const requested = detail?.requested ?? detail;
+    const reason = detail?.reason ? `（${detail.reason}）` : "";
+    return `${key}: ${contractValue(requested)}${reason}`;
+  }).join(" · ");
+}
+
+function methodLine(parent, text, className = "") {
+  const line = document.createElement("div");
+  line.className = `method-contract-line ${className}`.trim();
+  line.textContent = text;
+  parent.appendChild(line);
+}
+
+function addConvergencePreview(parent, convergence) {
+  if (!convergence || typeof convergence !== "object") return;
+  const panel = document.createElement("div");
+  panel.className = "method-convergence-preview";
+  methodLine(panel, `先做收敛扫描${convergence.job_count != null ? ` · ${convergence.job_count} 次计算` : ""}`);
+  if (convergence.ecutwfc_values?.length) methodLine(panel, `截断能：${convergence.ecutwfc_values.join("、")} Ry`);
+  if (convergence.kpoints_values?.length) {
+    methodLine(panel, `k 点网格：${convergence.kpoints_values.map((grid) => Array.isArray(grid) ? grid.slice(0, 3).join("×") : contractValue(grid)).join("、")}`);
+  }
+  if (convergence.fixed_ecutrho != null) methodLine(panel, `固定 ecutrho：${convergence.fixed_ecutrho} Ry`);
+  const fixed = [];
+  if (convergence.occupations != null) fixed.push(`occupations=${contractValue(convergence.occupations)}`);
+  if (convergence.smearing_values?.length) fixed.push(`smearing=${convergence.smearing_values.map(contractValue).join("、")}`);
+  if (convergence.degauss_values?.length) fixed.push(`degauss=${convergence.degauss_values.map(contractValue).join("、")} Ry`);
+  if (fixed.length) methodLine(panel, `固定占据与展宽：${fixed.join(" · ")}`);
+  methodLine(panel, `总能判据：${convergence.threshold_mev_per_atom ?? 1} meV/atom；不代表带隙或其他物性已收敛。`);
+  parent.appendChild(panel);
+}
+
+function addRecommendation(parent, recommendation) {
+  if (!recommendation || typeof recommendation !== "object") return;
+  methodLine(parent, recommendation.status === "deferred"
+    ? "参数推荐：等待实际结构或前序结果"
+    : "初始参数推荐 · 尚未通过收敛测试", "recommendation-state");
+  const details = document.createElement("details");
+  details.className = "method-recommendation";
+  const summary = document.createElement("summary");
+  summary.textContent = "推荐依据与参数来源";
+  details.appendChild(summary);
+  const structure = recommendation.structure;
+  if (structure && typeof structure === "object") {
+    methodLine(details, `结构：${structure.formula || "待确定"}${structure.natoms != null ? ` · ${structure.natoms} 原子` : ""}`);
+  }
+  for (const [key, reason] of Object.entries(recommendation.reasons || {})) {
+    const value = recommendation.parameters?.[key];
+    methodLine(details, `${key}${value !== undefined ? ` = ${contractValue(value)}` : ""}：${contractValue(reason)}`);
+  }
+  for (const pseudo of recommendation.pseudopotentials || []) {
+    methodLine(details, `赝势：${pseudo.filename || "未提供文件名"} · 价电子数 ${contractValue(pseudo.z_valence)}`);
+    if (pseudo.sha256) methodLine(details, `SHA-256：${pseudo.sha256}`, "mono");
+  }
+  for (const note of recommendation.notes || []) methodLine(details, note);
+  parent.appendChild(details);
+  addConvergencePreview(parent, recommendation.convergence);
+}
+
+function addMethodContract(msgDiv, bubble, contract, methodToken, requestSnapshot) {
+  if (!contract || !methodToken || msgDiv.querySelector(".method-contract-card")) return;
+  const card = document.createElement("section");
+  card.className = "method-contract-card";
+  const title = document.createElement("strong");
+  title.textContent = "请确认计算参数与方法";
+  card.appendChild(title);
+  const scope = document.createElement("p");
+  const planner = contract.planner === "llm" ? "LLM 已规划计算任务。" : contract.planner === "rules" ? "当前使用规则规划。" : "";
+  scope.textContent = `${planner}以下为实际执行步骤及参数。初始推荐尚未经过收敛验证；如需调整，可在“方法参数”保存设置后重新发送任务。`;
+  card.appendChild(scope);
+  addConvergencePreview(card, contract.convergence);
+  for (const step of contract.steps || []) {
+    const row = document.createElement("div");
+    row.className = "method-contract-step";
+    const head = document.createElement("div");
+    head.className = "method-contract-step-head";
+    head.textContent = `${Number(step.index) + 1}. ${step.tool || "步骤"}${step.template_id ? ` · ${step.template_id}` : ""}`;
+    row.appendChild(head);
+    const effective = document.createElement("div");
+    effective.className = "method-contract-line mono";
+    effective.textContent = `有效参数：${effectiveSummary(step.effective)}`;
+    row.appendChild(effective);
+    addRecommendation(row, step.recommendation);
+    if (Array.isArray(step.effective?.scan_points) && step.effective.scan_points.length) {
+      const details = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = `展开 ${step.effective.scan_points.length} 组扫描组合`;
+      details.appendChild(summary);
+      const table = document.createElement("table");
+      table.className = "method-contract-scan mono";
+      const header = document.createElement("tr");
+      for (const label of ["ecutwfc (Ry)", "k 点", "smearing", "degauss"]) {
+        const cell = document.createElement("th");
+        cell.textContent = label;
+        header.appendChild(cell);
+      }
+      table.appendChild(header);
+      for (const scan of step.effective.scan_points) {
+        const tr = document.createElement("tr");
+        for (const value of [scan.ecutwfc, (scan.kpoints || []).slice(0, 3).join("×"), scan.smearing, scan.degauss]) {
+          const cell = document.createElement("td");
+          cell.textContent = contractValue(value);
+          tr.appendChild(cell);
+        }
+        table.appendChild(tr);
+      }
+      details.appendChild(table);
+      row.appendChild(details);
+    }
+    const applied = document.createElement("div");
+    applied.className = "method-contract-line mono";
+    applied.textContent = `已应用：${contractEntries(step.applied) || "无"}`;
+    row.appendChild(applied);
+    const notApplicable = contractEntries(step.not_applicable);
+    if (notApplicable) {
+      const line = document.createElement("div");
+      line.className = "method-contract-line warning mono";
+      line.textContent = `未应用：${notApplicable}`;
+      row.appendChild(line);
+    }
+    const conflicts = contractEntries(step.conflicts);
+    if (conflicts) {
+      const line = document.createElement("div");
+      line.className = "method-contract-line warning mono";
+      line.textContent = `冲突：${conflicts}`;
+      row.appendChild(line);
+    }
+    if (step.automatic_defaults?.length) {
+      const line = document.createElement("div");
+      line.className = "method-contract-line mono";
+      line.textContent = `自动字段：${step.automatic_defaults.join("、")}`;
+      row.appendChild(line);
+    }
+    if (step.notes?.length) {
+      const line = document.createElement("div");
+      line.className = "method-contract-line";
+      line.textContent = step.notes.join("；");
+      row.appendChild(line);
+    }
+    card.appendChild(row);
+  }
+  const execution = document.createElement("div");
+  execution.className = "method-contract-execution mono";
+  execution.textContent = `执行后端：${contract.execution_selection?.backend || "未记录"} · walltime ${contract.execution_selection?.walltime_limit_sec || "未记录"}s`;
+  card.appendChild(execution);
+  const actions = document.createElement("div");
+  actions.className = "method-contract-actions";
+  const confirm = document.createElement("button");
+  confirm.type = "button";
+  confirm.className = "cfg-btn method-contract-confirm";
+  confirm.textContent = "确认参数并运行";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "cfg-btn ghost method-contract-cancel";
+  cancel.textContent = "取消";
+  const finishCard = (message) => {
+    confirm.disabled = true;
+    cancel.disabled = true;
+    const state = document.createElement("span");
+    state.className = "method-contract-state";
+    state.textContent = message;
+    actions.appendChild(state);
+  };
+  confirm.addEventListener("click", () => {
+    if (sessionId !== requestSnapshot.sessionId || sessionLoadSerial !== requestSnapshot.sessionSerial) {
+      finishCard("会话已切换，已取消");
+      return;
+    }
+    if (activeStream && !activeStream.detached) return;
+    finishCard("已确认，开始运行…");
+    send(false, { ...requestSnapshot, methodToken });
+  });
+  cancel.addEventListener("click", () => finishCard("已取消方法确认"));
+  actions.append(confirm, cancel);
+  card.appendChild(actions);
+  bubble.appendChild(card);
+}
+
+function addMethodUnsupported(bubble, message) {
+  bubble.textContent = `方法不支持：${message || "请清空不适用参数或选择支持的任务"}`;
 }
 
 /* ── message rendering ─────────────────────────────────────────────── */
@@ -33,8 +247,8 @@ function appendUser(text, ts) {
   chat.scrollTop = chat.scrollHeight;
 }
 
-const NODE_LABELS = { running: "运行中", succeeded: "完成", failed: "失败", repairing: "修复重试", ready: "重试", blocked: "阻塞" };
-const STEP_ICONS = { pending: "○", running: "◐", done: "✓", error: "✗" };
+const NODE_LABELS = { running: "运行中", succeeded: "完成", failed: "失败", repairing: "修复重试", ready: "重试", blocked: "阻塞", cancelled: "已停止" };
+const STEP_ICONS = { pending: "○", running: "◐", done: "✓", error: "✗", cancelled: "■" };
 
 function appendAgent(text, commands, results, ts, chain) {
   const div = document.createElement("div");
@@ -152,9 +366,11 @@ function setNodeRow(stepEl, node, state) {
 function renderChain(chain) {
   const card = makeChainCard();
   const stepsEl = card.querySelector(".chain-steps");
+  stepsEl.replaceChildren();
   const nErr = chain.filter((s) => s.status === "error").length;
   card.querySelector(".chain-phase").textContent =
     `执行过程 · ${chain.length} 步${nErr ? ` · ${nErr} 步失败` : ""}`;
+  setChainStage(card, "done");
   card.querySelector(".chain-elapsed").remove();
   // ?chain=open keeps historical transcripts expanded (default: collapsed)
   if (new URLSearchParams(location.search).get("chain") !== "open") {
@@ -205,35 +421,35 @@ function fmtTime(ts) {
 
 /* ── figures: structure + charts from tool results ─────────────────── */
 
-function applyFigure(viewer, chart) {
+function applyFigure(viewer, chart, provenance) {
   if (viewer?.cif) {
     renderCif(viewer.cif, viewer);
     const cap = document.getElementById("viewerCaption");
     cap.textContent = `${viewer.formula || ""} · ${viewer.natoms ?? "?"} 原子 · 拖拽旋转 / 滚轮缩放 / 双击复位`;
   }
-  if (chart) renderCharts(chartsEl, chart);
+  if (chart) renderCharts(chartsEl, chart, provenance || chart.provenance);
 }
 
 function applyFigures(results) {
-  for (const r of results || []) applyFigure(r.viewer, r.chart);
+  for (const r of results || []) applyFigure(r.viewer, r.chart, r.provenance);
 }
 
 /* Session restore: figures are scoped to the latest assistant turn. Scanning
    every historical message makes a failed/text-only follow-up resurrect the
    previous turn's structure in the viewer. */
 function restoreFigures(messages) {
-  let viewerPayload = null, chartPayload = null;
+  let viewerPayload = null, chartPayload = null, provenancePayload = null;
   const latestAgent = [...messages].reverse().find((m) => m.role === "agent");
   for (const r of latestAgent?.results || []) {
     if (r.viewer?.cif) viewerPayload = r.viewer;
-    if (r.chart) chartPayload = r.chart;
+    if (r.chart) { chartPayload = r.chart; provenancePayload = r.provenance || r.chart.provenance || null; }
   }
   if (viewerPayload) {
     renderCif(viewerPayload.cif, viewerPayload);
     const cap = document.getElementById("viewerCaption");
     cap.textContent = `${viewerPayload.formula || ""} · ${viewerPayload.natoms ?? "?"} 原子 · 拖拽旋转 / 滚轮缩放`;
   }
-  renderCharts(chartsEl, chartPayload);
+  renderCharts(chartsEl, chartPayload, provenancePayload);
 }
 
 /* ── sessions ──────────────────────────────────────────────────────── */
@@ -274,10 +490,20 @@ async function refreshSessions() {
 }
 
 async function loadSession(id) {
+  const serial = ++sessionLoadSerial;
+  if (activeStream) {
+    activeStream.detached = true;
+    document.getElementById("stop").hidden = true;
+    sendBtn.disabled = false;
+  }
   sessionId = id;
   localStorage.setItem("dftforge_session", id);
+  clearViewer();
+  renderCharts(chartsEl, null);
+  clearWorkspace();
   const res = await fetch(`/api/sessions/${id}`);
   const data = await res.json();
+  if (serial !== sessionLoadSerial || sessionId !== id) return;
   chat.innerHTML = "";
   for (const m of data.messages || []) {
     if (m.role === "user") appendUser(m.text, m.ts);
@@ -285,12 +511,19 @@ async function loadSession(id) {
   }
   if (!data.messages?.length) showWelcome();
   restoreFigures(data.messages || []);
-  restoreAttachment(data);
+  await restoreAttachment({ ...data, session_id: id });
+  if (serial !== sessionLoadSerial || sessionId !== id) return;
   refreshWorkspace(id);
   refreshSessions();
 }
 
 function newSession() {
+  sessionLoadSerial += 1;
+  if (activeStream) {
+    activeStream.detached = true;
+    document.getElementById("stop").hidden = true;
+    sendBtn.disabled = false;
+  }
   sessionId = null;
   localStorage.removeItem("dftforge_session");
   chat.innerHTML = "";
@@ -321,11 +554,53 @@ function showWelcome() {
 
 /* ── send loop: streaming execution chain ──────────────────────────── */
 
-async function send() {
-  const text = input.value.trim();
+async function send(forceApproval = false, frozenRequest = null) {
+  if (activeStream && !activeStream.detached) return;
+  if (!frozenRequest && approvalPending) return;
+  const text = frozenRequest?.text || input.value.trim();
   if (!text) return;
-  const approved = await approveRequest(text);
-  if (!approved) return;
+  const approvalSessionId = sessionId;
+  const approvalSessionSerial = sessionLoadSerial;
+  if (frozenRequest && (sessionId !== frozenRequest.sessionId || sessionLoadSerial !== frozenRequest.sessionSerial)) {
+    setStatus("会话已切换，已取消", "error");
+    return;
+  }
+  let approval;
+  if (frozenRequest) {
+    approval = { proceed: true, approved: true };
+  } else {
+    approvalPending = true;
+    try {
+      approval = await approveRequest(text, forceApproval);
+    } catch (error) {
+      setStatus(`参数错误：${error.message}`, "error");
+      return;
+    } finally {
+      approvalPending = false;
+    }
+  }
+  if (!approval?.proceed) return;
+  if (!frozenRequest && (sessionId !== approvalSessionId || sessionLoadSerial !== approvalSessionSerial)) {
+    setStatus("会话已切换，已取消", "error");
+    return;
+  }
+  const requestedSessionId = frozenRequest?.sessionId ?? sessionId;
+  let requestSnapshot = frozenRequest;
+  if (!requestSnapshot) {
+    try {
+      requestSnapshot = {
+        text,
+        sessionId: requestedSessionId,
+        sessionSerial: approvalSessionSerial,
+        context: requestContext(text, approval.approved),
+      };
+    } catch (error) {
+      setStatus(`参数错误：${error.message}`, "error");
+      return;
+    }
+  }
+  const streamState = { token: Symbol("chat-stream"), sessionId: requestedSessionId, detached: false };
+  activeStream = streamState;
   // A figure belongs to the current request. Do not let a failed or
   // text-only follow-up inherit the previous turn's structure/chart.
   clearViewer();
@@ -335,7 +610,7 @@ async function send() {
   setStatus("执行中…", "busy");
   const welcome = chat.querySelector(".welcome");
   if (welcome) welcome.remove();
-  appendUser(text);
+  if (!frozenRequest) appendUser(text);
 
   const card = makeChainCard();
   const stepsEl = card.querySelector(".chain-steps");
@@ -354,14 +629,20 @@ async function send() {
     elapsedEl.textContent = `${Math.round((performance.now() - t0) / 1000)}s`;
   }, 1000);
   let finished = false;
+  let streamFailed = false;
+  let streamCancelled = false;
+  let streamNeedsConfirmation = false;
+
+  const isAttached = () => activeStream === streamState && !streamState.detached && sessionId === streamState.sessionId;
 
   const stopBtn = document.getElementById("stop");
   const stop = async () => {
-    if (!sessionId) return;
+    if (!streamState.sessionId || streamState.detached) return;
     stopBtn.disabled = true;
     try {
-      const r = await fetch(`/api/sessions/${sessionId}/cancel`, { method: "POST" });
+      const r = await fetch(`/api/sessions/${streamState.sessionId}/cancel`, { method: "POST" });
       const d = await r.json();
+      streamCancelled = Boolean(d.cancelled);
       phaseEl.textContent = d.cancelled ? "已请求停止…" : "无进行中的计算";
       if (d.cancelled && d.processes_killed > 0) {
         phaseEl.textContent += `（终止了 ${d.processes_killed} 个进程）`;
@@ -377,18 +658,26 @@ async function send() {
     if (finished) return;
     finished = true;
     clearInterval(timer);
-    stopBtn.hidden = true;
+    const attached = isAttached();
+    if (activeStream === streamState) activeStream = null;
+    if (attached || !streamState.detached) stopBtn.hidden = true;
     stopBtn.removeEventListener("click", stopHandler);
-    phaseEl.textContent = "执行完成";
-    setStatus("就绪");
-    sendBtn.disabled = false;
-    input.focus();
+    if (attached) {
+      phaseEl.textContent = streamFailed ? "执行出错" : streamNeedsConfirmation ? "等待方法确认" : streamCancelled ? "已停止" : "执行完成";
+      setStatus(streamFailed ? "错误" : streamNeedsConfirmation ? "等待方法确认" : streamCancelled ? "已停止" : "就绪", streamFailed ? "error" : "");
+      sendBtn.disabled = false;
+      input.focus();
+    }
     refreshSessions();
   };
 
   const handleEvent = (ev) => {
+    if (ev.type !== "start" && !isAttached()) return;
     switch (ev.type) {
       case "start":
+        if (streamState.detached || (requestedSessionId && ev.session_id !== requestedSessionId)) return;
+        streamState.sessionId = ev.session_id;
+        if (!requestSnapshot.sessionId) requestSnapshot.sessionId = ev.session_id;
         sessionId = ev.session_id;
         localStorage.setItem("dftforge_session", sessionId);
         addActivity(card, "已接收请求");
@@ -404,7 +693,7 @@ async function send() {
         addActivity(card, ev.label || "已加载会话上下文");
         break;
       case "plan":
-        stepsEl.innerHTML = "";
+        stepsEl.replaceChildren();
         phaseEl.textContent = `${ev.planner === "llm" ? "LLM" : "规则"}规划 · ${ev.steps.length} 步`;
         setChainStage(card, "plan");
         addActivity(card, `${ev.planner === "llm" ? "LLM" : "规则"} 已生成执行计划 · ${ev.steps.length} 步`, "command");
@@ -422,6 +711,7 @@ async function send() {
         setChainStage(card, "tools");
         const el = stepsEl.children[ev.index];
         if (!el) break;
+        if (ev.status === "cancelled") streamCancelled = true;
         el.className = `chain-step ${ev.status}`;
         el.querySelector(".cs-icon").textContent = STEP_ICONS[ev.status] || "·";
         if (ev.summary) el.querySelector(".cs-summary").textContent = ev.summary;
@@ -438,7 +728,7 @@ async function send() {
         break;
       }
       case "figure":
-        applyFigure(ev.viewer, ev.chart);
+        applyFigure(ev.viewer, ev.chart, ev.provenance);
         break;
       case "reply":
         setChainStage(card, "done");
@@ -448,8 +738,21 @@ async function send() {
         chat.scrollTop = chat.scrollHeight;
         break;
       case "error":
+        if (ev.code === "method_confirmation_required") {
+          streamNeedsConfirmation = true;
+          bubble.textContent = "已生成计算参数，请确认后开始运行。";
+          if (!bubble.parentNode) msgDiv.insertBefore(bubble, card);
+          addMethodContract(msgDiv, bubble, ev.method_contract, ev.method_token, requestSnapshot);
+          phaseEl.textContent = "等待方法确认";
+          chat.scrollTop = chat.scrollHeight;
+          break;
+        }
+        streamFailed = true;
         bubble.textContent = `执行出错：${ev.message || "未知错误"}`;
         if (!bubble.parentNode) msgDiv.insertBefore(bubble, card);
+        if (ev.code === "approval_required") addApprovalRetry(msgDiv, bubble, text);
+        else if (ev.code === "method_unsupported") addMethodUnsupported(bubble, ev.message);
+        else if (ev.code === "method_confirmation_expired") addMethodUnsupported(bubble, "方法确认已过期，请重新发送请求生成新的确认卡");
         phaseEl.textContent = "执行出错";
         break;
       case "done":
@@ -463,9 +766,16 @@ async function send() {
     const res = await fetch("/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text, session_id: sessionId, ...requestContext(text, approved) }),
+      body: JSON.stringify({ message: text, session_id: requestedSessionId, ...requestSnapshot.context, approved: approval.approved, method_token: frozenRequest?.methodToken }),
     });
-    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok || !res.body) {
+      const body = await res.json().catch(() => ({}));
+      const error = new Error(body.detail || `HTTP ${res.status}`);
+      error.policyCode = res.headers.get("X-DFT-Policy") || body.code || "";
+      error.methodContract = body.method_contract;
+      error.methodToken = body.method_token;
+      throw error;
+    }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";
@@ -484,12 +794,20 @@ async function send() {
       }
     }
   } catch (e) {
-    bubble.textContent = `请求失败：${e.message}`;
-    if (!bubble.parentNode) msgDiv.insertBefore(bubble, card);
-    setStatus("错误", "error");
+    streamNeedsConfirmation = e.policyCode === "method_confirmation_required";
+    streamFailed = !streamNeedsConfirmation;
+    if (isAttached()) {
+      bubble.textContent = streamNeedsConfirmation ? "已生成计算参数，请确认后开始运行。" : `请求失败：${e.message}`;
+      if (!bubble.parentNode) msgDiv.insertBefore(bubble, card);
+      if (e.policyCode === "approval_required") addApprovalRetry(msgDiv, bubble, text);
+      else if (e.policyCode === "method_confirmation_required") addMethodContract(msgDiv, bubble, e.methodContract, e.methodToken, requestSnapshot);
+      else if (e.policyCode === "method_unsupported") addMethodUnsupported(bubble, e.message);
+      else if (e.policyCode === "method_confirmation_expired") addMethodUnsupported(bubble, "方法确认已过期，请重新发送请求生成新的确认卡");
+      setStatus(streamNeedsConfirmation ? "等待方法确认" : "错误", streamNeedsConfirmation ? "" : "error");
+    }
   } finally {
     finish();
-    refreshWorkspace(sessionId);
+    if (!streamState.detached && streamState.sessionId) refreshWorkspace(streamState.sessionId);
   }
 }
 
@@ -502,6 +820,13 @@ export function initChat() {
   document.getElementById("toggleCell").addEventListener("change", (e) => toggleCellFrame(e.target.checked));
 
   window.addEventListener("dftforge:session", (event) => { sessionId = event.detail.sessionId; });
+  window.addEventListener("dftforge:running", (event) => {
+    const detail = event.detail || {};
+    if (detail.sessionId !== sessionId || activeStream) return;
+    sendBtn.disabled = Boolean(detail.running);
+    if (detail.running) setStatus(detail.cancelling ? "正在停止…" : "任务运行中…", "busy");
+    else if (statusEl.classList.contains("busy")) setStatus("就绪");
+  });
 
   Promise.all([fetch("/doctor").then((r) => r.json()), fetch("/api/config").then((r) => r.json())]).then(([doctor, cfg]) => {
     const remote = cfg.compute?.executor === "ssh";

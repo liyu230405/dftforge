@@ -74,6 +74,17 @@ class TestWebBackend:
         assert "生成标准结构" in data["reply"]
         assert data["commands"][0]["command"] == "help"
 
+    def test_chat_plan_mode_never_dispatches_tools(self):
+        r = client.post("/chat", json={
+            "message": "生成 Si 结构",
+            "execution_mode": "plan",
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["commands"] == []
+        assert data["results"] == []
+        assert "仅规划" in data["reply"]
+
     def test_chat_multi_step_structure_and_input(self):
         r = client.post("/chat", json={"message": "导入结构然后构建vc-relax输入"})
         assert r.status_code == 200

@@ -247,14 +247,39 @@ def _structure_build2d(args: dict) -> dict:
 def _structure_dope(args: dict) -> dict:
     from dft_forge.cli import cmd_structure_dope
     import argparse
+    raw_index = args.get("index")
     ns = argparse.Namespace(
         source=args.get("source", ""),
         element=args.get("element", ""),
         supercell=args.get("supercell", "2x2x2"),
-        index=int(args.get("index", 0) or 0),
+        index=int(raw_index) if raw_index is not None else None,
         output=args.get("output"),
     )
     return _call_cmd(cmd_structure_dope, ns)
+
+
+def _structure_supercell(args: dict) -> dict:
+    from dft_forge.cli import cmd_structure_supercell
+    import argparse
+    ns = argparse.Namespace(
+        source=args.get("source", ""),
+        supercell=args.get("supercell", "2x2x2"),
+        output=args.get("output"),
+    )
+    return _call_cmd(cmd_structure_supercell, ns)
+
+
+def _structure_vacancy(args: dict) -> dict:
+    from dft_forge.cli import cmd_structure_vacancy
+    import argparse
+    ns = argparse.Namespace(
+        source=args.get("source", ""),
+        element=args.get("element", ""),
+        supercell=args.get("supercell", "2x2x2"),
+        index=args.get("index"),
+        output=args.get("output"),
+    )
+    return _call_cmd(cmd_structure_vacancy, ns)
 
 
 def _structure_molecule(args: dict) -> dict:
@@ -307,6 +332,41 @@ def _thermo_formation(args: dict) -> dict:
         ref_natoms=[refs[k].get("natoms", 1) for k in refs],
     )
     return _call_cmd(cmd_thermo_formation, ns)
+
+
+def _workflow_convergence(args: dict) -> dict:
+    from dft_forge.workflows import run_convergence
+
+    return run_convergence(args)
+
+
+def _workflow_neutral_vacancy(args: dict) -> dict:
+    from dft_forge.workflows import run_neutral_vacancy
+
+    return run_neutral_vacancy(args)
+
+
+def _chemical_potential_scan(args: dict) -> dict:
+    from dft_forge.workflows import chemical_potential_scan
+
+    return chemical_potential_scan(
+        formula=args.get("formula", ""),
+        formation_energy_ev_per_formula=args.get("formation_energy_ev_per_formula"),
+        competitors=args.get("competitors"),
+        n_points=args.get("n_points", 21),
+    )
+
+
+def _workflow_magnetic_compare(args: dict) -> dict:
+    from dft_forge.workflows import run_magnetic_compare
+
+    return run_magnetic_compare(args)
+
+
+def _workflow_phonon_dfpt(args: dict) -> dict:
+    from dft_forge.workflows import run_phonon_dfpt
+
+    return run_phonon_dfpt(args)
 
 
 def _analysis_compare(args: dict) -> dict:
@@ -454,7 +514,7 @@ def register_default_tools() -> None:
             name="Build 2D Material",
             description=(
                 "Build a 2D monolayer with optional supercell, doping, vacancy, and "
-                "adsorbate on top/bridge/hollow site. Kinds: graphene, bn (h-BN), "
+                "single-atom adsorbate on top/bridge/hollow site (not molecules). Kinds: graphene, bn (h-BN), "
                 "mos2, ws2, mose2, wse2, mote2, wte2 (TMD monolayers). "
                 "Example: {kind: 'mos2', supercell: '2x2', dopants: [{index: 0, element: 'Re'}], "
                 "adsorb: {element: 'H', site: 'top'}}"
@@ -482,10 +542,12 @@ def register_default_tools() -> None:
                     "adsorb": {
                         "type": "object",
                         "properties": {
-                            "element": {"type": "string"},
+                            "element": {"type": "string", "pattern": "^[A-Z][a-z]?$", "description": "One atomic element symbol, not a molecule such as CO2"},
                             "site": {"type": "string", "enum": ["top", "bridge", "hollow"]},
                             "height": {"type": "number"},
                         },
+                        "required": ["element"],
+                        "additionalProperties": False,
                     },
                     "height": {"type": "number"},
                     "vacuum": {"type": "number"},
@@ -510,12 +572,54 @@ def register_default_tools() -> None:
                     "source": {"type": "string", "description": "material name, formula, or structure file path"},
                     "element": {"type": "string", "description": "dopant element, e.g. P"},
                     "supercell": {"type": "string", "description": "e.g. '2x2x2' (larger = lower concentration)"},
-                    "index": {"type": "integer", "description": "atom index to substitute"},
+                    "index": {"type": "integer", "description": "absolute atom index to substitute; omit for deterministic host-site selection"},
                     "output": {"type": "string"},
                 },
                 "required": ["source", "element"],
             },
             execute_fn=_structure_dope,
+        ),
+        ToolEntry(
+            id="structure.supercell",
+            name="Build Pristine Bulk Supercell",
+            description=(
+                "Create an unchanged bulk supercell for a matched pristine reference. "
+                "This is not doping and does not substitute any atom. "
+                "Example: {source: 'Si', supercell: '2x2x2'}"
+            ),
+            category="structure",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "material name, formula, or structure file path"},
+                    "supercell": {"type": "string", "description": "e.g. '2x2x2'"},
+                    "output": {"type": "string"},
+                },
+                "required": ["source"],
+            },
+            execute_fn=_structure_supercell,
+        ),
+        ToolEntry(
+            id="structure.vacancy",
+            name="Build Bulk Vacancy",
+            description=(
+                "Remove one explicitly selected atom from a bulk supercell. "
+                "This is a neutral geometric vacancy builder, not substitution and "
+                "not a charged-defect correction. Example: {source: 'MgO', element: 'O', supercell: '2x2x2'}"
+            ),
+            category="structure",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "material name, formula, or structure file path"},
+                    "element": {"type": "string", "description": "element to remove, e.g. O"},
+                    "supercell": {"type": "string", "description": "e.g. '2x2x2'"},
+                    "index": {"type": "integer", "description": "absolute atom index after supercell construction"},
+                    "output": {"type": "string"},
+                },
+                "required": ["source", "element"],
+            },
+            execute_fn=_structure_vacancy,
         ),
         ToolEntry(
             id="structure.molecule",
@@ -623,6 +727,136 @@ def register_default_tools() -> None:
                 "required": ["formula", "compound_energy", "refs"],
             },
             execute_fn=_thermo_formation,
+        ),
+        ToolEntry(
+            id="workflow.convergence",
+            name="Convergence Scan",
+            description=(
+                "Run a reproducible SCF convergence sweep over ecutwfc, k-points, "
+                "smearing/degauss, compare against the highest-cost reference, and select "
+                "the least-cost point within a meV/atom threshold."
+            ),
+            category="analysis",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "material": {"type": "string"},
+                    "structure": {"type": "string"},
+                    "ecutwfc_values": {"type": "array", "items": {"type": "number"}},
+                    "kpoints_values": {"type": "array"},
+                    "smearing_values": {"type": "array", "items": {"type": "string"}},
+                    "degauss_values": {"type": "array", "items": {"type": "number"}},
+                    "threshold_mev_per_atom": {"type": "number"},
+                    "max_jobs": {"type": "integer"},
+                    "conv_thr": {"type": "number"},
+                    "workdir": {"type": "string"},
+                },
+                "required": [],
+            },
+            execute_fn=_workflow_convergence,
+        ),
+        ToolEntry(
+            id="workflow.neutral_vacancy",
+            name="Neutral Vacancy Formation",
+            description=(
+                "Build a matched pristine/vacancy bulk supercell, optionally relax the "
+                "neutral defect at fixed cell, run SCF energies, and compute "
+                "Edef-Ebulk+mu_removed. chemical_potential must be explicit."
+            ),
+            category="analysis",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string"},
+                    "element": {"type": "string"},
+                    "supercell": {"type": "string"},
+                    "index": {"type": "integer"},
+                    "charge": {"type": "integer"},
+                    "relax": {"type": "boolean"},
+                    "chemical_potential_ry": {"type": "number"},
+                    "chemical_potential_ev": {"type": "number"},
+                    "ecutwfc": {"type": "number"},
+                    "ecutrho": {"type": "number"},
+                    "kpoints": {"type": "array", "items": {"type": "integer"}},
+                    "conv_thr": {"type": "number"},
+                    "workdir": {"type": "string"},
+                },
+                "required": ["source", "element"],
+            },
+            execute_fn=_workflow_neutral_vacancy,
+        ),
+        ToolEntry(
+            id="thermo.chemical_potential_scan",
+            name="Chemical Potential Scan",
+            description=(
+                "Compute binary/ternary chemical-potential stability domains from the "
+                "parent formation energy, elemental bounds, and supplied competing phases. "
+                "Without an exhaustive competitor list the result is partial."
+            ),
+            category="analysis",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "formula": {"type": "string"},
+                    "formation_energy_ev_per_formula": {"type": "number"},
+                    "competitors": {"type": "array", "items": {"type": "object"}},
+                    "n_points": {"type": "integer"},
+                },
+                "required": ["formula", "formation_energy_ev_per_formula"],
+            },
+            execute_fn=_chemical_potential_scan,
+        ),
+        ToolEntry(
+            id="workflow.magnetic_compare",
+            name="Magnetic State Comparison",
+            description=(
+                "Run collinear NM/FM/AFM pw.x SCF states with explicit initial moments and "
+                "compare total/per-atom energies and realized atom magnetizations."
+            ),
+            category="analysis",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "material": {"type": "string"},
+                    "structure": {"type": "string"},
+                    "supercell": {"type": "string"},
+                    "magnetic_element": {"type": "string"},
+                    "orders": {"type": "array", "items": {"type": "string", "enum": ["NM", "FM", "AFM", "nm", "fm", "afm"]}},
+                    "initial_moment_muB": {"type": "number"},
+                    "ecutwfc": {"type": "number"},
+                    "kpoints": {"type": "array", "items": {"type": "integer"}},
+                    "conv_thr": {"type": "number"},
+                    "workdir": {"type": "string"},
+                },
+                "required": [],
+            },
+            execute_fn=_workflow_magnetic_compare,
+        ),
+        ToolEntry(
+            id="workflow.phonon_dfpt",
+            name="Phonon DFPT Workflow",
+            description=(
+                "Run pre-relaxation, SCF, ph.x on a regular q-grid, q2r.x, and matdyn.x "
+                "phonon DOS; parse frequencies and identify imaginary modes."
+            ),
+            category="analysis",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "material": {"type": "string"},
+                    "structure": {"type": "string"},
+                    "q_grid": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 3, "maxItems": 3},
+                    "relax": {"type": "boolean"},
+                    "ecutwfc": {"type": "number"},
+                    "kpoints": {"type": "array", "items": {"type": "integer"}},
+                    "conv_thr": {"type": "number"},
+                    "tr2_ph": {"type": "number"},
+                    "imaginary_threshold_thz": {"type": "number"},
+                    "workdir": {"type": "string"},
+                },
+                "required": [],
+            },
+            execute_fn=_workflow_phonon_dfpt,
         ),
         ToolEntry(
             id="structure.import",
@@ -785,6 +1019,43 @@ def register_default_tools() -> None:
             execute_fn=_doctor,
         ),
     ]
+
+    # Keep the effect/semantic contract next to the built-in registry.  The
+    # planner sees the same metadata and the registry can enforce it for
+    # callers that bypass AgentLoop.
+    metadata = {
+        "structure.generate": ("workspace_write", "build a standard crystal structure", []),
+        "structure.build2d": ("workspace_write", "build a 2D cell with optional substitution/vacancy/adsorption", []),
+        "structure.dope": ("workspace_write", "bulk elemental substitution; not vacancy or pristine copying", []),
+        "structure.supercell": ("workspace_write", "copy a bulk structure into an unchanged matched supercell", []),
+        "structure.vacancy": ("workspace_write", "remove one selected bulk atom; neutral geometry only", []),
+        "structure.molecule": ("workspace_write", "build a boxed gas-phase molecule", []),
+        "structure.reference": ("workspace_write", "build a conventional elemental reference phase", []),
+        "structure.import": ("workspace_write", "read and normalize a user-provided structure", []),
+        "structure.analyze": ("workspace_write", "analyze an existing structure; may write a report", []),
+        "input.build": ("workspace_write", "compile a deterministic QE input file", []),
+        "job.submit": ("external_execution", "submit or run a QE calculation", []),
+        "job.status": ("read_only", "inspect a job status", []),
+        "result.parse": ("workspace_write", "parse an existing QE result", []),
+        "result.verify": ("workspace_write", "verify an existing parsed result; may write a report", []),
+        "ledger.query": ("read_only", "query the evidence ledger", []),
+        "doctor": ("read_only", "inspect the local compute environment", []),
+        "analysis.compare": ("read_only", "compare already-computed results", []),
+        "thermo.eads": ("read_only", "reduce three named SCF energies into adsorption energy", ["ry_a", "ry_s", "ry_m"]),
+        "thermo.formation": ("read_only", "reduce a compound energy and elemental references into formation energy", ["compound_energy", "refs"]),
+        "workflow.convergence": ("external_execution", "run a bounded SCF parameter sweep and select a converged point", []),
+        "workflow.neutral_vacancy": ("external_execution", "run matched pristine/neutral-vacancy energies and reduce formation energy", []),
+        "thermo.chemical_potential_scan": ("read_only", "solve elemental and supplied competing-phase chemical-potential constraints", []),
+        "workflow.magnetic_compare": ("external_execution", "run collinear NM/FM/AFM pw.x states and compare realized magnetism", []),
+        "workflow.phonon_dfpt": ("external_execution", "run ph.x/q2r.x/matdyn.x DFPT and verify frequencies", []),
+    }
+    for tool in tools:
+        side_effect, contract, deferred = metadata.get(
+            tool.id, (tool.side_effect, tool.semantic_contract, tool.deferred_inputs)
+        )
+        tool.side_effect = side_effect
+        tool.semantic_contract = contract
+        tool.deferred_inputs = list(deferred)
 
     for tool in tools:
         registry.register(tool)

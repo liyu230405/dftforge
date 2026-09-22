@@ -17,6 +17,13 @@ VALID_CATEGORIES = frozenset({
     "general", "structure", "input", "job", "result", "ledger",
 })
 
+# Tool effects are part of the execution contract, not merely UI metadata.
+# Unknown effects fail closed in plan-only mode and in future authorization
+# layers, while keeping ordinary registry calls backwards compatible.
+VALID_SIDE_EFFECTS = frozenset({
+    "read_only", "workspace_write", "external_execution", "unknown",
+})
+
 
 def validate_tool_id(tool_id: str) -> bool:
     return bool(_VALID_ID.match(tool_id))
@@ -44,12 +51,22 @@ class ToolEntry:
     output_type: str = "json"
     trust: str = "builtin"
     permissions: list[str] = field(default_factory=list)
+    side_effect: str = "unknown"
+    semantic_contract: str = ""
+    deferred_inputs: list[str] = field(default_factory=list)
     source: str = "code"
     path: Optional[Path] = None
     execute_fn: Optional[Callable] = field(default=None, repr=False)
     extra_fns: dict[str, Callable] = field(default_factory=dict, repr=False)
     frontend: Optional[dict] = None
     enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if self.side_effect not in VALID_SIDE_EFFECTS:
+            raise ValueError(
+                f"Invalid side_effect for {self.id}: {self.side_effect!r}; "
+                f"expected one of {sorted(VALID_SIDE_EFFECTS)}"
+            )
 
     def to_dict(self) -> dict:
         return {
@@ -63,6 +80,9 @@ class ToolEntry:
             "output_type": self.output_type,
             "trust": self.trust,
             "permissions": self.permissions,
+            "side_effect": self.side_effect,
+            "semantic_contract": self.semantic_contract,
+            "deferred_inputs": self.deferred_inputs,
             "enabled": self.enabled,
             "source": self.source,
         }

@@ -324,6 +324,50 @@ def cmd_structure_dope(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_structure_supercell(args: argparse.Namespace) -> int:
+    """structure supercell: unchanged bulk structure → CIF."""
+    from ase.io import write as ase_write
+
+    from dft_forge.structure_builder import StructureBuildError, supercell_3d
+
+    try:
+        result = supercell_3d(args.source, supercell=args.supercell)
+    except (StructureBuildError, ValueError, FileNotFoundError) as exc:
+        return _error_response(str(exc))
+    output_path = Path(args.output) if args.output else Path.cwd() / f"supercell_{args.supercell}.cif"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ase_write(str(output_path), result.atoms)
+    data = result.to_dict()
+    data.update({"command": "structure.supercell", "ok": True, "source": args.source, "output": str(output_path)})
+    print(_json_dumps(data))
+    return 0
+
+
+def cmd_structure_vacancy(args: argparse.Namespace) -> int:
+    """structure vacancy: remove one selected atom from a bulk supercell."""
+    from ase.io import write as ase_write
+
+    from dft_forge.structure_builder import StructureBuildError, vacancy_3d
+
+    try:
+        result = vacancy_3d(
+            args.source, args.element, supercell=args.supercell, index=args.index,
+        )
+    except (StructureBuildError, ValueError, FileNotFoundError) as exc:
+        return _error_response(str(exc))
+    output_path = Path(args.output) if args.output else Path.cwd() / f"vacancy_{args.element}_{args.supercell}.cif"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ase_write(str(output_path), result.atoms)
+    data = result.to_dict()
+    data.update({
+        "command": "structure.vacancy", "ok": True, "source": args.source,
+        "element": args.element, "index": data.get("selected_index", args.index),
+        "output": str(output_path),
+    })
+    print(_json_dumps(data))
+    return 0
+
+
 def cmd_structure_molecule(args: argparse.Namespace) -> int:
     """structure molecule: gas-phase molecule in a box → CIF."""
     from ase.io import write as ase_write
@@ -1088,6 +1132,18 @@ def main() -> int:
     dop.add_argument("--index", type=int, default=0, help="Atom index to substitute in the supercell")
     dop.add_argument("--output", default=None, help="Output CIF path")
 
+    sup = struct_sub.add_parser("supercell", help="Build an unchanged bulk supercell")
+    sup.add_argument("source", help="Material name, formula, or CIF/POSCAR path")
+    sup.add_argument("--supercell", default="2x2x2", help="Supercell spec, e.g. 2x2x2")
+    sup.add_argument("--output", default=None, help="Output CIF path")
+
+    vac = struct_sub.add_parser("vacancy", help="Remove one atom from a bulk supercell")
+    vac.add_argument("source", help="Material name, formula, or CIF/POSCAR path")
+    vac.add_argument("element", help="Element to remove, e.g. O")
+    vac.add_argument("--supercell", default="2x2x2", help="Supercell spec, e.g. 2x2x2")
+    vac.add_argument("--index", type=int, default=None, help="Absolute atom index after supercell construction")
+    vac.add_argument("--output", default=None, help="Output CIF path")
+
     ana = struct_sub.add_parser("analyze", help="Analyze structure: formula, cell, bonds, angles, coordination, space group")
     ana.add_argument("source", help="Path to structure file or inline content")
     ana.add_argument("--format", default=None, choices=["cif", "poscar", "xyz", "qe_input", "explicit"])
@@ -1236,6 +1292,10 @@ def main() -> int:
                 return cmd_structure_build2d(args)
             if args.structure_command == "dope":
                 return cmd_structure_dope(args)
+            if args.structure_command == "supercell":
+                return cmd_structure_supercell(args)
+            if args.structure_command == "vacancy":
+                return cmd_structure_vacancy(args)
             if args.structure_command == "analyze":
                 return cmd_structure_analyze(args)
             if args.structure_command == "molecule":
