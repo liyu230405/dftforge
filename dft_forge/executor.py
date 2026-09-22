@@ -234,6 +234,15 @@ class FakeExecutor(Executor):
     def run_projwfc_x(self, input_file: Path, workdir: Path, timeout: float | None = None) -> JobResult:
         return self.run_pw(input_file, workdir, timeout=timeout)
 
+    def run_ph_x(self, input_file: Path, workdir: Path, timeout: float | None = None) -> JobResult:
+        return self.run_pw(input_file, workdir, timeout=timeout)
+
+    def run_q2r_x(self, input_file: Path, workdir: Path, timeout: float | None = None) -> JobResult:
+        return self.run_pw(input_file, workdir, timeout=timeout)
+
+    def run_matdyn_x(self, input_file: Path, workdir: Path, timeout: float | None = None) -> JobResult:
+        return self.run_pw(input_file, workdir, timeout=timeout)
+
 
 # ── LocalExecutor ──────────────────────────────────────────────────────────────
 
@@ -338,6 +347,15 @@ class LocalExecutor(Executor):
 
     def run_projwfc_x(self, input_file: Path, workdir: Path, timeout: float | None = None) -> JobResult:
         return self._run_tool("projwfc.x", input_file, workdir, timeout=timeout)
+
+    def run_ph_x(self, input_file: Path, workdir: Path, timeout: float | None = None) -> JobResult:
+        return self._run_tool("ph.x", input_file, workdir, timeout=timeout)
+
+    def run_q2r_x(self, input_file: Path, workdir: Path, timeout: float | None = None) -> JobResult:
+        return self._run_tool("q2r.x", input_file, workdir, timeout=timeout)
+
+    def run_matdyn_x(self, input_file: Path, workdir: Path, timeout: float | None = None) -> JobResult:
+        return self._run_tool("matdyn.x", input_file, workdir, timeout=timeout)
 
     def _run_tool(self, binary: str, input_file: Path, workdir: Path, timeout: float | None = None) -> JobResult:
         workdir = Path(workdir).resolve()
@@ -457,7 +475,10 @@ class LocalExecutor(Executor):
             for f in sorted(save_dir.iterdir()):
                 if f.is_file():
                     files.append(str(f))
-        for ext in ["xml", "out", "bands.dat", "dos.dat", "proj.dat", "pdos.dat"]:
+        for ext in [
+            "xml", "out", "bands.dat", "dos.dat", "proj.dat", "pdos.dat",
+            "dyn", "dyn1", "fc", "freq", "phdos", "modes",
+        ]:
             f = workdir / f"{prefix}.{ext}"
             if f.exists():
                 files.append(str(f))
@@ -648,12 +669,19 @@ class SSHExecutor(Executor):
         if sched_id and self.scheduler_adapter is not None:
             ok, _msg = self.scheduler_adapter.cancel_job(sched_id)
         else:
-            # direct mode: kill whatever is still running inside the job dir
-            # ('; true' keeps the exit code clean when nothing matches)
-            self._run_remote(f"pkill -f {shlex.quote(handle.remote_path)}; true")
-            ok = True
+            # direct mode: kill whatever is still running inside the job dir.
+            # The remote QE process carries that dir in its cmdline (see
+            # _run_direct), so the pattern really reaches it; killing only the
+            # ssh wrapper would leave pw.x running on the cluster.
+            # ('; true' keeps the exit code clean when nothing matches.)
+            res = self._run_remote(f"pkill -f {shlex.quote(handle.remote_path)}; true")
+            ok = res.ok
+        if not ok:
+            # the cancel never reached the remote side (transport failure):
+            # keep the recorded state honest instead of pretending it stopped
+            return False
         record["state"] = "cancelled"
-        return bool(ok)
+        return True
 
     def cancel_all(self) -> int:
         """Cancel every live job (web stop-button chain)."""
@@ -677,6 +705,15 @@ class SSHExecutor(Executor):
 
     def run_projwfc_x(self, input_file: Path, workdir: Path, timeout: float | None = None) -> JobResult:
         return self._run_remote_tool("projwfc.x", input_file, workdir, timeout)
+
+    def run_ph_x(self, input_file: Path, workdir: Path, timeout: float | None = None) -> JobResult:
+        return self._run_remote_tool("ph.x", input_file, workdir, timeout)
+
+    def run_q2r_x(self, input_file: Path, workdir: Path, timeout: float | None = None) -> JobResult:
+        return self._run_remote_tool("q2r.x", input_file, workdir, timeout)
+
+    def run_matdyn_x(self, input_file: Path, workdir: Path, timeout: float | None = None) -> JobResult:
+        return self._run_remote_tool("matdyn.x", input_file, workdir, timeout)
 
     def _run_remote_tool(self, binary: str, input_file: Path, workdir: Path, timeout: float | None = None) -> JobResult:
         input_file = Path(input_file).resolve()
@@ -745,7 +782,22 @@ class SSHExecutor(Executor):
                 success=False, exit_code=-1, walltime_sec=time.time() - start,
                 error_message=f"download failed: {exc}", remote_path=remote_dir,
             )
-        stdout = self._read_local(workdir / f"{input_file.stem}.out")
+        stdout_path = workdir / f"{input_file.stem}.out"
+        if not stdout_path.exists():
+            # every remote run redirects stdout to <stem>.out, so a missing
+            # file means the transport lost the result. Reporting success with
+            # empty stdout is the worst failure mode here: the parsers would
+            # hand back empty bands/DOS as if the calculation had produced them.
+            record["state"] = "failed"
+            return JobResult(
+                success=False, exit_code=-1, walltime_sec=time.time() - start,
+                output_files=files, remote_path=remote_dir,
+                error_message=(
+                    f"no {input_file.stem}.out retrieved from remote host "
+                    f"({len(files)} other files downloaded)"
+                ),
+            )
+        stdout = self._read_local(stdout_path)
         stderr = self._read_local(workdir / f"{input_file.stem}.err")
         record["state"] = "completed"
         return JobResult(
@@ -801,17 +853,24 @@ class SSHExecutor(Executor):
         res = self._run_remote(
             f"tar -C {shlex.quote(remote_dir)} -cf - . 2>/dev/null | base64", timeout=300.0
         )
-        if not res.ok or not res.stdout.strip():
-            return []
+        if not res.ok:
+            # a failed download must never look like "the job produced nothing"
+            raise RuntimeError(
+                f"remote tar failed: {res.stderr.strip()[:200] or f'exit {res.exit_code}'}"
+            )
+        if not res.stdout.strip():
+            return []  # genuinely empty job dir
         try:
             payload = base64.b64decode(res.stdout.strip())
-        except (binascii.Error, ValueError):
-            return []
+        except (binascii.Error, ValueError) as exc:
+            raise RuntimeError(f"remote archive was not valid base64: {exc}") from exc
         proc = subprocess.run(
             ["tar", "-C", str(destination), "-xf", "-"], input=payload, capture_output=True
         )
         if proc.returncode != 0:
-            return []
+            raise RuntimeError(
+                f"local untar failed: {proc.stderr.decode(errors='replace')[:200]}"
+            )
         return [str(p) for p in sorted(destination.rglob("*")) if p.is_file()]
 
     @staticmethod
@@ -825,18 +884,31 @@ class SSHExecutor(Executor):
 
         walltime = int(timeout or self.max_walltime_sec)
         stem = Path(input_name).stem
+        # The input is addressed by ABSOLUTE path so the running QE process
+        # carries the job dir in its own cmdline — that is what lets
+        # cancel()'s `pkill -f <job dir>` reach pw.x. With a relative
+        # `-in file.in` the process cmdline holds no job dir and the kill
+        # silently misses, leaving the calculation running on the cluster.
+        # `cd` stays because QE writes its .save directory relative to CWD.
+        remote_input = f"{remote_dir}/{input_name}"
         cmd = (
             f"cd {shlex.quote(remote_dir)} && "
             f"timeout {walltime} {shlex.quote(self.qe_bin_dir + '/' + binary)} "
-            f"-in {shlex.quote(input_name)} > {shlex.quote(stem)}.out "
+            f"-in {shlex.quote(remote_input)} > {shlex.quote(stem)}.out "
             f"2> {shlex.quote(stem)}.err; echo DFTFORGE_EXIT_$?"
         )
         # remote walltime + transfer margin for the ssh call itself
         res = self._run_remote(cmd, timeout=walltime + 120)
-        exit_code = 0
         m = re.search(r"DFTFORGE_EXIT_(-?\d+)", res.stdout)
-        if m:
-            exit_code = int(m.group(1))
+        if m is None:
+            # The marker is the remote shell's own report after the job
+            # returned. Its absence means the transport failed (ssh timeout,
+            # dropped connection, unreachable host), NOT that a program
+            # exited 0: defaulting to 0 here turned dead ssh sessions into
+            # "successful" runs with empty output.
+            detail = res.stderr.strip() or "no DFTFORGE_EXIT marker in remote output"
+            return CommandResult(-1, stdout=res.stdout, stderr=f"ssh transport failed: {detail}")
+        exit_code = int(m.group(1))
         stderr = res.stderr
         # timeout(1) exits 124 when the walltime kills the binary
         if exit_code == 124:

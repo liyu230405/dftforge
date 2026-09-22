@@ -7,7 +7,7 @@ import logging
 import sqlite3
 import threading
 import time
-from contextlib import closing
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional
 
@@ -17,6 +17,38 @@ from dft_forge.runtime.states import NodeState, RunState, TERMINAL_RUN_STATES
 
 logger = logging.getLogger(__name__)
 
+_SQLITE_MUTEX = threading.RLock()
+
+
+@contextmanager
+def sqlite_connection(path: Path, *, read_only: bool = False, timeout: float = 30):
+    """Open one SQLite connection under the process-wide state-store mutex.
+
+    The mutex deliberately spans connection creation, all caller work,
+    commit/rollback, and close.  This avoids sqlite's native mutex deadlocks
+    when multiple store instances in one process open the same database.
+    """
+    db_path = Path(path)
+    conn = None
+    with _SQLITE_MUTEX:
+        try:
+            if read_only:
+                conn = sqlite3.connect(
+                    f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=timeout
+                )
+            else:
+                conn = sqlite3.connect(db_path, timeout=timeout)
+            yield conn
+            if not read_only:
+                conn.commit()
+        except Exception:
+            if conn is not None and not read_only:
+                conn.rollback()
+            raise
+        finally:
+            if conn is not None:
+                conn.close()
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS graph_runs (
     id TEXT PRIMARY KEY,
@@ -25,6 +57,10 @@ CREATE TABLE IF NOT EXISTS graph_runs (
     data TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS graph_run_templates (
+    run_id TEXT PRIMARY KEY,
+    template_json TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS node_runs (
     run_id TEXT NOT NULL,
@@ -43,50 +79,75 @@ class SQLiteStateStore:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
-        with closing(self._connect()) as conn, conn:
+        with sqlite_connection(self.path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_SCHEMA)
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL")
-        return conn
+    def connection(self, *, read_only: bool = False, timeout: float = 30):
+        """Instance convenience wrapper around :func:`sqlite_connection`."""
+        return sqlite_connection(self.path, read_only=read_only, timeout=timeout)
 
     # ── Graph runs ───────────────────────────────────────────────────────────
 
-    def save_run(self, run: GraphRun) -> None:
+    def save_run(self, run: GraphRun, template: Optional[GraphTemplate] = None) -> None:
         run.touch()
         data = {
             "inputs": run.inputs,
+            "metadata": run.metadata,
             "created_at": run.created_at,
             "updated_at": run.updated_at,
         }
-        with self._lock, closing(self._connect()) as conn, conn:
+        with self.connection() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO graph_runs (id, template_id, status, data, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (run.run_id, run.template_id, run.state.value, json.dumps(data),
                  str(run.created_at), str(run.updated_at)),
             )
+            if template is not None:
+                conn.execute(
+                    "INSERT OR IGNORE INTO graph_run_templates (run_id, template_json) VALUES (?, ?)",
+                    (run.run_id, json.dumps(template.to_dict())),
+                )
 
-    def load_run(self, run_id: str, template: GraphTemplate) -> Optional[GraphRun]:
-        with closing(self._connect()) as conn:
+    def template_for(self, run_id: str) -> Optional[GraphTemplate]:
+        """Return the immutable template snapshot for a run, if available.
+
+        Runs created before snapshots were introduced deliberately return
+        ``None`` so the engine can fall back to its registered template.
+        A present but corrupt snapshot raises instead of silently selecting a
+        different DAG.
+        """
+        with self.connection() as conn:
             row = conn.execute(
-                "SELECT id, template_id, status, data FROM graph_runs WHERE id = ?", (run_id,)
+                "SELECT template_json FROM graph_run_templates WHERE run_id = ?", (run_id,)
             ).fetchone()
         if row is None:
             return None
-        _, _, status, data = row
-        payload = json.loads(data)
-        run = GraphRun(
-            run_id=row[0],
-            template_id=row[1],
-            state=RunState(status),
-            inputs=payload.get("inputs", {}),
-            created_at=float(payload.get("created_at", time.time())),
-            updated_at=float(payload.get("updated_at", time.time())),
-        )
-        with closing(self._connect()) as conn:
+        try:
+            return GraphTemplate.from_dict(json.loads(row[0]))
+        except (TypeError, ValueError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+            logger.warning("invalid template snapshot for run %s", run_id)
+            raise ValueError(f"invalid template snapshot for run '{run_id}'") from exc
+
+    def load_run(self, run_id: str, template: GraphTemplate) -> Optional[GraphRun]:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT id, template_id, status, data FROM graph_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            _, _, status, data = row
+            payload = json.loads(data)
+            run = GraphRun(
+                run_id=row[0],
+                template_id=row[1],
+                state=RunState(status),
+                inputs=payload.get("inputs", {}),
+                metadata=payload.get("metadata", {}),
+                created_at=float(payload.get("created_at", time.time())),
+                updated_at=float(payload.get("updated_at", time.time())),
+            )
             node_rows = conn.execute(
                 "SELECT node_id, status, data FROM node_runs WHERE run_id = ?", (run_id,)
             ).fetchall()
@@ -101,6 +162,19 @@ class SQLiteStateStore:
                 attempt=d.get("attempt", 0),
                 repair_attempts=d.get("repair_attempts", 0),
                 params=d.get("params", {}),
+                # New records persist this explicitly.  For legacy records,
+                # only a dispatched/finished state proves params were bound;
+                # PENDING/BLOCKED/SKIPPED remain unresolved conservatively.
+                params_resolved=bool(d["params_resolved"])
+                if "params_resolved" in d
+                else node_status in {
+                    NodeState.READY.value,
+                    NodeState.RUNNING.value,
+                    NodeState.REPAIRING.value,
+                    NodeState.SUCCEEDED.value,
+                    NodeState.FAILED.value,
+                    NodeState.CANCELLED.value,
+                },
                 outputs=d.get("outputs", {}),
                 error=d.get("error"),
                 job_id=d.get("job_id"),
@@ -113,7 +187,7 @@ class SQLiteStateStore:
     def list_runs(self) -> List[dict]:
         # updated_at is stored as a float string — ORDER BY TEXT would sort
         # "9.5" after "10.5"; cast to REAL for numeric ordering
-        with closing(self._connect()) as conn:
+        with self.connection() as conn:
             rows = conn.execute(
                 "SELECT id, template_id, status, updated_at FROM graph_runs "
                 "ORDER BY CAST(updated_at AS REAL) DESC"
@@ -121,7 +195,7 @@ class SQLiteStateStore:
         return [{"run_id": r[0], "template_id": r[1], "status": r[2], "updated_at": r[3]} for r in rows]
 
     def template_id_for(self, run_id: str) -> Optional[str]:
-        with closing(self._connect()) as conn:
+        with self.connection() as conn:
             row = conn.execute(
                 "SELECT template_id FROM graph_runs WHERE id = ?", (run_id,)
             ).fetchone()
@@ -135,13 +209,14 @@ class SQLiteStateStore:
             "attempt": node.attempt,
             "repair_attempts": node.repair_attempts,
             "params": node.params,
+            "params_resolved": node.params_resolved,
             "outputs": node.outputs,
             "error": node.error,
             "job_id": node.job_id,
             "workdir": node.workdir,
             "updated_at": node.updated_at,
         }
-        with self._lock, closing(self._connect()) as conn, conn:
+        with self.connection() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO node_runs (run_id, node_id, status, data, updated_at) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -154,8 +229,9 @@ class SQLiteStateStore:
         """Load a run and reset in-flight nodes for rescheduling.
 
         Succeeded nodes keep their outputs (idempotent skip). Nodes that were
-        Running/Ready/Repairing when the process died go back to Pending so the
-        scheduler re-dispatches them. Terminal run states are returned as-is.
+        Running/Ready/Repairing when the process died, or Cancelled by a
+        deliberate pause, go back to Pending so the scheduler re-dispatches
+        them. Terminal run states are returned as-is.
         """
         run = self.load_run(run_id, template)
         if run is None:
@@ -163,12 +239,21 @@ class SQLiteStateStore:
         if run.state in TERMINAL_RUN_STATES:
             return run
         for node in run.nodes.values():
-            if node.state in (NodeState.RUNNING, NodeState.READY, NodeState.REPAIRING):
+            reset_blocked = run.state == RunState.PAUSED and node.state == NodeState.BLOCKED
+            if node.state in (
+                NodeState.RUNNING,
+                NodeState.READY,
+                NodeState.REPAIRING,
+                NodeState.CANCELLED,
+            ) or reset_blocked:
                 # deliberate direct assignment: crash recovery resets
                 # in-flight states that the normal transition table forbids
                 node.state = NodeState.PENDING
+                self.save_node_run(run, node)
             self._warn_broken_symlinks(node)
         run.state = RunState.VALIDATED
+        # The snapshot was validated by the engine before this method is
+        # called; leave the immutable row untouched and only persist state.
         self.save_run(run)
         return run
 
