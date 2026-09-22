@@ -35,6 +35,45 @@ class RulePlanner:
         lower = message.lower()
         steps: List[Dict[str, Any]] = []
 
+        # These are high-level deterministic workflows.  A fallback planner
+        # should select the same registered macro as the LLM planner instead
+        # of degrading to an obsolete "unsupported" help message.
+        if sig.wants_phonon:
+            return [{
+                "tool": "workflow.phonon_dfpt",
+                "args": {"material": sig.formula_hint or sig.material_hint or "MgO", "q_grid": [2, 2, 2]},
+                "description": "运行预弛豫→SCF→ph.x→q2r.x→matdyn.x，并检查 q 网格声子虚频",
+            }]
+        if sig.wants_magnetism:
+            return [{
+                "tool": "workflow.magnetic_compare",
+                "args": {"material": sig.formula_hint or sig.material_hint or "Fe", "orders": ["NM", "FM", "AFM"]},
+                "description": "分别运行 NM/FM/AFM 的自旋极化 pw.x SCF，并比较能量和磁矩",
+            }]
+        if sig.wants_convergence:
+            return [{
+                "tool": "workflow.convergence",
+                "args": {"material": sig.formula_hint or sig.material_hint or "Si"},
+                "description": "扫描 ecutwfc/k 点并按 meV/atom 阈值选择最低成本收敛点",
+            }]
+
+        if sig.wants_vacancy and sig.wants_formation:
+            return [{
+                "tool": "workflow.neutral_vacancy",
+                "args": {
+                    "source": sig.formula_hint or sig.material_hint or "MgO",
+                    "element": sig.vacancy_el or "O",
+                    "supercell": "2x2x2",
+                },
+                "description": "构建匹配的中性空位/纯相超胞并计算形成能；化学势必须由用户显式提供",
+            }]
+
+        if sig.wants_chemical_potential:
+            return [{
+                "tool": "help", "args": {"topic": "chemical_potential"},
+                "description": "化学势扫描需要显式提供母相形成能（eV/化学式）和可用竞争相形成能，拒绝猜测这些输入。",
+            }]
+
         # ── comparison intent: session ledger first, never a dead end ──
         if sig.wants_compare:
             ledger = ctx.get("ledger") or []
@@ -43,6 +82,38 @@ class RulePlanner:
                 else "band_gap" if any(k in lower for k in ("能带", "带隙", "带结构", "band"))
                 else "auto"
             )
+            # A doped-vs-pristine comparison needs a like-sized pristine
+            # control.  Do not manufacture it with same-element dope.
+            if sig.dopant_el and sig.formula_hint and sig.graph_targets:
+                target = sig.graph_targets[0]
+                label = {"t2_bands": "能带结构", "t2_dos": "态密度", "t1_vc_relax": "结构优化"}.get(target, target)
+                return [
+                    {
+                        "tool": "structure.dope",
+                        "args": {"source": sig.formula_hint, "element": sig.dopant_el, "supercell": "2x2x2"},
+                        "description": f"构建 {sig.dopant_el} 掺杂 {sig.formula_hint} 的 2x2x2 超胞",
+                    },
+                    {
+                        "tool": "graph.run",
+                        "args": {"template_id": target, "inputs": {}},
+                        "description": f"计算掺杂体系的{label}",
+                    },
+                    {
+                        "tool": "structure.supercell",
+                        "args": {"source": sig.formula_hint, "supercell": "2x2x2"},
+                        "description": f"构建同尺寸纯 {sig.formula_hint} 对照超胞",
+                    },
+                    {
+                        "tool": "graph.run",
+                        "args": {"template_id": target, "inputs": {}},
+                        "description": f"计算纯 {sig.formula_hint} 对照的{label}",
+                    },
+                    {
+                        "tool": "analysis.compare",
+                        "args": {"use_last": 2, "metric": metric},
+                        "description": "比较同尺寸掺杂与纯体系结果",
+                    },
+                ]
             if len(ledger) >= 2:
                 return [
                     {"tool": "analysis.compare",

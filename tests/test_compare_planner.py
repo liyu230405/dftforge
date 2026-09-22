@@ -130,6 +130,13 @@ class _RecordingRegistry:
             register_default_tools()
         return real_registry.list_all()
 
+    def get(self, tool_id: str):
+        from dft_forge.tools.definitions import register_default_tools
+        from dft_forge.tools.registry import registry as real_registry
+        if not real_registry._tools:
+            register_default_tools()
+        return real_registry.get(tool_id)
+
     async def call(self, tool_id: str, arguments: dict, **kwargs):
         self.calls.append({"tool": tool_id, "args": dict(arguments)})
         payload = self.payloads.get(tool_id, {})

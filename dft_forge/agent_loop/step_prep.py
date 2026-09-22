@@ -69,11 +69,57 @@ def prepare_step_args(
     node_log: List[Dict[str, Any]],
     emit: Callable[[Dict[str, Any]], None],
     idx: int,
+    method: Optional[Dict[str, Any]] = None,
+    structure_outputs: Optional[Dict[int, str]] = None,
 ) -> Optional[str]:
     """Inject session paths / chained context into step args in place.
 
     Returns an error string when the step must be aborted before execution.
     """
+    args.pop("_method_contract", None)
+    if method:
+        structure_input = method["step"].get("structure_input") or {}
+        producer = structure_input.get("from_step")
+        if producer is not None:
+            source = (structure_outputs or {}).get(producer)
+            if (not source or not Path(source).is_file() or Path(source).is_symlink()
+                    or not Path(source).resolve().is_relative_to(session_dir.resolve())):
+                return f"确认方法要求使用第 {producer + 1} 步生成的结构，但该步骤未成功产生文件；拒绝回退到其他结构"
+            if tool_id == "graph.run":
+                args.setdefault("inputs", {})["structure"] = source
+                args["inputs"].pop("material", None)
+            elif tool_id == "input.build":
+                args["structure"] = source
+        bindings = method["step"]["applied"]
+        target = args.setdefault("inputs", {}) if tool_id == "graph.run" else args
+        for key in method["step"].get("strip_planner_parameters", []):
+            target.pop(key, None)
+        target.update(bindings)
+        policy = method["step"].get("auto_parameter_policy")
+        if policy:
+            from dft_forge.compiler.qe_parameters import resolve_qe_parameters
+            from dft_forge.agent_loop.method_contract import _file_identity
+
+            try:
+                before = _file_identity(target.get("structure"), session_dir)
+                recommendation = resolve_qe_parameters(
+                    structure=target.get("structure"), material=target.get("material"),
+                    accuracy=policy["accuracy"], overrides=policy["overrides"], task=policy["task"],
+                )
+                after = _file_identity(target.get("structure"), session_dir)
+                if before != after:
+                    return "生成结构在参数解析期间发生变化，请重新预览"
+            except (ValueError, OSError, KeyError, TypeError) as exc:
+                return f"生成结构的参数解析失败：{exc}"
+            resolved = {k: v for k, v in recommendation["parameters"].items() if k in policy["supported"]}
+            target.update(resolved)
+            method["step"]["recommendation"] = recommendation
+            method["step"]["effective"].update(resolved)
+            method["step"]["applied"].update(resolved)
+            method["step"]["resolved_structure_input"] = after
+            method["step"]["parameter_repair"] = "require_new_confirmation"
+        if tool_id == "graph.run" or tool_id.startswith("workflow."):
+            args["_method_contract"] = method
     if tool_id == "structure.import":
         args["output"] = str(session_dir / "structure.json")
     elif tool_id == "structure.generate":
@@ -87,6 +133,15 @@ def prepare_step_args(
         src = re.sub(r"[^A-Za-z0-9]", "_", str(args.get("source", "mat")))[:20]
         el = re.sub(r"[^A-Za-z0-9]", "", str(args.get("element", "X")))[:3]
         args["output"] = str(session_dir / f"doped_{src}_{el}.cif")
+    elif tool_id == "structure.supercell":
+        src = re.sub(r"[^A-Za-z0-9]", "_", str(args.get("source", "mat")))[:20]
+        sc = re.sub(r"[^A-Za-z0-9]", "_", str(args.get("supercell", "2x2x2")))
+        args["output"] = str(session_dir / f"supercell_{src}_{sc}.cif")
+    elif tool_id == "structure.vacancy":
+        src = re.sub(r"[^A-Za-z0-9]", "_", str(args.get("source", "mat")))[:20]
+        el = re.sub(r"[^A-Za-z0-9]", "", str(args.get("element", "X")))[:3]
+        sc = re.sub(r"[^A-Za-z0-9]", "_", str(args.get("supercell", "2x2x2")))
+        args["output"] = str(session_dir / f"vacancy_{src}_{el}_{sc}.cif")
     elif tool_id == "structure.analyze" and str(args.get("output", "")).endswith(".json"):
         args["output"] = str(session_dir / "structure_analysis.json")
     elif tool_id == "structure.analyze":
@@ -105,6 +160,25 @@ def prepare_step_args(
         if not args.get("output"):
             el = re.sub(r"[^A-Za-z]", "", str(args.get("element", "X")))
             args["output"] = str(session_dir / f"ref_{el}.cif")
+    elif tool_id in {
+        "workflow.convergence",
+        "workflow.neutral_vacancy",
+        "workflow.magnetic_compare",
+        "workflow.phonon_dfpt",
+    }:
+        # High-level workflows own a graph namespace below the session.  Do
+        # not allow the planner to scatter dynamic DAG state to arbitrary
+        # paths.
+        name = re.sub(r"[^a-z0-9_]", "_", tool_id.replace(".", "_"))
+        args["workdir"] = str(session_dir / "workflows" / name)
+        if ctx.get("cancel_event") is not None:
+            args["_cancel_event"] = ctx["cancel_event"]
+
+        def _workflow_node_cb(ev, _idx=idx, _log=node_log):
+            _log.append({"node": ev.get("node"), "state": ev.get("state")})
+            emit({"type": "node", "step": _idx, "node": ev.get("node"), "state": ev.get("state")})
+
+        args["_on_event"] = _workflow_node_cb
     elif tool_id == "thermo.eads" and args.get("ry_a") is None:
         # inject the last three SCF energies in plan order:
         # [adsorbed, surface, molecule]
@@ -113,12 +187,15 @@ def prepare_step_args(
             args["ry_a"] = e_a["energy_ry"]
             args["ry_s"] = e_s["energy_ry"]
             args["ry_m"] = e_m["energy_ry"]
+            args["_input_provenance"] = [item.get("provenance") for item in (e_a, e_s, e_m)]
             n_a, n_s, n_m = e_a.get("natoms"), e_s.get("natoms"), e_m.get("natoms")
             if n_a and n_s and n_m and n_a > n_s:
                 # molecule energy is shared between its atoms: O adsorbed
                 # from an O2 reference → subtract E(O2)/2, not E(O2)
                 args["nat_a"] = n_a - n_s
                 args["nat_mol"] = n_m
+        else:
+            return "thermo.eads 需要明确的吸附体系、纯表面和气相分子三个 SCF 能量；前置结果不足，拒绝猜测"
     elif tool_id == "thermo.formation" and not args.get("refs"):
         # inject: first SCF = compound, rest = element refs in plan order
         try:
@@ -134,6 +211,12 @@ def prepare_step_args(
                 e = scf_energies[i + 1]
                 refs[el] = {"energy_ry": e["energy_ry"], "natoms": e.get("natoms") or 1}
             args["refs"] = refs
+            args["_input_provenance"] = [item.get("provenance") for item in scf_energies[:refs_needed + 1]]
+        else:
+            return (
+                f"thermo.formation 需要化合物和 {refs_needed} 个元素参考态的 SCF 结果；"
+                "前置结果不足，拒绝猜测"
+            )
     elif tool_id == "analysis.compare" and not args.get("entries"):
         # inject the last N ledger entries (default 2) so "对比一下"
         # finds earlier-turn results without the planner re-specifying them
@@ -141,6 +224,7 @@ def prepare_step_args(
         n = int(args.get("use_last") or 2)
         if len(ledger) >= n:
             args["entries"] = ledger[-n:]
+            args["_input_provenance"] = [item.get("provenance") for item in ledger[-n:]]
     elif tool_id == "input.build":
         args["output"] = str(session_dir / "input.in")
         if not args.get("structure") and built_structure:
@@ -180,20 +264,6 @@ def prepare_step_args(
                 # silently produce wrong physics for E_ads/formation flows
                 return "no structure to chain (previous build step failed) and no material given"
 
-            # Product-level method card: only inject values declared by the
-            # selected template. This keeps approval visible and reproducible
-            # without letting UI-only metadata leak into GraphTemplate inputs.
-            run_config = ctx.get("run_config") or {}
-            template_id = str(args.get("template_id") or "")
-            approved_keys = {
-                "t0_scf": ("ecutwfc", "kpoints"),
-                "t1_vc_relax": ("ecutwfc", "kpoints"),
-                "t2_bands": ("ecutwfc", "kpoints", "nbnd", "nkpoints_bands"),
-                "t2_dos": ("ecutwfc", "kpoints", "nbnd"),
-            }.get(template_id, ())
-            for key in approved_keys:
-                if run_config.get(key) not in (None, ""):
-                    inputs[key] = run_config[key]
             args["inputs"] = inputs
 
             def _node_cb(ev, _idx=idx, _log=node_log):

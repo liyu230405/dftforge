@@ -25,6 +25,7 @@ class IntentSignals:
     dopant_el: Optional[str] = None
     ads_el: Optional[str] = None
     ads_site: Optional[str] = None
+    vacancy_el: Optional[str] = None
 
     wants_analyze: bool = False
     wants_import: bool = False
@@ -39,6 +40,11 @@ class IntentSignals:
     wants_compare: bool = False
     wants_eads: bool = False
     wants_formation: bool = False
+    wants_vacancy: bool = False
+    wants_phonon: bool = False
+    wants_magnetism: bool = False
+    wants_convergence: bool = False
+    wants_chemical_potential: bool = False
     wants_2d: bool = False
     strong_analyze: bool = False
 
@@ -92,6 +98,11 @@ _INTENT_KEYWORDS: Dict[str, tuple] = {
     "wants_compare": ("对比", "比较", "区别", "差异", "差距", "compare", " vs ", "vs.", "哪个更"),
     "wants_eads": ("吸附能", "adsorption energy", "eads", "e_ads"),
     "wants_formation": ("形成能", "formation energy", "formation enthalpy", "生成能"),
+    "wants_vacancy": ("空位", "vacancy", "缺陷"),
+    "wants_phonon": ("声子", "phonon", "dfpt", "虚频", "dynamical stability"),
+    "wants_magnetism": ("磁性", "磁矩", "铁磁", "反铁磁", "ferromagnetic", "antiferromagnetic", "spin-polarized"),
+    "wants_convergence": ("收敛测试", "收敛扫描", "收敛性", "convergence test", "convergence study", "convergence scan", "ecutwfc", "截断能", "k 点收敛"),
+    "wants_chemical_potential": ("化学势", "chemical potential", "稳定区间", "convex hull", "相图"),
     "strong_analyze": ("键长", "键能", "bond", "distance", "距离", "分析", "analyze"),
 }
 
@@ -144,6 +155,15 @@ def detect_intents(message: str, ctx: Optional[Dict[str, Any]] = None) -> Intent
     # Simple keyword-driven flags
     for flag, keys in _INTENT_KEYWORDS.items():
         setattr(sig, flag, any(k in lower for k in keys))
+
+    vacancy_match = re.search(
+        r"(?<![A-Za-z])([A-Z][a-z]?)(?:原子)?\s*(?:空位|vacancy)",
+        message or "",
+        re.IGNORECASE,
+    )
+    if vacancy_match:
+        symbol = vacancy_match.group(1)
+        sig.vacancy_el = symbol[:1].upper() + symbol[1:].lower()
 
     # flag-specific exceptions the keyword tables cannot express
     if sig.wants_generate and "build a" in lower:

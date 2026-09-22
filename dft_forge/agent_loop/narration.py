@@ -40,6 +40,7 @@ def narrate(provider, message: str, commands: List[dict], results: List[dict], c
     for c, r in zip(commands, results):
         data = r.get("json") if isinstance(r.get("json"), dict) else {}
         brief = {"tool": c.get("command"), "desc": c.get("description")}
+        brief["provenance"] = r.get("provenance") or {"execution_class": "unknown"}
         if r.get("error"):
             brief["error"] = str(r["error"])[:200]
         elif isinstance(data, dict) and data.get("error"):
@@ -73,6 +74,9 @@ def narrate(provider, message: str, commands: List[dict], results: List[dict], c
         "或失败原因与建议。铁律：所有数值必须逐字来自执行步骤数据，"
         "禁止用教科书/记忆中的理论值替换计算值（如计算带隙 0.57 eV 就说 0.57，"
         "绝不说成实验值或理论值）；数据里没有的数值一个都不许出现。"
+        "来源铁律：provenance 标为 simulated 或 contains_simulated=true 的结果必须明确称为模拟演示，"
+        "不能写成科研结论；compute 仅表示计算输出，并不证明科学有效性。"
+        "parsed/user_input/unknown 不能声称已执行真实计算，也不能根据当前连接设置猜测历史来源。"
         "对比类结果必须逐体系给出数值和差值，结果已在手就立即汇报，"
         "禁止说'后续将输出/稍后给出'。"
         "不要罗列工具名，结构/图表已自动展示在界面右侧无需赘述。"
