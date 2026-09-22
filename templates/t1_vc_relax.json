@@ -2,8 +2,11 @@
   "template_id": "t1_vc_relax",
   "description": "Structure optimization (pw.x vc-relax) for any library material",
   "inputs": {
+    "_parameters_locked": false,
+    "_source_lock": null,
     "material": "Si",
     "ecutwfc": null,
+    "ecutrho": null,
     "kpoints": null,
     "structure": null
   },
@@ -16,9 +19,12 @@
       "id": "vc_relax",
       "tool": "qe",
       "params": {
+        "_parameters_locked": "${inputs._parameters_locked}",
+        "_source_lock": "${inputs._source_lock}",
         "calc": "vc-relax",
         "material": "${inputs.material}",
         "ecutwfc": "${inputs.ecutwfc}",
+        "ecutrho": "${inputs.ecutrho}",
         "kpoints": "${inputs.kpoints}",
         "structure": "${inputs.structure}"
       },

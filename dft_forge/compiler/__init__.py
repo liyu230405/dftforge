@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import math
+from numbers import Integral
 import textwrap
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from ase import Atoms
@@ -19,6 +20,8 @@ from ase.io import write as ase_write
 from pymatgen.core import Structure
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from pymatgen.symmetry.kpath import KPathSeek
+
+from .pseudopotentials import read_pseudo_metadata
 
 
 # ── Material database ─────────────────────────────────────────────────────────
@@ -519,6 +522,38 @@ def get_bandpath_kpoints(material: str, npoints: int = 100, atoms: Optional[Atom
 
 # ── QE input generator ────────────────────────────────────────────────────────
 
+def resolve_band_count(
+    *, valence_electrons: float, natoms: int, is_metal: bool,
+    nbnd: Optional[int] = None, tot_charge: float = 0.0,
+    spin_polarized: bool = False, extra_bands: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Shared electron occupation bound and initial band count for QE.
+
+    Positive QE charge removes electrons.  A collinear-spin calculation
+    without constrained total magnetization uses the conservative bound
+    with all electrons in one channel.  ``nbnd`` is the total number of
+    bands per spin channel, not the number of additional empty bands.
+    """
+    charge = float(tot_charge)
+    if not math.isfinite(charge):
+        raise ValueError("tot_charge must be finite")
+    nelec = float(valence_electrons) - charge
+    if not math.isfinite(nelec) or nelec <= 0:
+        raise ValueError("tot_charge must leave a positive finite electron count")
+    minimum_bands = int(math.ceil(nelec if spin_polarized else nelec / 2.0))
+    extra = extra_bands if extra_bands is not None else (12 if is_metal else 8)
+    if nbnd is None:
+        nbnd = max(natoms * 4, minimum_bands + extra)
+    elif isinstance(nbnd, bool) or not isinstance(nbnd, Integral) or nbnd < minimum_bands:
+        qualifier = "conservative collinear-spin bound" if spin_polarized else "electron occupation bound"
+        raise ValueError(
+            f"nbnd must be an integer >= {minimum_bands} for {nelec:g} electrons "
+            f"({qualifier})"
+        )
+    return {"nelec": nelec, "charge": charge, "minimum_bands": minimum_bands,
+            "extra_bands": extra, "nbnd": int(nbnd)}
+
+
 class QECompiler:
     """Deterministic QE input file compiler.
     
@@ -529,7 +564,6 @@ class QECompiler:
     def __init__(self, pseudo_dir: Path):
         self.pseudo_dir = Path(pseudo_dir)
         self._validate_pseudo_dir()
-        self._z_valence_cache: Dict[str, float] = {}
 
     def _validate_pseudo_dir(self) -> None:
         if not self.pseudo_dir.exists():
@@ -544,24 +578,8 @@ class QECompiler:
         return missing
 
     def _pseudo_z_valence(self, pseudo_file: str) -> float:
-        """Valence electron count from a UPF header (cached)."""
-        cached = self._z_valence_cache.get(pseudo_file)
-        if cached is not None:
-            return cached
-        text = (self.pseudo_dir / pseudo_file).read_text(errors="ignore")
-        # UPF PP_HEADER line: e.g. "     19.00000000000      Z valence"
-        val = 0.0
-        for line in text.splitlines():
-            if "Z valence" in line:
-                for tok in line.split():
-                    try:
-                        val = float(tok)
-                        break
-                    except ValueError:
-                        continue
-                break
-        self._z_valence_cache[pseudo_file] = val
-        return val
+        """Read validated valence metadata without caching mutable files."""
+        return float(read_pseudo_metadata(self.pseudo_dir / pseudo_file)["z_valence"])
 
     def _resolve(self, material: str, atoms: Optional[Atoms]) -> Tuple[Dict[str, Any], Atoms, float]:
         """Material profile + atoms + alat(bohr), from MATERIAL_DB or a raw structure."""
@@ -718,6 +736,14 @@ class QECompiler:
         nkpoints_bands: int = 60,
         atoms: Optional[Atoms] = None,
         kmode: str = "path",
+        spin_polarized: bool = False,
+        magnetic_order: Optional[str] = None,
+        magnetic_element: Optional[str] = None,
+        initial_moment_muB: Optional[float] = None,
+        tot_charge: float = 0.0,
+        occupations: Optional[str] = None,
+        smearing: Optional[str] = None,
+        degauss: Optional[float] = None,
     ) -> str:
         """Compile a generic SCF or NSCF input file.
 
@@ -733,23 +759,58 @@ class QECompiler:
         ecutrho = ecutrho if ecutrho is not None else db["ecutrho_default"]
         kpoints = tuple(kpoints) if kpoints else tuple(db.get("kpoints_default", (4, 4, 4, 1, 1, 1)))
         
-        # Check pseudos
-        missing = self._check_pseudos(db["pseudos"])
+        # Magnetic calculations reuse pw.x.  AFM is represented by two QE
+        # species labels pointing to the same pseudopotential, because QE's
+        # starting_magnetization is species-level rather than atom-level.
+        order = str(magnetic_order or "").strip().lower().replace("-", "")
+        if order not in {"", "nm", "fm", "afm"}:
+            raise ValueError("magnetic_order must be NM, FM, or AFM")
+        magnetic_element = str(magnetic_element or (atoms.symbols[0] if len(atoms) else "")).strip()
+        atom_labels = list(atoms.symbols)
+        species = list(db["species"])
+        masses = list(db["masses"])
+        pseudos = dict(db["pseudos"])
+        spin = bool(spin_polarized or order in {"fm", "afm"})
+        starting: Dict[str, float] = {}
+        if order == "afm":
+            indices = [i for i, sym in enumerate(atom_labels) if sym == magnetic_element]
+            if len(indices) < 2:
+                raise ValueError(
+                    f"AFM requires at least two atoms of magnetic_element={magnetic_element!r}; "
+                    "provide a magnetic supercell"
+                )
+            left, right = f"{magnetic_element}A", f"{magnetic_element}B"
+            for j, i in enumerate(indices):
+                atom_labels[i] = left if j % 2 == 0 else right
+            species = [left, right] + [s for s in species if s != magnetic_element]
+            masses = [float(db["masses"][db["species"].index(magnetic_element)])] * 2 + [
+                m for s, m in zip(db["species"], db["masses"]) if s != magnetic_element
+            ]
+            pseudos = {left: db["pseudos"][magnetic_element], right: db["pseudos"][magnetic_element]}
+            pseudos.update({s: db["pseudos"][s] for s in db["species"] if s != magnetic_element})
+
+        missing = self._check_pseudos(pseudos)
         if missing:
             raise FileNotFoundError(f"Missing pseudopotentials: {missing}")
-        
-        # Determine nbnd from the pseudopotentials' real valence electron
-        # counts — GBRV semicore pseudos (e.g. Ga_sv with 19 valence e-)
-        # make atom-count heuristics fatally wrong ("too few bands")
-        if nbnd is None:
-            nelec = sum(
-                self._pseudo_z_valence(db["pseudos"][s]) for s in atoms.symbols
-            )
-            n_occ = int(math.ceil(nelec / 2.0))
-            if db["is_metal"]:
-                nbnd = max(len(atoms) * 4, n_occ + 12)
-            else:
-                nbnd = max(len(atoms) * 4, n_occ + 8)
+        valences = {filename: self._pseudo_z_valence(filename) for filename in set(pseudos.values())}
+        if order in {"fm", "afm"}:
+            moment = abs(float(initial_moment_muB if initial_moment_muB is not None else 2.2))
+            for label in species:
+                base = magnetic_element
+                if label.endswith("A") or label.endswith("B"):
+                    base = label[:-1]
+                if base == magnetic_element:
+                    zval = valences[pseudos[label]]
+                    sign = -1.0 if order == "afm" and label.endswith("B") else 1.0
+                    starting[label] = max(-1.0, min(1.0, sign * moment / zval))
+
+        # Use the same electron count and spin bound as parameter previews.
+        bands = resolve_band_count(
+            valence_electrons=sum(valences[db["pseudos"][s]] for s in atoms.symbols),
+            natoms=len(atoms), is_metal=bool(db["is_metal"]), nbnd=nbnd,
+            tot_charge=tot_charge, spin_polarized=spin,
+        )
+        charge, nbnd = bands["charge"], bands["nbnd"]
 
         lines = []
         lines.append("&CONTROL")
@@ -757,6 +818,11 @@ class QECompiler:
         lines.append(f'  prefix = "{prefix}"')
         lines.append(f'  outdir = "./"')
         lines.append(f'  pseudo_dir = "{self.pseudo_dir}"')
+        if spin:
+            # Ask pw.x for the site-resolved magnetic report when the
+            # selected QE build supports it; total/absolute magnetization
+            # remain the portable fallback parsed by QEParser.
+            lines.append('  verbosity = "high"')
         if calculation in ("bands", "nscf"):
             lines.append('  restart_mode = "from_scratch"')
         lines.append("/")
@@ -765,12 +831,19 @@ class QECompiler:
         lines.append(f"  ibrav = {db['ibrav']}")
         lines.append(f"  celldm(1) = {alat_bohr:.6f}")
         lines.append(f"  nat = {len(atoms)}")
-        lines.append(f"  ntyp = {db['nspecies']}")
+        lines.append(f"  ntyp = {len(species)}")
         lines.append(f"  ecutwfc = {ecutwfc}")
         lines.append(f"  ecutrho = {ecutrho}")
-        lines.append(f'  occupations = "{db["occupations"]}"')
-        lines.append(f'  smearing = "{db["smearing"]}"')
-        lines.append(f"  degauss = {db['degauss']}")
+        lines.append(f'  occupations = "{occupations or db["occupations"]}"')
+        lines.append(f'  smearing = "{smearing or db["smearing"]}"')
+        lines.append(f"  degauss = {degauss if degauss is not None else db['degauss']}")
+        if spin:
+            lines.append("  nspin = 2")
+        if abs(charge) > 1e-12:
+            lines.append(f"  tot_charge = {charge:.8g}")
+        for i, label in enumerate(species, start=1):
+            if label in starting:
+                lines.append(f"  starting_magnetization({i}) = {starting[label]:.8g}")
         lines.append(f"  nbnd = {nbnd}")
         lines.append("/")
         lines.append("")
@@ -782,14 +855,14 @@ class QECompiler:
         
         # ATOMIC_SPECIES
         lines.append("ATOMIC_SPECIES")
-        for elem, mass in zip(db["species"], db["masses"]):
-            pseudo_file = db["pseudos"][elem]
+        for elem, mass in zip(species, masses):
+            pseudo_file = pseudos[elem]
             lines.append(f"  {elem}  {mass:.3f}  {pseudo_file}")
         lines.append("")
         
         # ATOMIC_POSITIONS
         lines.append("ATOMIC_POSITIONS (crystal)")
-        for sym, pos in zip(atoms.symbols, atoms.get_scaled_positions()):
+        for sym, pos in zip(atom_labels, atoms.get_scaled_positions()):
             lines.append(f"  {sym}  {pos[0]:.8f}  {pos[1]:.8f}  {pos[2]:.8f}")
         lines.append("")
         
@@ -982,6 +1055,104 @@ class QECompiler:
         lines.append("/")
         # trailing newline: QE namelist readers abort without it
         content = "\n".join(lines) + "\n"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(content)
+        return content
+
+    def compile_ph_input(
+        self,
+        material: str,
+        output_path: Path,
+        *,
+        prefix: Optional[str] = None,
+        q_grid: Sequence[int] = (1, 1, 1),
+        tr2_ph: float = 1.0e-14,
+        fildyn: Optional[str] = None,
+    ) -> str:
+        """Compile a QE ``ph.x`` regular-q-grid DFPT input."""
+        if len(q_grid) != 3 or any(int(x) < 1 for x in q_grid):
+            raise ValueError("q_grid must contain three positive integers")
+        prefix = prefix or material.lower()
+        fildyn = fildyn or f"{prefix}.dyn"
+        lines = [
+            "&inputph",
+            f"  tr2_ph = {float(tr2_ph):.6e}",
+            f"  prefix = \"{prefix}\"",
+            '  outdir = "./"',
+            f"  fildyn = \"{fildyn}\"",
+            "  ldisp = .true.",
+            f"  nq1 = {int(q_grid[0])}",
+            f"  nq2 = {int(q_grid[1])}",
+            f"  nq3 = {int(q_grid[2])}",
+            "/",
+            "",
+        ]
+        content = "\n".join(lines)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(content)
+        return content
+
+    def compile_q2r_input(
+        self,
+        material: str,
+        output_path: Path,
+        *,
+        prefix: Optional[str] = None,
+        fildyn: Optional[str] = None,
+        flfrc: Optional[str] = None,
+        zasr: str = "simple",
+    ) -> str:
+        """Compile a QE ``q2r.x`` force-constant input."""
+        prefix = prefix or material.lower()
+        fildyn = fildyn or f"{prefix}.dyn"
+        flfrc = flfrc or f"{prefix}.fc"
+        lines = [
+            "&input",
+            f"  fildyn = \"{fildyn}\"",
+            f"  flfrc = \"{flfrc}\"",
+            f"  zasr = \"{zasr}\"",
+            "/",
+            "",
+        ]
+        content = "\n".join(lines)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(content)
+        return content
+
+    def compile_matdyn_input(
+        self,
+        material: str,
+        output_path: Path,
+        *,
+        prefix: Optional[str] = None,
+        flfrc: Optional[str] = None,
+        flfrq: Optional[str] = None,
+        q_grid: Sequence[int] = (1, 1, 1),
+        asr: str = "simple",
+        dos: bool = True,
+        fldos: Optional[str] = None,
+    ) -> str:
+        """Compile ``matdyn.x`` input for a regular q-grid and phonon DOS."""
+        if len(q_grid) != 3 or any(int(x) < 1 for x in q_grid):
+            raise ValueError("q_grid must contain three positive integers")
+        prefix = prefix or material.lower()
+        flfrc = flfrc or f"{prefix}.fc"
+        flfrq = flfrq or f"{prefix}.freq"
+        fldos = fldos or f"{prefix}.phdos"
+        lines = [
+            "&input",
+            f"  asr = \"{asr}\"",
+            f"  flfrc = \"{flfrc}\"",
+            f"  flfrq = \"{flfrq}\"",
+            f"  dos = {'.true.' if dos else '.false.'}",
+            f"  fldos = \"{fldos}\"",
+            f"  nk1 = {int(q_grid[0])}",
+            f"  nk2 = {int(q_grid[1])}",
+            f"  nk3 = {int(q_grid[2])}",
+            "/",
+            "",
+        ]
+        content = "\n".join(lines)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(content)
         return content

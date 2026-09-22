@@ -105,6 +105,21 @@ class ParsedPDOS:
     atom_elements: Optional[List[str]] = None
 
 
+@dataclass
+class ParsedMagnetization:
+    """Collinear spin information extracted from pw.x output."""
+    total_magnetization_muB: Optional[float] = None
+    absolute_magnetization_muB: Optional[float] = None
+    atom_magnetizations_muB: List[float] = field(default_factory=list)
+
+
+@dataclass
+class ParsedPhonon:
+    """Frequencies emitted by ph.x/matdyn.x, in THz."""
+    frequencies_thz: List[float] = field(default_factory=list)
+    dos_file: Optional[str] = None
+
+
 # ── Main parser class ─────────────────────────────────────────────────────────
 
 class QEParser:
@@ -160,6 +175,55 @@ class QEParser:
         if nbnd_match:
             result.n_bands = int(nbnd_match.group(1))
         
+        return result
+
+    @staticmethod
+    def parse_magnetization(stdout: str) -> ParsedMagnetization:
+        """Parse total and per-atom collinear magnetizations from pw.x."""
+        result = ParsedMagnetization()
+        total = re.findall(
+            r"total\s+magnetization\s*=\s*([-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?)",
+            stdout or "", re.IGNORECASE,
+        )
+        absolute = re.findall(
+            r"absolute\s+magnetization\s*=\s*([-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?)",
+            stdout or "", re.IGNORECASE,
+        )
+        if total:
+            result.total_magnetization_muB = float(total[-1])
+        if absolute:
+            result.absolute_magnetization_muB = float(absolute[-1])
+        atom_matches = re.findall(
+            r"atom\s*:\s*(\d+).*?(?:magnetization|magn)\s*[:=]\s*"
+            r"([-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?)",
+            stdout or "", re.IGNORECASE,
+        )
+        indexed = {int(i): float(v) for i, v in atom_matches}
+        if indexed:
+            result.atom_magnetizations_muB = [indexed[i] for i in sorted(indexed)]
+        return result
+
+    @staticmethod
+    def parse_phonon(stdout: str) -> ParsedPhonon:
+        """Parse ph.x/matdyn.x frequency lines; normalize to THz."""
+        result = ParsedPhonon()
+        text = stdout or ""
+        thz = re.findall(
+            r"(?:omega|freq)\s*\(\s*\d+\s*\)\s*=\s*"
+            r"([-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?)\s*\[\s*THz\s*\]",
+            text, re.IGNORECASE,
+        )
+        if thz:
+            result.frequencies_thz = [float(x) for x in thz]
+        else:
+            # Some QE builds print only cm^-1.  1 THz = 33.3564095 cm^-1.
+            cm = re.findall(
+                r"(?:omega|freq)\s*\(\s*\d+\s*\)\s*=\s*"
+                r"[-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?\s*\[\s*cm-?1\s*\]"
+                r"\s*=\s*([-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?)",
+                text, re.IGNORECASE,
+            )
+            result.frequencies_thz = [float(x) / 33.3564095 for x in cm]
         return result
 
     @staticmethod

@@ -11,6 +11,10 @@ Calc types:
 - nscf     : pw.x non-self-consistent run
 - bands    : bands.x band-structure extraction (needs nscf upstream)
 - dos      : dos.x density-of-states         (needs nscf upstream)
+- pdos     : projwfc.x projected DOS         (needs nscf upstream)
+- ph       : ph.x DFPT dynamical matrices   (needs scf upstream)
+- q2r      : q2r.x real-space force constants (needs ph upstream)
+- matdyn   : matdyn.x frequencies / DOS     (needs q2r upstream)
 
 Data flow follows QE physics plus graph bindings: nscf/bands/dos nodes
 symlink the upstream ``{prefix}.save`` directory into their workdir, and the
@@ -62,6 +66,20 @@ class QECalcTool:
         self.verifier = ScientificVerifier()
 
     def execute(self, node: NodeRun, ctx: ExecutionContext) -> Dict[str, Any]:
+        from dft_forge.compiler.qe_parameters import validate_source_lock
+
+        try:
+            validate_source_lock(node.params.get("_source_lock"), node.params.get("structure"), self.compiler.pseudo_dir)
+        except (ValueError, OSError) as exc:
+            raise ToolError(str(exc), category="method_source", repairable=False) from exc
+        output = self._execute(node, ctx)
+        try:
+            validate_source_lock(node.params.get("_source_lock"), node.params.get("structure"), self.compiler.pseudo_dir)
+        except (ValueError, OSError) as exc:
+            raise ToolError(str(exc), category="method_source", repairable=False) from exc
+        return output
+
+    def _execute(self, node: NodeRun, ctx: ExecutionContext) -> Dict[str, Any]:
         params = node.params
         calc = str(params.get("calc", "scf"))
         material = str(params.get("material", ""))
@@ -87,17 +105,34 @@ class QECalcTool:
             atoms, _proto = formula_atoms(material)
         if not material and atoms is None:
             raise ToolError("qe node missing 'material' param", category="config")
+        if params.get("supercell") and str(params.get("supercell")) not in {"1x1x1", "1x1x1.0"}:
+            from ase.build import make_supercell
+            from dft_forge.structure_builder import parse_supercell_3d
+
+            if atoms is None:
+                from dft_forge.compiler import build_atoms, formula_atoms
+
+                if material in MATERIAL_DB:
+                    atoms = build_atoms(material)
+                else:
+                    atoms, _proto = formula_atoms(material)
+            m, n, p = parse_supercell_3d(str(params["supercell"]))
+            atoms = make_supercell(atoms, [[m, 0, 0], [0, n, 0], [0, 0, p]])
         prefix = str(params.get("prefix", re.sub(r"[^A-Za-z0-9]", "_", material.lower())[:24] or "calc"))
         workdir = ctx.node_workdir(node.node_id)
         workdir.mkdir(parents=True, exist_ok=True)
 
-        if calc in ("nscf", "bands", "dos", "pdos"):
+        if calc in ("nscf", "bands", "dos", "pdos", "ph"):
             self._link_upstream_save(ctx, workdir, prefix)
 
         if calc == "vc-relax":
             return self._run_vc_relax(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds)
         if calc == "scf":
             return self._run_scf(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds)
+        if calc == "relax":
+            params = dict(params)
+            params["cell_optimization"] = False
+            return self._run_vc_relax(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds)
         if calc == "nscf":
             return self._run_nscf(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds)
         if calc == "bands":
@@ -106,6 +141,14 @@ class QECalcTool:
             return self._run_dos(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds)
         if calc == "pdos":
             return self._run_pdos(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds)
+        if calc == "ph":
+            return self._run_ph(material, prefix, params, workdir, timeout=ctx.timeout_seconds)
+        if calc == "q2r":
+            self._link_upstream_artifacts(ctx, workdir, "dyn_files")
+            return self._run_q2r(material, prefix, params, workdir, timeout=ctx.timeout_seconds)
+        if calc == "matdyn":
+            self._link_upstream_artifacts(ctx, workdir, "force_constants_file")
+            return self._run_matdyn(material, prefix, params, workdir, timeout=ctx.timeout_seconds)
         raise ToolError(f"unknown qe calc type '{calc}'", category="config")
 
     # ── Calc implementations ─────────────────────────────────────────────────
@@ -119,30 +162,41 @@ class QECalcTool:
             ecutwfc=params.get("ecutwfc"),
             ecutrho=params.get("ecutrho"),
             kpoints=tuple(params["kpoints"]) if params.get("kpoints") else None,
+            cell_optimization=bool(params.get("cell_optimization", True)),
             atoms=atoms,
         )
         result = self._run_pw(input_file, workdir, timeout=timeout)
         xml = workdir / f"{prefix}.xml"
         parsed = QEParser.parse_vc_relax(result.stdout, xml if xml.exists() else None)
-        report = self.verifier.verify_t1(
-            VerificationInput(
-                stdout=result.stdout,
-                xml_path=xml if xml.exists() else None,
-                job_success=bool(getattr(result, "success", True)),
-            ),
-            parsed,
-        )
-        if not report.passed:
-            raise ToolError(
-                "vc-relax verification failed: " + "; ".join(report.failure_reasons),
-                category="verification",
-                repairable=True,
+        if bool(params.get("cell_optimization", True)):
+            report = self.verifier.verify_t1(
+                VerificationInput(
+                    stdout=result.stdout,
+                    xml_path=xml if xml.exists() else None,
+                    job_success=bool(getattr(result, "success", True)),
+                ),
+                parsed,
             )
+            if not report.passed:
+                raise ToolError(
+                    "vc-relax verification failed: " + "; ".join(report.failure_reasons),
+                    category="verification",
+                    repairable=True,
+                )
+        else:
+            scf = QEParser.parse_scf(result.stdout)
+            force_present = bool(re.search(r"\batom\s+\d+.*?\bforce\s*=", result.stdout, re.IGNORECASE))
+            if not scf.converged or not force_present or parsed.max_force_ry_bohr > self.verifier.force_threshold_ry:
+                raise ToolError(
+                    "relax verification failed: missing SCF/force convergence evidence",
+                    category="verification",
+                    repairable=True,
+                )
         cell = parsed.cell
         outputs = {
             "energy_ry": parsed.final_energy_ry,
             "max_force_ry_bohr": parsed.max_force_ry_bohr,
-            "pressure_kbar": parsed.pressure_kbar,
+            "pressure_kbar": parsed.pressure_kbar if bool(params.get("cell_optimization", True)) else None,
             "n_iterations": parsed.n_iterations,
             "a_angstrom": (cell.a_bohr * BOHR_TO_ANG) if cell else None,
             "volume_a3": (cell.volume_bohr3 * BOHR3_TO_ANG3) if cell else None,
@@ -178,6 +232,14 @@ class QECalcTool:
             conv_thr=_as_float(params, "conv_thr", 1.0e-8),
             nbnd=params.get("nbnd"),
             atoms=atoms,
+            spin_polarized=bool(params.get("spin_polarized", False)),
+            magnetic_order=params.get("magnetic_order"),
+            magnetic_element=params.get("magnetic_element"),
+            initial_moment_muB=params.get("initial_moment_muB"),
+            tot_charge=float(params.get("tot_charge", 0.0) or 0.0),
+            occupations=params.get("occupations"),
+            smearing=params.get("smearing"),
+            degauss=params.get("degauss"),
         )
         result = self._run_pw(input_file, workdir, timeout=timeout)
         parsed = QEParser.parse_scf(result.stdout)
@@ -189,13 +251,23 @@ class QECalcTool:
                 repairable=True,
             )
         nat_match = re.search(r"number of atoms/cell\s+=\s+(\d+)", result.stdout)
-        return {
+        outputs = {
             "energy_ry": parsed.total_energy_ry,
             "fermi_ev": parsed.fermi_energy_ev,
             "n_iterations": parsed.n_iterations,
             "natoms": int(nat_match.group(1)) if nat_match else (len(atoms) if atoms is not None else None),
             "stdout_file": str(input_file.with_suffix(".out")),
         }
+        if params.get("magnetic_order"):
+            magnet = QEParser.parse_magnetization(result.stdout)
+            outputs.update({
+                "requested_order": str(params["magnetic_order"]).upper(),
+                "spin_polarized": str(params["magnetic_order"]).lower() in {"fm", "afm"},
+                "total_magnetization_muB": magnet.total_magnetization_muB,
+                "absolute_magnetization_muB": magnet.absolute_magnetization_muB,
+                "atom_magnetizations_muB": magnet.atom_magnetizations_muB,
+            })
+        return outputs
 
     def _run_nscf(self, material, prefix, params, workdir, atoms=None, timeout=None) -> Dict[str, Any]:
         input_file = workdir / f"{prefix}_nscf.in"
@@ -369,6 +441,109 @@ class QECalcTool:
         }
         return outputs
 
+    def _run_ph(self, material, prefix, params, workdir, timeout=None) -> Dict[str, Any]:
+        input_file = workdir / f"{prefix}_ph.in"
+        self.compiler.compile_ph_input(
+            material,
+            input_file,
+            prefix=prefix,
+            q_grid=tuple(params.get("q_grid") or (1, 1, 1)),
+            tr2_ph=float(params.get("tr2_ph", 1.0e-14)),
+            fildyn=params.get("fildyn") or f"{prefix}.dyn",
+        )
+        result = self._run_program("ph.x", input_file, workdir, timeout=timeout)
+        dyn_files = sorted(str(p) for p in workdir.glob(f"{prefix}.dyn*"))
+        if not dyn_files:
+            raise ToolError(
+                f"ph.x produced no dynamical matrix files: {result.error_message or 'unknown error'}",
+                category="tool_failure",
+                repairable=False,
+            )
+        return {
+            "dynamics_prefix": str(workdir / f"{prefix}.dyn"),
+            "dyn_files": dyn_files,
+            "q_grid": [int(x) for x in (params.get("q_grid") or (1, 1, 1))],
+        }
+
+    def _run_q2r(self, material, prefix, params, workdir, timeout=None) -> Dict[str, Any]:
+        input_file = workdir / f"{prefix}_q2r.in"
+        self.compiler.compile_q2r_input(
+            material,
+            input_file,
+            prefix=prefix,
+            fildyn=params.get("dynamics_prefix") or f"{prefix}.dyn",
+            flfrc=params.get("force_constants_prefix") or f"{prefix}.fc",
+            zasr=str(params.get("zasr", "simple")),
+        )
+        result = self._run_program("q2r.x", input_file, workdir, timeout=timeout)
+        fc = workdir / f"{prefix}.fc"
+        if not fc.exists():
+            candidates = sorted(workdir.glob(f"{prefix}.fc*"))
+            if candidates:
+                fc = candidates[0]
+            else:
+                raise ToolError(
+                    f"q2r.x produced no force-constant file: {result.error_message or 'unknown error'}",
+                    category="tool_failure",
+                    repairable=False,
+                )
+        return {"force_constants_file": str(fc), "force_constants_prefix": str(fc)}
+
+    def _run_matdyn(self, material, prefix, params, workdir, timeout=None) -> Dict[str, Any]:
+        input_file = workdir / f"{prefix}_matdyn.in"
+        self.compiler.compile_matdyn_input(
+            material,
+            input_file,
+            prefix=prefix,
+            flfrc=params.get("force_constants_prefix") or f"{prefix}.fc",
+            flfrq=params.get("frequencies_file") or f"{prefix}.freq",
+            q_grid=tuple(params.get("q_grid") or (1, 1, 1)),
+            asr=str(params.get("asr", "simple")),
+            dos=bool(params.get("dos", True)),
+            fldos=params.get("phonon_dos_file") or f"{prefix}.phdos",
+        )
+        result = self._run_program("matdyn.x", input_file, workdir, timeout=timeout)
+        parsed = QEParser.parse_phonon(result.stdout)
+        freq_file = workdir / f"{prefix}.freq"
+        dos_file = workdir / f"{prefix}.phdos"
+        modes_candidates = [workdir / "matdyn.modes", workdir / f"{prefix}.modes"]
+        if not parsed.frequencies_thz and freq_file.exists():
+            parsed = QEParser.parse_phonon(freq_file.read_text(errors="ignore"))
+        if not parsed.frequencies_thz:
+            for candidate in modes_candidates + sorted(workdir.glob("*.modes")):
+                if candidate.exists():
+                    parsed = QEParser.parse_phonon(candidate.read_text(errors="ignore"))
+                    if parsed.frequencies_thz:
+                        break
+        if not parsed.frequencies_thz:
+            raise ToolError(
+                "matdyn.x produced no parseable phonon frequencies",
+                category="verification",
+                repairable=False,
+            )
+        return {
+            "frequencies_thz": parsed.frequencies_thz,
+            "n_modes": len(parsed.frequencies_thz),
+            "frequency_file": str(freq_file) if freq_file.exists() else None,
+            "phonon_dos_file": str(dos_file) if dos_file.exists() else None,
+            "modes_file": next((str(p) for p in modes_candidates if p.exists()), None),
+            "q_grid": [int(x) for x in (params.get("q_grid") or (1, 1, 1))],
+        }
+
+    def _run_program(self, binary: str, input_file: Path, workdir: Path, timeout=None):
+        runner = getattr(self.executor, {
+            "ph.x": "run_ph_x", "q2r.x": "run_q2r_x", "matdyn.x": "run_matdyn_x",
+        }.get(binary, ""), None)
+        if runner is None:
+            raise ToolError(f"executor does not provide {binary}", category="config", repairable=False)
+        result = runner(input_file, workdir, timeout=timeout)
+        if not result.success or "JOB DONE" not in (result.stdout or ""):
+            raise ToolError(
+                f"{binary} failed: {result.error_message or result.stderr or 'no JOB DONE in stdout'}",
+                category="tool_failure", repairable=True,
+            )
+        return result
+
     @staticmethod
     def _locate_bands_xml(workdir: Path, prefix: str) -> Optional[Path]:
         """Find the QE XML holding nscf eigenvalues (version-robust)."""
@@ -463,6 +638,22 @@ class QECalcTool:
             repairable=False,
         )
 
+    @staticmethod
+    def _link_upstream_artifacts(ctx: ExecutionContext, workdir: Path, output_key: str) -> None:
+        """Make file outputs of a predecessor visible to q2r/matdyn nodes."""
+        for outputs in ctx.upstream.values():
+            values = outputs.get(output_key, []) if isinstance(outputs, dict) else []
+            if isinstance(values, str):
+                values = [values]
+            for raw in values:
+                source = Path(str(raw))
+                if not source.exists():
+                    continue
+                target = workdir / source.name
+                if target.exists() or target.is_symlink():
+                    continue
+                target.symlink_to(source.resolve())
+
 
 class QEParamRepairer:
     """Repair handler that strengthens QE parameters and requeues the node.
@@ -478,6 +669,9 @@ class QEParamRepairer:
     REPAIRABLE_CATEGORIES = ("scf_not_converged", "verification", "execution")
 
     def repair(self, node: NodeRun, error: ToolError) -> bool:
+        if node.params.get("_parameters_locked"):
+            node.error = (node.error or str(error)) + " | 参数已确认；调整计算参数后请重新预览并确认"
+            return False
         if error.category not in self.REPAIRABLE_CATEGORIES:
             return False
         params = node.params

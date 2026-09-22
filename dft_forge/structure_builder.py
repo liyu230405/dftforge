@@ -48,9 +48,10 @@ class BuildResult:
     atoms: Atoms
     description: str = ""
     sites: Dict[str, List[float]] = field(default_factory=dict)
+    selected_index: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        data = {
             "formula": self.atoms.get_chemical_formula(),
             "natoms": len(self.atoms),
             "species": sorted(set(self.atoms.get_chemical_symbols())),
@@ -60,6 +61,9 @@ class BuildResult:
             "sites": {k: [round(c, 4) for c in v] for k, v in self.sites.items()},
             "min_distance": round(float(min_distance(self.atoms)), 4),
         }
+        if self.selected_index is not None:
+            data["selected_index"] = self.selected_index
+        return data
 
 
 def min_distance(atoms: Atoms) -> float:
@@ -336,6 +340,73 @@ def dope_3d(
     n_el = atoms.get_chemical_symbols().count(str(element))
     description = f"{host}→{element} in {m}x{n}x{p} supercell ({frac:.1f}% nominal, {n_el} atom)"
     return BuildResult(atoms=atoms, description=description)
+
+
+def _load_bulk_source(source: Any) -> Atoms:
+    """Load a bulk structure source for deterministic 3D transformations."""
+    from dft_forge.compiler import MATERIAL_DB, build_atoms, formula_atoms, read_structure
+
+    src = str(source)
+    path = Path(src)
+    if path.suffix.lower() in (".cif", ".vasp", ".poscar", ".contcar", ".xyz") and path.exists():
+        return read_structure(path)
+    if src in MATERIAL_DB:
+        return build_atoms(src)
+    atoms, _proto = formula_atoms(src)
+    return atoms
+
+
+def _apply_3d_supercell(atoms: Atoms, supercell: str) -> Tuple[Atoms, Tuple[int, int, int]]:
+    m, n, p = parse_supercell_3d(supercell)
+    if (m, n, p) != (1, 1, 1):
+        atoms = ase_make_supercell(atoms, [[m, 0, 0], [0, n, 0], [0, 0, p]])
+    return atoms, (m, n, p)
+
+
+def supercell_3d(source: Any, *, supercell: str = "2x2x2") -> BuildResult:
+    """Create an unchanged bulk supercell for matched pristine references."""
+    atoms, dims = _apply_3d_supercell(_load_bulk_source(source), supercell)
+    m, n, p = dims
+    return BuildResult(
+        atoms=atoms,
+        description=f"pristine {source} {m}x{n}x{p} supercell (no substitution)",
+    )
+
+
+def vacancy_3d(
+    source: Any,
+    element: str,
+    *,
+    supercell: str = "2x2x2",
+    index: Optional[int] = None,
+) -> BuildResult:
+    """Remove one selected atom from a bulk supercell.
+
+    ``index`` is an absolute atom index after supercell construction.  If it
+    is omitted, the first atom matching ``element`` is removed.  The explicit
+    element check prevents a planner from silently deleting the wrong species.
+    """
+    atoms, dims = _apply_3d_supercell(_load_bulk_source(source), supercell)
+    element = str(element).strip()
+    candidates = [i for i, symbol in enumerate(atoms.get_chemical_symbols()) if symbol == element]
+    if not candidates:
+        raise StructureBuildError(
+            f"no atom with element {element!r} in {source!r} after supercell construction"
+        )
+    if index is None:
+        index = candidates[0]
+    if index not in candidates:
+        raise StructureBuildError(
+            f"vacancy index {index} is not an {element} atom; valid candidates include {candidates[:8]}"
+        )
+    remove_atom(atoms, index)
+    check_distances(atoms, f"vacancy {element}@{index}")
+    m, n, p = dims
+    return BuildResult(
+        atoms=atoms,
+        description=f"vacancy {element}@{index} in {m}x{n}x{p} supercell",
+        selected_index=index,
+    )
 
 
 # ── Gas molecules (adsorption references) and elemental reference phases ──────

@@ -124,7 +124,7 @@ class TestCompileSCF:
         assert out_file.exists()
         assert 'calculation = "scf"' in content
         assert "prefix = \"si\"" in content
-        assert "nbnd = 8" in content  # 2 atoms * 4
+        assert "nbnd = 12" in content  # 8 valence electrons: 4 occupied + 8 empty bands.
 
     def test_compile_nscf_al(self, tmp_path, pseudo_dir):
         compiler = QECompiler(pseudo_dir=pseudo_dir)

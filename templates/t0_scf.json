@@ -2,8 +2,12 @@
   "template_id": "t0_scf",
   "description": "Single-point SCF energy (building block for E_ads / formation energy workflows)",
   "inputs": {
+    "_parameters_locked": false,
+    "_source_lock": null,
     "material": "Si",
     "ecutwfc": null,
+    "ecutrho": null,
+    "nbnd": null,
     "kpoints": null,
     "structure": null
   },
@@ -16,9 +20,13 @@
       "id": "scf",
       "tool": "qe",
       "params": {
+        "_parameters_locked": "${inputs._parameters_locked}",
+        "_source_lock": "${inputs._source_lock}",
         "calc": "scf",
         "material": "${inputs.material}",
         "ecutwfc": "${inputs.ecutwfc}",
+        "ecutrho": "${inputs.ecutrho}",
+        "nbnd": "${inputs.nbnd}",
         "kpoints": "${inputs.kpoints}",
         "structure": "${inputs.structure}"
       },
