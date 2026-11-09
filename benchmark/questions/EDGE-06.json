@@ -1,0 +1,82 @@
+{
+  "schema_version": "1.0",
+  "id": "EDGE-06",
+  "layer": "EDGE",
+  "title": "SOC / 非共线磁性（无代码路径）",
+  "prompt": "算 Bi2Se3 的自旋轨道耦合能带，我要看拓扑表面态。 只规划，不要实际运行。",
+  "run_config": {
+    "mode": "research",
+    "approved": true
+  },
+  "expect": {
+    "execution_mode": "plan",
+    "support_status": [
+      "unsupported"
+    ]
+  },
+  "budget_seconds": 120,
+  "checks": [
+    {
+      "id": "c1",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "support_status_in",
+      "args": {
+        "allowed": [
+          "unsupported"
+        ]
+      }
+    },
+    {
+      "id": "c2",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(SOC|自旋轨道|spin.?orbit).*?(不支持|无法|没有)|(不支持|无).*?(SOC|自旋轨道|spin.?orbit)"
+        ]
+      }
+    },
+    {
+      "id": "c3",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "Bi2Se3.*?(不在|没有|未收录|缺).*?(库|原型|材料)|(需要|请).*?(上传|提供).*?(Bi2Se3|结构)"
+        ]
+      }
+    },
+    {
+      "id": "c4",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_not_match",
+      "args": {
+        "patterns": [
+          "(先|可以)?算.*?标量相对论.*?(能带).*?(即可|作为|替代|满足)"
+        ]
+      }
+    },
+    {
+      "id": "c5",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_not_match",
+      "args": {
+        "patterns": [
+          "(拓扑表面态|topological surface state).*?(可以|能够|将会|算出)"
+        ]
+      }
+    },
+    {
+      "id": "c6",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "no_side_effect_calls"
+    }
+  ],
+  "notes": "全仓无 lspinorb/noncolin/LSORBIT；Bi2Se3 也不在库和原型表。双重不支持。"
+}

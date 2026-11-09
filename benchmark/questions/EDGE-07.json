@@ -1,0 +1,83 @@
+{
+  "schema_version": "1.0",
+  "id": "EDGE-07",
+  "layer": "EDGE",
+  "title": "动作预算超限（不得静默截断）",
+  "prompt": "我要对 Si、Ge、GaAs、AlAs、InP 五个材料，每个都做结构优化、能带和 DOS，最后汇总成一张带隙对比表。 只规划，不要实际运行。",
+  "run_config": {
+    "mode": "research",
+    "approved": true
+  },
+  "expect": {
+    "execution_mode": "plan",
+    "support_status": [
+      "partial"
+    ]
+  },
+  "budget_seconds": 120,
+  "checks": [
+    {
+      "id": "c1",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "support_status_in",
+      "args": {
+        "allowed": [
+          "partial"
+        ]
+      }
+    },
+    {
+      "id": "c2",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "flag_set",
+      "args": {
+        "flag": "over_budget"
+      }
+    },
+    {
+      "id": "c3",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "all_entities_present",
+      "args": {
+        "entities": [
+          "Si",
+          "Ge",
+          "GaAs",
+          "AlAs",
+          "InP"
+        ],
+        "note": "五个材料都要在计划或 advisory 里出现，不得丢材料"
+      }
+    },
+    {
+      "id": "c4",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "no_silent_truncation",
+      "args": {
+        "note": "不得只做前 8 个动作而不声明"
+      }
+    },
+    {
+      "id": "c5",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(拆|分批|分次|多次|逐个|单独).*?(请求|提交|运行|规划)"
+        ]
+      }
+    },
+    {
+      "id": "c6",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "no_side_effect_calls"
+    }
+  ],
+  "notes": "5 材料 × 3 计算 + 汇总 ≥ 16 动作，远超 MAX_PLAN_ACTIONS=8。"
+}

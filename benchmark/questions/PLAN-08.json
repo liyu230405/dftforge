@@ -1,0 +1,92 @@
+{
+  "schema_version": "1.0",
+  "id": "PLAN-08",
+  "layer": "PLAN",
+  "title": "中性空位",
+  "prompt": "算 Si 里一个中性空位的形成能，用 2x2x2 超胞。 只规划，不要实际运行。",
+  "run_config": {
+    "mode": "research",
+    "approved": true
+  },
+  "expect": {
+    "execution_mode": "plan",
+    "support_status": [
+      "complete"
+    ]
+  },
+  "budget_seconds": 120,
+  "checks": [
+    {
+      "id": "c1",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "tool_planned_any",
+      "args": {
+        "tools": [
+          "workflow.neutral_vacancy",
+          "structure.vacancy"
+        ]
+      }
+    },
+    {
+      "id": "c2",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "tool_not_planned",
+      "args": {
+        "tool": "structure.dope"
+      }
+    },
+    {
+      "id": "c3",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "no_side_effect_calls"
+    },
+    {
+      "id": "c4",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "same_method_bulk_per_atom|同方法.*?(每原子|E/N|per.?atom)|完美超胞.*?(每原子|平均)"
+        ]
+      }
+    },
+    {
+      "id": "c5",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "16.*?15|15.*?16|完美.*?16.*?缺陷.*?15"
+        ]
+      }
+    },
+    {
+      "id": "c6",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(固定晶胞|fixed.?cell).*?(弛豫|relax)|弛豫.*?(固定晶胞|fixed.?cell)|(缺陷|空位).*?周围.*?(松弛|弛豫)"
+        ]
+      }
+    },
+    {
+      "id": "c7",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(超胞|尺寸|16\\s*原子).*?(偏小|不足|未收敛|太小)|(缺陷|空位).*?(相互作用|自相互作用).*?(未|没)收敛|有限尺寸"
+        ]
+      }
+    }
+  ],
+  "notes": "c2：空位是移除不是替换（2026-09-07 P8 把 structure.dope 当空位工具）。"
+}

@@ -1,0 +1,66 @@
+{
+  "schema_version": "1.0",
+  "id": "EDGE-01",
+  "layer": "EDGE",
+  "title": "表面 slab（完全不支持）",
+  "prompt": "算 Pt(111) 表面上 H 原子的吸附能，用 4 层 slab、上面两层放开弛豫。 只规划，不要实际运行。",
+  "run_config": {
+    "mode": "research",
+    "approved": true
+  },
+  "expect": {
+    "execution_mode": "plan",
+    "support_status": [
+      "unsupported",
+      "partial"
+    ]
+  },
+  "budget_seconds": 120,
+  "checks": [
+    {
+      "id": "c1",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "support_status_in",
+      "args": {
+        "allowed": [
+          "unsupported",
+          "partial"
+        ]
+      }
+    },
+    {
+      "id": "c2",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(slab|表面|surface).*?(不支持|无法|没有|缺少).*?(构建|切|生成)|无法.*?(切出|构建|生成).*?(slab|表面|\\(111\\))"
+        ]
+      }
+    },
+    {
+      "id": "c3",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "tool_not_planned",
+      "args": {
+        "tool": "structure.build2d"
+      }
+    },
+    {
+      "id": "c4",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "alternative_given"
+    },
+    {
+      "id": "c5",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "no_side_effect_calls"
+    }
+  ],
+  "notes": "全仓无 ase.build.surface / fcc111 / cut 调用。最干净的 unsupported 题。"
+}

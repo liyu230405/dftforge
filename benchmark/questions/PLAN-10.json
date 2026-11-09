@@ -1,0 +1,93 @@
+{
+  "schema_version": "1.0",
+  "id": "PLAN-10",
+  "layer": "PLAN",
+  "title": "声子与动力学稳定性",
+  "prompt": "算 MgO 的声子，我想知道它动力学上稳不稳定。 只规划，不要实际运行。",
+  "run_config": {
+    "mode": "research",
+    "approved": true
+  },
+  "expect": {
+    "execution_mode": "plan",
+    "support_status": [
+      "complete",
+      "partial"
+    ]
+  },
+  "budget_seconds": 120,
+  "checks": [
+    {
+      "id": "c1",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "tool_planned",
+      "args": {
+        "tool": "workflow.phonon_dfpt"
+      }
+    },
+    {
+      "id": "c2",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "no_qe_phonon_template"
+    },
+    {
+      "id": "c3",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "no_side_effect_calls"
+    },
+    {
+      "id": "c4",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_not_match",
+      "args": {
+        "patterns": [
+          "(声子|phonon|DFPT).*?(不支持|无法|没有能力)"
+        ]
+      }
+    },
+    {
+      "id": "c5",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "ph\\.x.*?q2r\\.x.*?matdyn\\.x|ph\\.x.*?matdyn"
+        ]
+      }
+    },
+    {
+      "id": "c6",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "q_grid_not_gamma_only"
+    },
+    {
+      "id": "c7",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(虚频|虚频率|imaginary|负频)"
+        ]
+      }
+    },
+    {
+      "id": "c8",
+      "kind": "assertion",
+      "weight": 0.5,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "LO.?TO|非解析|nonanalytic|non-analytic|极性.*?修正"
+        ]
+      }
+    }
+  ],
+  "notes": "c2：QE 声子只能走 workflow.phonon_dfpt，没有 QE 声子 JSON 模板。c8 为加分项。"
+}

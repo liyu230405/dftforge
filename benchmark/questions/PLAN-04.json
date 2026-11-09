@@ -1,0 +1,80 @@
+{
+  "schema_version": "1.0",
+  "id": "PLAN-04",
+  "layer": "PLAN",
+  "title": "DOS 与投影 DOS",
+  "prompt": "我要 MgO 的总态密度和 Mg、O 分别的投影态密度。 只规划，不要实际运行。",
+  "run_config": {
+    "mode": "research",
+    "approved": true
+  },
+  "expect": {
+    "execution_mode": "plan",
+    "support_status": [
+      "complete"
+    ]
+  },
+  "budget_seconds": 120,
+  "checks": [
+    {
+      "id": "c1",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "template_used",
+      "args": {
+        "template_id": "t2_dos"
+      }
+    },
+    {
+      "id": "c2",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "no_side_effect_calls"
+    },
+    {
+      "id": "c3",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "projwfc\\.x"
+        ]
+      }
+    },
+    {
+      "id": "c4",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_not_match",
+      "args": {
+        "patterns": [
+          "\\bpdos\\.x\\b"
+        ]
+      }
+    },
+    {
+      "id": "c5",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "NSCF.*?(更密|加密|更多|致密|denser)|(更密|加密|致密).*?NSCF"
+        ]
+      }
+    },
+    {
+      "id": "c6",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "展宽|degauss|sigma|smearing|broadening"
+        ]
+      }
+    }
+  ],
+  "notes": "c4：pdos.x 这个 QE 程序不存在，正确名是 projwfc.x（2026-09-07 P4 缺陷）。"
+}

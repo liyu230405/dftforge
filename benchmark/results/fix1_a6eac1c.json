@@ -1,0 +1,203 @@
+{
+  "meta": {
+    "bench_version": "1.0",
+    "round_id": "fix1",
+    "timestamp": "2026-10-08T11:02:09Z",
+    "git_sha": "a6eac1c",
+    "llm_model": "deepseek-flash",
+    "executor": "local",
+    "qe_version": "7.5",
+    "side_effect_table_drift": []
+  },
+  "layer_scores": {
+    "L1": null,
+    "L2": 0.8409,
+    "L3": null
+  },
+  "red_lines": {
+    "plan_only_violations": 0,
+    "audit_failures": 0,
+    "false_capability_claims": 0
+  },
+  "per_question": [
+    {
+      "question_id": "EXEC-03",
+      "layer": "EXEC",
+      "title": "Cu 金属 DOS 与 PDOS",
+      "total_score_raw": 0.8247,
+      "total_score": 0.8247,
+      "gating_failed": [],
+      "audit_flags": {
+        "non_empty_answer": true,
+        "qe_invoked": true,
+        "job_done": true,
+        "qe_wallclock_ok": true,
+        "no_fake_backend": true,
+        "plan_only_respected": false,
+        "paths_in_session": true,
+        "files_nonempty": true,
+        "_qe_wall_sec": 3.39,
+        "_total_wall_sec": 12.621,
+        "_side_effect_calls": [
+          "graph.run"
+        ],
+        "_qe_log_count": 4
+      },
+      "checks": [
+        {
+          "id": "c1",
+          "kind": "tool_trace",
+          "rule": "nodes_succeeded",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "节点全部成功: ['scf', 'nscf', 'dos', 'pdos']",
+          "manual": false
+        },
+        {
+          "id": "c2",
+          "kind": "numeric",
+          "rule": "graded_relative",
+          "weight": 1.0,
+          "score": 0.5003,
+          "detail": "dos_at_fermi=0.26384000000000035 目标=0.2727 相对误差=0.03249 tol=0.05 → 0.500",
+          "manual": true
+        },
+        {
+          "id": "c3",
+          "kind": "numeric",
+          "rule": "graded_relative",
+          "weight": 1.0,
+          "score": 0.4479,
+          "detail": "pdos_cu_at_fermi=0.2635564271495113 目标=0.272924 相对误差=0.03432 tol=0.05 → 0.448",
+          "manual": true
+        },
+        {
+          "id": "c4",
+          "kind": "numeric",
+          "rule": "nonzero",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "e_fermi_ev=16.7109 需非零",
+          "manual": false
+        },
+        {
+          "id": "c5",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "命中 (Cu|铜).*?(金属|metal)|费米能.*?(有态|非零|存在态)",
+          "manual": false
+        },
+        {
+          "id": "c6",
+          "kind": "audit",
+          "rule": "gating_all_pass",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "gating 全通过 (QE wall=3.39s)",
+          "manual": false
+        }
+      ],
+      "duration_sec": 12.621,
+      "fatal_error": null,
+      "needs_manual_review": true
+    },
+    {
+      "question_id": "EXEC-11",
+      "layer": "EXEC",
+      "title": "MgO 形成能闭环",
+      "total_score_raw": 0.8571,
+      "total_score": 0.8571,
+      "gating_failed": [],
+      "audit_flags": {
+        "non_empty_answer": true,
+        "qe_invoked": true,
+        "job_done": true,
+        "qe_wallclock_ok": true,
+        "no_fake_backend": true,
+        "plan_only_respected": false,
+        "paths_in_session": true,
+        "files_nonempty": true,
+        "_qe_wall_sec": 23.5,
+        "_total_wall_sec": 38.011,
+        "_side_effect_calls": [
+          "graph.run",
+          "structure.reference",
+          "graph.run",
+          "structure.reference",
+          "graph.run"
+        ],
+        "_qe_log_count": 3
+      },
+      "checks": [
+        {
+          "id": "c1",
+          "kind": "tool_trace",
+          "rule": "node_count",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "成功节点 15 ≥ 3",
+          "manual": false
+        },
+        {
+          "id": "c2",
+          "kind": "tool_trace",
+          "rule": "energy_steps_bound",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "thermo.formation 能量来源绑定到步骤",
+          "manual": false
+        },
+        {
+          "id": "c3",
+          "kind": "numeric",
+          "rule": "in_range",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "formation_energy_ev_per_atom=-2.6953 区间=[-4.5, -1.5]",
+          "manual": false
+        },
+        {
+          "id": "c4",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "命中 三重态|triplet|自旋极化.*?O2|O2.*?自旋极化",
+          "manual": false
+        },
+        {
+          "id": "c5",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "命中 (方法|赝势|泛函|截断|参数).*?(一致|相同|统一)|同一.*?(方法|赝势|泛函)",
+          "manual": false
+        },
+        {
+          "id": "c6",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 0.0,
+          "detail": "无一命中: ['(不等于|≠|不代表|不意味|不能说明).*?(convex hull|凸包|热力学稳定)|(convex hull|凸包).*?(未|没有|不).*?(穷举|验证|检索)']",
+          "manual": false
+        },
+        {
+          "id": "c7",
+          "kind": "audit",
+          "rule": "gating_all_pass",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "gating 全通过 (QE wall=23.5s)",
+          "manual": false
+        }
+      ],
+      "duration_sec": 38.011,
+      "fatal_error": null,
+      "needs_manual_review": false
+    }
+  ]
+}

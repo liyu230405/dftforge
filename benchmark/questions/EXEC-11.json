@@ -1,0 +1,98 @@
+{
+  "schema_version": "1.0",
+  "id": "EXEC-11",
+  "layer": "EXEC",
+  "title": "MgO 形成能闭环",
+  "prompt": "算 MgO 相对于 Mg 固体和 O2 分子的形成能，三个体系都用一致的方法。 直接运行本地 QE。本轮是有限参数下的链路验证，数值未经过收敛测试；只执行当前任务，不添加扫描。",
+  "run_config": {
+    "mode": "research",
+    "approved": true,
+    "accuracy": "custom",
+    "ecutwfc": 40,
+    "ecutrho": 320,
+    "kpoints": [
+      4,
+      4,
+      4,
+      1,
+      1,
+      1
+    ]
+  },
+  "expect": {
+    "execution_mode": "execute"
+  },
+  "budget_seconds": 240,
+  "checks": [
+    {
+      "id": "c1",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "node_count",
+      "args": {
+        "minimum": 3
+      }
+    },
+    {
+      "id": "c2",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "energy_steps_bound",
+      "args": {
+        "tool": "thermo.formation"
+      }
+    },
+    {
+      "id": "c3",
+      "kind": "numeric",
+      "weight": 1.0,
+      "rule": "in_range",
+      "args": {
+        "field": "formation_energy_ev_per_atom",
+        "low": -4.5,
+        "high": -1.5,
+        "unit": "eV/atom"
+      }
+    },
+    {
+      "id": "c4",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "三重态|triplet|自旋极化.*?O2|O2.*?自旋极化"
+        ]
+      }
+    },
+    {
+      "id": "c5",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(方法|赝势|泛函|截断|参数).*?(一致|相同|统一)|同一.*?(方法|赝势|泛函)"
+        ]
+      }
+    },
+    {
+      "id": "c6",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(不等于|≠|不代表|不意味|不能说明).*?(convex hull|凸包|热力学稳定)|(convex hull|凸包).*?(未|没有|不).*?(穷举|验证|检索)"
+        ]
+      }
+    },
+    {
+      "id": "c7",
+      "kind": "audit",
+      "weight": 1.0,
+      "rule": "gating_all_pass"
+    }
+  ],
+  "notes": "Mg hcp + O2 分子参考。GT 区间宽，首轮后收窄。"
+}

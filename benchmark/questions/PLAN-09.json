@@ -1,0 +1,88 @@
+{
+  "schema_version": "1.0",
+  "id": "PLAN-09",
+  "layer": "PLAN",
+  "title": "磁性基态比较",
+  "prompt": "比较 bcc Fe 的 NM、FM、AFM 三种磁序的总能量和磁矩。 只规划，不要实际运行。",
+  "run_config": {
+    "mode": "research",
+    "approved": true
+  },
+  "expect": {
+    "execution_mode": "plan",
+    "support_status": [
+      "complete",
+      "partial"
+    ]
+  },
+  "budget_seconds": 120,
+  "checks": [
+    {
+      "id": "c1",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "tool_planned",
+      "args": {
+        "tool": "workflow.magnetic_compare",
+        "args_contains": {
+          "orders": [
+            "NM",
+            "FM",
+            "AFM"
+          ]
+        }
+      }
+    },
+    {
+      "id": "c2",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "no_side_effect_calls"
+    },
+    {
+      "id": "c3",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_not_match",
+      "args": {
+        "patterns": [
+          "(无|没有|缺).*?Fe.*?(结构|材料库)|Fe.*?(不在|未收录).*?(材料库|库)"
+        ]
+      }
+    },
+    {
+      "id": "c4",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "initial_moment|初始磁矩|starting_magnetization"
+        ]
+      }
+    },
+    {
+      "id": "c5",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(一种|单一|仅).*?(AFM|反铁磁|交替|子格)|AFM.*?(初态|初始|不等于|≠).*?(基态|全局|穷举)"
+        ]
+      }
+    },
+    {
+      "id": "c6",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(实际|收敛后|最终).*?磁矩|磁矩.*?(实际|收敛|最终|realized)"
+        ]
+      }
+    }
+  ],
+  "notes": "c3：Fe 不在 MATERIAL_DB 但走 formula_atoms 的 bcc 原型，赝势存在。历史拒答已过时。"
+}

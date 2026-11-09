@@ -1,0 +1,1129 @@
+{
+  "meta": {
+    "bench_version": "1.0",
+    "round_id": "gt2",
+    "timestamp": "2026-10-08T09:16:23Z",
+    "git_sha": "a6eac1c",
+    "llm_model": "deepseek-flash",
+    "executor": "local",
+    "qe_version": "7.5",
+    "side_effect_table_drift": []
+  },
+  "layer_scores": {
+    "L1": null,
+    "L2": 0.8188,
+    "L3": null
+  },
+  "red_lines": {
+    "plan_only_violations": 0,
+    "audit_failures": 0,
+    "false_capability_claims": 0
+  },
+  "per_question": [
+    {
+      "question_id": "EXEC-01",
+      "layer": "EXEC",
+      "title": "Si vc-relax",
+      "total_score_raw": 1.0,
+      "total_score": 1.0,
+      "gating_failed": [],
+      "audit_flags": {
+        "non_empty_answer": true,
+        "qe_invoked": true,
+        "job_done": true,
+        "qe_wallclock_ok": true,
+        "no_fake_backend": true,
+        "plan_only_respected": false,
+        "paths_in_session": true,
+        "files_nonempty": true,
+        "_qe_wall_sec": 2.12,
+        "_total_wall_sec": 9.121,
+        "_side_effect_calls": [
+          "graph.run"
+        ],
+        "_qe_log_count": 1
+      },
+      "checks": [
+        {
+          "id": "c1",
+          "kind": "tool_trace",
+          "rule": "nodes_succeeded",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "节点全部成功: ['vc_relax']",
+          "manual": false
+        },
+        {
+          "id": "c2",
+          "kind": "numeric",
+          "rule": "graded_relative",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "a_conventional_angstrom=5.467902095370849 目标=5.467902 相对误差=1.744e-08 tol=0.005 → 1.000",
+          "manual": false
+        },
+        {
+          "id": "c3",
+          "kind": "numeric",
+          "rule": "upper_bound",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "pressure_kbar_abs=0.01 上限=0.5 → 1.000",
+          "manual": false
+        },
+        {
+          "id": "c4",
+          "kind": "numeric",
+          "rule": "upper_bound",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "max_force_ry_bohr=0.0 上限=0.001 → 1.000",
+          "manual": false
+        },
+        {
+          "id": "c5",
+          "kind": "audit",
+          "rule": "gating_all_pass",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "gating 全通过 (QE wall=2.12s)",
+          "manual": false
+        }
+      ],
+      "duration_sec": 9.121,
+      "fatal_error": null,
+      "needs_manual_review": false
+    },
+    {
+      "question_id": "EXEC-02",
+      "layer": "EXEC",
+      "title": "Si 能带与带隙",
+      "total_score_raw": 1.0,
+      "total_score": 1.0,
+      "gating_failed": [],
+      "audit_flags": {
+        "non_empty_answer": true,
+        "qe_invoked": true,
+        "job_done": true,
+        "qe_wallclock_ok": true,
+        "no_fake_backend": true,
+        "plan_only_respected": false,
+        "paths_in_session": true,
+        "files_nonempty": true,
+        "_qe_wall_sec": 4.68,
+        "_total_wall_sec": 16.843,
+        "_side_effect_calls": [
+          "graph.run"
+        ],
+        "_qe_log_count": 2
+      },
+      "checks": [
+        {
+          "id": "c1",
+          "kind": "tool_trace",
+          "rule": "nodes_succeeded",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "节点全部成功: ['scf', 'nscf', 'bands']",
+          "manual": false
+        },
+        {
+          "id": "c2",
+          "kind": "numeric",
+          "rule": "graded_absolute",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "band_gap_ev=0.5751055571005583 目标=0.575106 绝对误差=4.429e-07 tol=0.04 → 1.000",
+          "manual": false
+        },
+        {
+          "id": "c3",
+          "kind": "numeric",
+          "rule": "exact",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "n_atoms=2.0 期望=2",
+          "manual": false
+        },
+        {
+          "id": "c4",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "命中 PBE.*?(低估|偏小|underestimat)|不能?.*?(等同|直接比较|等于).*?实验|实验.*?(不能|不可).*?直接",
+          "manual": false
+        },
+        {
+          "id": "c5",
+          "kind": "audit",
+          "rule": "gating_all_pass",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "gating 全通过 (QE wall=4.68s)",
+          "manual": false
+        }
+      ],
+      "duration_sec": 16.843,
+      "fatal_error": null,
+      "needs_manual_review": false
+    },
+    {
+      "question_id": "EXEC-03",
+      "layer": "EXEC",
+      "title": "Cu 金属 DOS 与 PDOS",
+      "total_score_raw": 0.6667,
+      "total_score": 0.6667,
+      "gating_failed": [],
+      "audit_flags": {
+        "non_empty_answer": true,
+        "qe_invoked": true,
+        "job_done": true,
+        "qe_wallclock_ok": true,
+        "no_fake_backend": true,
+        "plan_only_respected": false,
+        "paths_in_session": true,
+        "files_nonempty": true,
+        "_qe_wall_sec": 3.4,
+        "_total_wall_sec": 14.548,
+        "_side_effect_calls": [
+          "graph.run"
+        ],
+        "_qe_log_count": 4
+      },
+      "checks": [
+        {
+          "id": "c1",
+          "kind": "tool_trace",
+          "rule": "nodes_succeeded",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "节点全部成功: ['scf', 'nscf', 'dos', 'pdos']",
+          "manual": false
+        },
+        {
+          "id": "c2",
+          "kind": "numeric",
+          "rule": "graded_relative",
+          "weight": 1.0,
+          "score": 0.0,
+          "detail": "dos_at_fermi=-2.6190199999996984e-06 目标=0.2727 相对误差=1 tol=0.05 → 0.000",
+          "manual": false
+        },
+        {
+          "id": "c3",
+          "kind": "numeric",
+          "rule": "graded_relative",
+          "weight": 1.0,
+          "score": 0.0,
+          "detail": "pdos_cu_at_fermi=-2.6540899991081313e-06 目标=0.272924 相对误差=1 tol=0.05 → 0.000",
+          "manual": false
+        },
+        {
+          "id": "c4",
+          "kind": "numeric",
+          "rule": "nonzero",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "e_fermi_ev=16.7109 需非零",
+          "manual": false
+        },
+        {
+          "id": "c5",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "命中 (Cu|铜).*?(金属|metal)|费米能.*?(有态|非零|存在态)",
+          "manual": false
+        },
+        {
+          "id": "c6",
+          "kind": "audit",
+          "rule": "gating_all_pass",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "gating 全通过 (QE wall=3.4s)",
+          "manual": false
+        }
+      ],
+      "duration_sec": 14.548,
+      "fatal_error": null,
+      "needs_manual_review": false
+    },
+    {
+      "question_id": "EXEC-04",
+      "layer": "EXEC",
+      "title": "Fe 三磁序比较",
+      "total_score_raw": 0.8333,
+      "total_score": 0.8333,
+      "gating_failed": [],
+      "audit_flags": {
+        "non_empty_answer": true,
+        "qe_invoked": true,
+        "job_done": true,
+        "qe_wallclock_ok": true,
+        "no_fake_backend": true,
+        "plan_only_respected": false,
+        "paths_in_session": true,
+        "files_nonempty": true,
+        "_qe_wall_sec": 7.78,
+        "_total_wall_sec": 57.3,
+        "_side_effect_calls": [
+          "workflow.magnetic_compare"
+        ],
+        "_qe_log_count": 3
+      },
+      "checks": [
+        {
+          "id": "c1",
+          "kind": "tool_trace",
+          "rule": "nodes_succeeded",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "节点全部成功: ['nm', 'fm', 'afm']",
+          "manual": false
+        },
+        {
+          "id": "c2",
+          "kind": "numeric",
+          "rule": "lowest_energy_order",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "基态磁序=fm 期望=fm 能量表={'afm': -6810.894248161434, 'fm': -6811.871460743161, 'nm': -6810.057467013389}",
+          "manual": false
+        },
+        {
+          "id": "c3",
+          "kind": "numeric",
+          "rule": "graded_relative",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "fm_total_moment_muB=5.35 目标=5.35 相对误差=0 tol=0.1 → 1.000",
+          "manual": false
+        },
+        {
+          "id": "c4",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 0.0,
+          "detail": "无一命中: ['AFM.*?(总磁矩|total).*?(0|零|接近零).*?(绝对|absolute).*?(非零|不为零)|绝对磁矩.*?(非零|不为零)']",
+          "manual": false
+        },
+        {
+          "id": "c5",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "命中 (一种|单一|仅).*?(AFM|反铁磁|交替|子格)|AFM.*?(初态|初始|不等于|≠).*?(基态|全局|穷举)",
+          "manual": false
+        },
+        {
+          "id": "c6",
+          "kind": "audit",
+          "rule": "gating_all_pass",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "gating 全通过 (QE wall=7.78s)",
+          "manual": false
+        }
+      ],
+      "duration_sec": 57.3,
+      "fatal_error": null,
+      "needs_manual_review": false
+    },
+    {
+      "question_id": "EXEC-05",
+      "layer": "EXEC",
+      "title": "MgO Γ 点声子",
+      "total_score_raw": 0.8571,
+      "total_score": 0.8571,
+      "gating_failed": [],
+      "audit_flags": {
+        "non_empty_answer": true,
+        "qe_invoked": true,
+        "job_done": true,
+        "qe_wallclock_ok": true,
+        "no_fake_backend": true,
+        "plan_only_respected": false,
+        "paths_in_session": true,
+        "files_nonempty": true,
+        "_qe_wall_sec": 1.38,
+        "_total_wall_sec": 13.719,
+        "_side_effect_calls": [
+          "workflow.phonon_dfpt"
+        ],
+        "_qe_log_count": 5
+      },
+      "checks": [
+        {
+          "id": "c1",
+          "kind": "tool_trace",
+          "rule": "nodes_succeeded",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "节点全部成功: ['relax', 'scf', 'ph', 'q2r', 'matdyn']",
+          "manual": false
+        },
+        {
+          "id": "c2",
+          "kind": "numeric",
+          "rule": "acoustic_modes_near_zero",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "声学支 [-0.0, -0.0, -0.0] 最大 |ω|=0 限=0.5 → 1.000",
+          "manual": false
+        },
+        {
+          "id": "c3",
+          "kind": "numeric",
+          "rule": "graded_relative",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "optical_mode_thz=25.918065 目标=25.9187 相对误差=2.45e-05 tol=0.05 → 1.000",
+          "manual": false
+        },
+        {
+          "id": "c4",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "命中 (0\\.1\\s*THz|阈值).*?(未|没有|无).*?(虚频|显著虚频)",
+          "manual": false
+        },
+        {
+          "id": "c5",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "命中 (仅|只有?).*?(Γ|Gamma|gamma).*?(不|≠|不能).*?(代表|等于|外推|说明)|(Γ|Gamma).*?点.*?(不足以|不代表)",
+          "manual": false
+        },
+        {
+          "id": "c6",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 0.0,
+          "detail": "无一命中: ['(方法|赝势|泛函|截断|参数).*?(一致|相同|统一)|同一.*?(方法|赝势|泛函)']",
+          "manual": false
+        },
+        {
+          "id": "c7",
+          "kind": "audit",
+          "rule": "gating_all_pass",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "gating 全通过 (QE wall=1.38s)",
+          "manual": false
+        }
+      ],
+      "duration_sec": 13.719,
+      "fatal_error": null,
+      "needs_manual_review": false
+    },
+    {
+      "question_id": "EXEC-06",
+      "layer": "EXEC",
+      "title": "Si 中性空位形成能",
+      "total_score_raw": 0.875,
+      "total_score": 0.875,
+      "gating_failed": [],
+      "audit_flags": {
+        "non_empty_answer": true,
+        "qe_invoked": true,
+        "job_done": true,
+        "qe_wallclock_ok": true,
+        "no_fake_backend": true,
+        "plan_only_respected": false,
+        "paths_in_session": true,
+        "files_nonempty": true,
+        "_qe_wall_sec": 64.12,
+        "_total_wall_sec": 182.401,
+        "_side_effect_calls": [
+          "workflow.neutral_vacancy"
+        ],
+        "_qe_log_count": 3
+      },
+      "checks": [
+        {
+          "id": "c1",
+          "kind": "tool_trace",
+          "rule": "nodes_succeeded",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "节点全部成功: ['pristine_scf', 'defect_relax', 'defect_scf']",
+          "manual": false
+        },
+        {
+          "id": "c2",
+          "kind": "numeric",
+          "rule": "graded_relative",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "formation_energy_ev=2.9851085103190584 目标=2.985109 相对误差=1.64e-07 tol=0.03 → 1.000",
+          "manual": false
+        },
+        {
+          "id": "c3",
+          "kind": "numeric",
+          "rule": "exact",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "n_atoms_pristine=16.0 期望=16",
+          "manual": false
+        },
+        {
+          "id": "c4",
+          "kind": "numeric",
+          "rule": "exact",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "n_atoms_defect=15.0 期望=15",
+          "manual": false
+        },
+        {
+          "id": "c5",
+          "kind": "numeric",
+          "rule": "upper_bound",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "max_force_ry_bohr=0.0005918327588939294 上限=0.001 → 1.000",
+          "manual": false
+        },
+        {
+          "id": "c6",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "命中 same_method_bulk_per_atom|同方法.*?(每原子|E/N|per.?atom)|完美超胞.*?(每原子|平均)",
+          "manual": false
+        },
+        {
+          "id": "c7",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 0.0,
+          "detail": "无一命中: ['(无|没有|不含|未做).*?(带电|charged).*?(态|修正)|有限尺寸.*?(未|没有|不)']",
+          "manual": false
+        },
+        {
+          "id": "c8",
+          "kind": "audit",
+          "rule": "gating_all_pass",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "gating 全通过 (QE wall=64.12s)",
+          "manual": false
+        }
+      ],
+      "duration_sec": 182.401,
+      "fatal_error": null,
+      "needs_manual_review": false
+    },
+    {
+      "question_id": "EXEC-07",
+      "layer": "EXEC",
+      "title": "P 掺杂 Si 对照",
+      "total_score_raw": 0.8571,
+      "total_score": 0.8571,
+      "gating_failed": [],
+      "audit_flags": {
+        "non_empty_answer": true,
+        "qe_invoked": true,
+        "job_done": true,
+        "qe_wallclock_ok": true,
+        "no_fake_backend": true,
+        "plan_only_respected": false,
+        "paths_in_session": true,
+        "files_nonempty": true,
+        "_qe_wall_sec": 59.06,
+        "_total_wall_sec": 206.77,
+        "_side_effect_calls": [
+          "structure.dope",
+          "graph.run",
+          "structure.supercell",
+          "graph.run"
+        ],
+        "_qe_log_count": 4
+      },
+      "checks": [
+        {
+          "id": "c1",
+          "kind": "tool_trace",
+          "rule": "node_count",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "成功节点 19 ≥ 6",
+          "manual": false
+        },
+        {
+          "id": "c2",
+          "kind": "tool_trace",
+          "rule": "no_self_doping",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "无自掺杂",
+          "manual": false
+        },
+        {
+          "id": "c3",
+          "kind": "numeric",
+          "rule": "exact",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "n_atoms_doped=16.0 期望=16",
+          "manual": false
+        },
+        {
+          "id": "c4",
+          "kind": "numeric",
+          "rule": "exact",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "n_atoms_pristine=16.0 期望=16",
+          "manual": false
+        },
+        {
+          "id": "c5",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "命中 (金属|metallic|展宽下?不可分辨|无法分辨).*?(Si15P|掺杂)|(Si15P|掺杂).*?(金属|metallic|不可分辨)",
+          "manual": false
+        },
+        {
+          "id": "c6",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 0.0,
+          "detail": "无一命中: ['6\\\\.25\\\\s*%|高掺杂|理想.*?未弛豫|未弛豫.*?理想']",
+          "manual": false
+        },
+        {
+          "id": "c7",
+          "kind": "audit",
+          "rule": "gating_all_pass",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "gating 全通过 (QE wall=59.06s)",
+          "manual": false
+        }
+      ],
+      "duration_sec": 206.77,
+      "fatal_error": null,
+      "needs_manual_review": false
+    },
+    {
+      "question_id": "EXEC-08",
+      "layer": "EXEC",
+      "title": "GaAs 结构优化（新体系泛化）",
+      "total_score_raw": 0.8,
+      "total_score": 0.8,
+      "gating_failed": [],
+      "audit_flags": {
+        "non_empty_answer": true,
+        "qe_invoked": true,
+        "job_done": true,
+        "qe_wallclock_ok": true,
+        "no_fake_backend": true,
+        "plan_only_respected": false,
+        "paths_in_session": true,
+        "files_nonempty": true,
+        "_qe_wall_sec": 25.67,
+        "_total_wall_sec": 33.2,
+        "_side_effect_calls": [
+          "graph.run"
+        ],
+        "_qe_log_count": 1
+      },
+      "checks": [
+        {
+          "id": "c1",
+          "kind": "tool_trace",
+          "rule": "nodes_succeeded",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "节点全部成功: ['vc_relax']",
+          "manual": false
+        },
+        {
+          "id": "c2",
+          "kind": "numeric",
+          "rule": "graded_relative",
+          "weight": 1.0,
+          "score": 0.0,
+          "detail": "a_conventional_angstrom=5.7272025699152564，目标值尚未冻结（等 freeze_gt）",
+          "manual": false
+        },
+        {
+          "id": "c3",
+          "kind": "numeric",
+          "rule": "upper_bound",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "pressure_kbar_abs=0.29 上限=1.0 → 1.000",
+          "manual": false
+        },
+        {
+          "id": "c4",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "命中 Ga.*?As.*?(赝势|pseudo)|(赝势|pseudo).*?Ga.*?As",
+          "manual": false
+        },
+        {
+          "id": "c5",
+          "kind": "audit",
+          "rule": "gating_all_pass",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "gating 全通过 (QE wall=25.67s)",
+          "manual": false
+        }
+      ],
+      "duration_sec": 33.2,
+      "fatal_error": null,
+      "needs_manual_review": false
+    },
+    {
+      "question_id": "EXEC-09",
+      "layer": "EXEC",
+      "title": "NaCl 离子晶体 DOS",
+      "total_score_raw": 0.8889,
+      "total_score": 0.8889,
+      "gating_failed": [],
+      "audit_flags": {
+        "non_empty_answer": true,
+        "qe_invoked": true,
+        "job_done": true,
+        "qe_wallclock_ok": true,
+        "no_fake_backend": true,
+        "plan_only_respected": false,
+        "paths_in_session": true,
+        "files_nonempty": true,
+        "_qe_wall_sec": 29.38,
+        "_total_wall_sec": 36.983,
+        "_side_effect_calls": [
+          "graph.run"
+        ],
+        "_qe_log_count": 4
+      },
+      "checks": [
+        {
+          "id": "c1",
+          "kind": "tool_trace",
+          "rule": "nodes_succeeded",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "节点全部成功: ['scf', 'nscf', 'dos', 'pdos']",
+          "manual": false
+        },
+        {
+          "id": "c2",
+          "kind": "numeric",
+          "rule": "upper_bound",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "dos_at_fermi=-9.1076e-79 上限=0.01 → 1.000",
+          "manual": false
+        },
+        {
+          "id": "c3",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "命中 (NaCl|氯化钠).*?(绝缘|带隙)|(宽|大).*?带隙|EF.*?(带隙|gap).*?(中|内)",
+          "manual": false
+        },
+        {
+          "id": "c4",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 0.5,
+          "score": 0.0,
+          "detail": "无一命中: ['Cl.*?3p|Cl.*?p.*?(价带|VBM|主导)']",
+          "manual": false
+        },
+        {
+          "id": "c5",
+          "kind": "audit",
+          "rule": "gating_all_pass",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "gating 全通过 (QE wall=29.38s)",
+          "manual": false
+        }
+      ],
+      "duration_sec": 36.983,
+      "fatal_error": null,
+      "needs_manual_review": false
+    },
+    {
+      "question_id": "EXEC-10",
+      "layer": "EXEC",
+      "title": "收敛扫描实跑",
+      "total_score_raw": 0.8,
+      "total_score": 0.8,
+      "gating_failed": [],
+      "audit_flags": {
+        "non_empty_answer": true,
+        "qe_invoked": true,
+        "job_done": true,
+        "qe_wallclock_ok": true,
+        "no_fake_backend": true,
+        "plan_only_respected": false,
+        "paths_in_session": true,
+        "files_nonempty": true,
+        "_qe_wall_sec": 3.98,
+        "_total_wall_sec": 24.744,
+        "_side_effect_calls": [
+          "workflow.convergence"
+        ],
+        "_qe_log_count": 4
+      },
+      "checks": [
+        {
+          "id": "c1",
+          "kind": "tool_trace",
+          "rule": "node_count",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "成功节点 11 ≥ 4",
+          "manual": false
+        },
+        {
+          "id": "c2",
+          "kind": "numeric",
+          "rule": "selected_within_threshold",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "选定 40.0，并声明了 1.0 meV/atom 判据",
+          "manual": false
+        },
+        {
+          "id": "c3",
+          "kind": "assertion",
+          "rule": "reference_is_highest",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "参考点 50.0 = 最高截断，选定 40.0",
+          "manual": false
+        },
+        {
+          "id": "c4",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 0.0,
+          "detail": "无一命中: ['能量收敛.*?(不等于|≠|不代表|不意味).*?(带隙|物性|声子|其他)|(带隙|物性|声子).*?(另需|单独|独立).*?收敛']",
+          "manual": false
+        },
+        {
+          "id": "c5",
+          "kind": "audit",
+          "rule": "gating_all_pass",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "gating 全通过 (QE wall=3.98s)",
+          "manual": false
+        }
+      ],
+      "duration_sec": 24.744,
+      "fatal_error": null,
+      "needs_manual_review": false
+    },
+    {
+      "question_id": "EXEC-11",
+      "layer": "EXEC",
+      "title": "MgO 形成能闭环",
+      "total_score_raw": 0.5714,
+      "total_score": 0.5714,
+      "gating_failed": [],
+      "audit_flags": {
+        "non_empty_answer": true,
+        "qe_invoked": true,
+        "job_done": true,
+        "qe_wallclock_ok": true,
+        "no_fake_backend": true,
+        "plan_only_respected": false,
+        "paths_in_session": true,
+        "files_nonempty": true,
+        "_qe_wall_sec": 28.6,
+        "_total_wall_sec": 45.39,
+        "_side_effect_calls": [
+          "graph.run",
+          "structure.reference",
+          "graph.run",
+          "structure.reference",
+          "graph.run"
+        ],
+        "_qe_log_count": 3
+      },
+      "checks": [
+        {
+          "id": "c1",
+          "kind": "tool_trace",
+          "rule": "node_count",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "成功节点 15 ≥ 3",
+          "manual": false
+        },
+        {
+          "id": "c2",
+          "kind": "tool_trace",
+          "rule": "energy_steps_bound",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "thermo.formation 能量来源绑定到步骤",
+          "manual": false
+        },
+        {
+          "id": "c3",
+          "kind": "numeric",
+          "rule": "in_range",
+          "weight": 1.0,
+          "score": 0.0,
+          "detail": "formation_energy_ev_per_atom=846.4033 区间=[-4.5, -1.5]",
+          "manual": false
+        },
+        {
+          "id": "c4",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 0.0,
+          "detail": "无一命中: ['三重态|triplet|自旋极化.*?O2|O2.*?自旋极化']",
+          "manual": false
+        },
+        {
+          "id": "c5",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "命中 (方法|赝势|泛函|截断|参数).*?(一致|相同|统一)|同一.*?(方法|赝势|泛函)",
+          "manual": false
+        },
+        {
+          "id": "c6",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 0.0,
+          "detail": "无一命中: ['(不等于|≠|不代表|不意味|不能说明).*?(convex hull|凸包|热力学稳定)|(convex hull|凸包).*?(未|没有|不).*?(穷举|验证|检索)']",
+          "manual": false
+        },
+        {
+          "id": "c7",
+          "kind": "audit",
+          "rule": "gating_all_pass",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "gating 全通过 (QE wall=28.6s)",
+          "manual": false
+        }
+      ],
+      "duration_sec": 45.39,
+      "fatal_error": null,
+      "needs_manual_review": false
+    },
+    {
+      "question_id": "EXEC-12",
+      "layer": "EXEC",
+      "title": "石墨烯单层 + N 掺杂",
+      "total_score_raw": 0.9231,
+      "total_score": 0.9231,
+      "gating_failed": [],
+      "audit_flags": {
+        "non_empty_answer": true,
+        "qe_invoked": true,
+        "job_done": true,
+        "qe_wallclock_ok": true,
+        "no_fake_backend": true,
+        "plan_only_respected": false,
+        "paths_in_session": true,
+        "files_nonempty": true,
+        "_qe_wall_sec": 48.59,
+        "_total_wall_sec": 60.573,
+        "_side_effect_calls": [
+          "structure.build2d",
+          "graph.run"
+        ],
+        "_qe_log_count": 4
+      },
+      "checks": [
+        {
+          "id": "c1",
+          "kind": "tool_trace",
+          "rule": "tool_planned",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "structure.build2d 参数匹配 {'kind': 'graphene', 'supercell': '3x3'}",
+          "manual": false
+        },
+        {
+          "id": "c2",
+          "kind": "numeric",
+          "rule": "exact",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "n_atoms=18.0 期望=18",
+          "manual": false
+        },
+        {
+          "id": "c3",
+          "kind": "numeric",
+          "rule": "exact",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "n_atoms_N=1.0 期望=1",
+          "manual": false
+        },
+        {
+          "id": "c4",
+          "kind": "numeric",
+          "rule": "exact",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "kpoints_kz=1.0 期望=1",
+          "manual": false
+        },
+        {
+          "id": "c5",
+          "kind": "numeric",
+          "rule": "lower_bound",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "vacuum_angstrom=15.0 下限=15.0 → 1.000",
+          "manual": false
+        },
+        {
+          "id": "c6",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 0.5,
+          "score": 0.0,
+          "detail": "无一命中: ['n.?型|n.?type|电子掺杂|EF.*?(上移|升高|移向导带)']",
+          "manual": false
+        },
+        {
+          "id": "c7",
+          "kind": "audit",
+          "rule": "gating_all_pass",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "gating 全通过 (QE wall=48.59s)",
+          "manual": false
+        }
+      ],
+      "duration_sec": 60.573,
+      "fatal_error": null,
+      "needs_manual_review": false
+    },
+    {
+      "question_id": "EXEC-13",
+      "layer": "EXEC",
+      "title": "O@MoS2 单位点吸附能",
+      "total_score_raw": 0.5714,
+      "total_score": 0.5714,
+      "gating_failed": [],
+      "audit_flags": {
+        "non_empty_answer": true,
+        "qe_invoked": true,
+        "job_done": true,
+        "qe_wallclock_ok": true,
+        "no_fake_backend": true,
+        "plan_only_respected": false,
+        "paths_in_session": true,
+        "files_nonempty": true,
+        "_qe_wall_sec": 52.1,
+        "_total_wall_sec": 720.705,
+        "_side_effect_calls": [
+          "workflow.adsorption_scan"
+        ],
+        "_qe_log_count": 2
+      },
+      "checks": [
+        {
+          "id": "c1",
+          "kind": "tool_trace",
+          "rule": "node_count",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "成功节点 5 ≥ 4",
+          "manual": false
+        },
+        {
+          "id": "c2",
+          "kind": "tool_trace",
+          "rule": "energy_steps_bound",
+          "weight": 1.0,
+          "score": 0.0,
+          "detail": "计划里没有 thermo.eads",
+          "manual": false
+        },
+        {
+          "id": "c3",
+          "kind": "numeric",
+          "rule": "finite",
+          "weight": 1.0,
+          "score": 0.0,
+          "detail": "未提取到 e_ads_ev",
+          "manual": false
+        },
+        {
+          "id": "c4",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "命中 三重态|triplet|自旋极化.*?O2|O2.*?自旋极化",
+          "manual": false
+        },
+        {
+          "id": "c5",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "命中 固定(晶胞|胞|面内|晶格)|面内晶格.*?(不变|固定)|fixed.?cell",
+          "manual": false
+        },
+        {
+          "id": "c6",
+          "kind": "assertion",
+          "rule": "must_match",
+          "weight": 1.0,
+          "score": 0.0,
+          "detail": "无一命中: ['(单|一个|仅).*?位点.*?(不等于|≠|不代表|不一定).*?(最稳|最低|全局)']",
+          "manual": false
+        },
+        {
+          "id": "c7",
+          "kind": "audit",
+          "rule": "gating_all_pass",
+          "weight": 1.0,
+          "score": 1.0,
+          "detail": "gating 全通过 (QE wall=52.1s)",
+          "manual": false
+        }
+      ],
+      "duration_sec": 720.705,
+      "fatal_error": null,
+      "needs_manual_review": false
+    }
+  ]
+}

@@ -1,0 +1,113 @@
+{
+  "schema_version": "1.0",
+  "id": "EXEC-06",
+  "layer": "EXEC",
+  "title": "Si 中性空位形成能",
+  "prompt": "运行 Si 中性空位形成能：workflow.neutral_vacancy，source=Si、element=Si、supercell=2x2x2、relax=true、reference_mode=same_method_bulk_per_atom。显式以同方法完美 Si 超胞的每原子能量为化学势，不另填数值。 直接运行本地 QE。本轮是有限参数下的链路验证，数值未经过收敛测试；只执行当前任务，不添加扫描。",
+  "run_config": {
+    "mode": "research",
+    "approved": true,
+    "accuracy": "custom",
+    "ecutwfc": 30,
+    "ecutrho": 240,
+    "kpoints": [
+      2,
+      2,
+      2,
+      1,
+      1,
+      1
+    ]
+  },
+  "expect": {
+    "execution_mode": "execute"
+  },
+  "budget_seconds": 420,
+  "checks": [
+    {
+      "id": "c1",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "nodes_succeeded",
+      "args": {
+        "nodes": [
+          "pristine_scf",
+          "defect_relax",
+          "defect_scf"
+        ]
+      }
+    },
+    {
+      "id": "c2",
+      "kind": "numeric",
+      "weight": 1.0,
+      "rule": "graded_relative",
+      "args": {
+        "field": "formation_energy_ev",
+        "value": 2.985109,
+        "tolerance": 0.03,
+        "unit": "eV"
+      }
+    },
+    {
+      "id": "c3",
+      "kind": "numeric",
+      "weight": 1.0,
+      "rule": "exact",
+      "args": {
+        "field": "n_atoms_pristine",
+        "value": 16
+      }
+    },
+    {
+      "id": "c4",
+      "kind": "numeric",
+      "weight": 1.0,
+      "rule": "exact",
+      "args": {
+        "field": "n_atoms_defect",
+        "value": 15
+      }
+    },
+    {
+      "id": "c5",
+      "kind": "numeric",
+      "weight": 1.0,
+      "rule": "upper_bound",
+      "args": {
+        "field": "max_force_ry_bohr",
+        "limit": 0.001,
+        "unit": "Ry/bohr"
+      }
+    },
+    {
+      "id": "c6",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "same_method_bulk_per_atom|同方法.*?(每原子|E/N|per.?atom)|完美超胞.*?(每原子|平均)"
+        ]
+      }
+    },
+    {
+      "id": "c7",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(无|没有|不含|未做).*?(带电|charged).*?(态|修正)|有限尺寸.*?(未|没有|不)"
+        ]
+      }
+    },
+    {
+      "id": "c8",
+      "kind": "audit",
+      "weight": 1.0,
+      "rule": "gating_all_pass"
+    }
+  ],
+  "notes": "GT E_f=2.985109 eV。本套最重的题之一，实测 defect_relax 单节点 3 min 4 s。"
+}

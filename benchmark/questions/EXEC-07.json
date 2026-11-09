@@ -1,0 +1,94 @@
+{
+  "schema_version": "1.0",
+  "id": "EXEC-07",
+  "layer": "EXEC",
+  "title": "P 掺杂 Si 对照",
+  "prompt": "生成 P 掺杂 Si 的 2x2x2 原胞超胞与同尺寸纯 Si 超胞，分别计算能带并比较带隙。每个体系 40 条能带、30 个路径点，不做弛豫。 直接运行本地 QE。本轮是有限参数下的链路验证，数值未经过收敛测试；只执行当前任务，不添加扫描。",
+  "run_config": {
+    "mode": "research",
+    "approved": true,
+    "accuracy": "custom",
+    "ecutwfc": 25,
+    "ecutrho": 200,
+    "kpoints": [
+      2,
+      2,
+      2,
+      1,
+      1,
+      1
+    ],
+    "nbnd": 40,
+    "nkpoints_bands": 30
+  },
+  "expect": {
+    "execution_mode": "execute"
+  },
+  "budget_seconds": 420,
+  "checks": [
+    {
+      "id": "c1",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "node_count",
+      "args": {
+        "minimum": 6
+      }
+    },
+    {
+      "id": "c2",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "no_self_doping"
+    },
+    {
+      "id": "c3",
+      "kind": "numeric",
+      "weight": 1.0,
+      "rule": "exact",
+      "args": {
+        "field": "n_atoms_doped",
+        "value": 16
+      }
+    },
+    {
+      "id": "c4",
+      "kind": "numeric",
+      "weight": 1.0,
+      "rule": "exact",
+      "args": {
+        "field": "n_atoms_pristine",
+        "value": 16
+      }
+    },
+    {
+      "id": "c5",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(金属|metallic|展宽下?不可分辨|无法分辨).*?(Si15P|掺杂)|(Si15P|掺杂).*?(金属|metallic|不可分辨)"
+        ]
+      }
+    },
+    {
+      "id": "c6",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "6\\.25\\s*%|高掺杂|理想.*?未弛豫|未弛豫.*?理想"
+        ]
+      }
+    },
+    {
+      "id": "c7",
+      "kind": "audit",
+      "weight": 1.0,
+      "rule": "gating_all_pass"
+    }
+  ],
+  "notes": "c5：Si15P 不能报告为可靠有限带隙（2026-09-22 实测 0.052817 eV 属展宽内噪声）。"
+}
