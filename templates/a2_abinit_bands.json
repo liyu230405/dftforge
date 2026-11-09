@@ -1,0 +1,52 @@
+{
+  "template_id": "a2_abinit_bands",
+  "description": "ABINIT band structure: scf (writes density) -> bands (iscf -2 line-mode k-path, reuses density)",
+  "inputs": {
+    "_parameters_locked": false,
+    "material": "Si",
+    "ecut": null,
+    "ngkpt": null,
+    "ndivsm": 10,
+    "nband": null,
+    "structure": null
+  },
+  "outputs": {
+    "scf_energy_ev": "${nodes.scf.outputs.energy_ev}",
+    "band_gap_ev": "${nodes.bands.outputs.band_gap_ev}",
+    "is_metal": "${nodes.bands.outputs.is_metal}",
+    "n_bands": "${nodes.bands.outputs.n_bands}"
+  },
+  "nodes": [
+    {
+      "id": "scf",
+      "tool": "abinit",
+      "params": {
+        "calc": "scf",
+        "_parameters_locked": "${inputs._parameters_locked}",
+        "material": "${inputs.material}",
+        "ecut": "${inputs.ecut}",
+        "ngkpt": "${inputs.ngkpt}",
+        "structure": "${inputs.structure}"
+      },
+      "depends_on": [],
+      "max_repair_attempts": 2
+    },
+    {
+      "id": "bands",
+      "tool": "abinit",
+      "params": {
+        "calc": "bands",
+        "_parameters_locked": "${inputs._parameters_locked}",
+        "material": "${inputs.material}",
+        "ecut": "${inputs.ecut}",
+        "ndivsm": "${inputs.ndivsm}",
+        "nband": "${inputs.nband}",
+        "structure": "${inputs.structure}"
+      },
+      "depends_on": [
+        "scf"
+      ],
+      "max_repair_attempts": 1
+    }
+  ]
+}

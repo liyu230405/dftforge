@@ -1,0 +1,35 @@
+{
+  "template_id": "a1_abinit_relax",
+  "description": "ABINIT ionic + cell relaxation (ionmov 2, optcell 2); exports relaxed structure",
+  "inputs": {
+    "_parameters_locked": false,
+    "material": "Si",
+    "ecut": null,
+    "ngkpt": null,
+    "tolmxf": null,
+    "structure": null
+  },
+  "outputs": {
+    "energy_ev": "${nodes.relax.outputs.energy_ev}",
+    "converged": "${nodes.relax.outputs.converged}",
+    "final_volume_ang3": "${nodes.relax.outputs.final_volume_ang3}",
+    "final_structure_cif": "${nodes.relax.outputs.final_structure_cif}"
+  },
+  "nodes": [
+    {
+      "id": "relax",
+      "tool": "abinit",
+      "params": {
+        "calc": "vc-relax",
+        "_parameters_locked": "${inputs._parameters_locked}",
+        "material": "${inputs.material}",
+        "ecut": "${inputs.ecut}",
+        "ngkpt": "${inputs.ngkpt}",
+        "tolmxf": "${inputs.tolmxf}",
+        "structure": "${inputs.structure}"
+      },
+      "depends_on": [],
+      "max_repair_attempts": 2
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "template_id": "v3_vasp_phonon",
+  "description": "VASP Gamma-point phonons via DFPT (IBRION=8); frequencies in THz from OUTCAR",
+  "inputs": {
+    "_parameters_locked": false,
+    "material": "Si",
+    "encut": null,
+    "kpoints": null,
+    "kspacing": null,
+    "supercell": null,
+    "structure": null
+  },
+  "outputs": {
+    "n_modes": "${nodes.phonon.outputs.n_modes}",
+    "frequencies_thz": "${nodes.phonon.outputs.frequencies_thz}",
+    "has_imaginary_modes": "${nodes.phonon.outputs.has_imaginary_modes}"
+  },
+  "nodes": [
+    {
+      "id": "phonon",
+      "tool": "vasp",
+      "params": {
+        "calc": "phonon",
+        "_parameters_locked": "${inputs._parameters_locked}",
+        "material": "${inputs.material}",
+        "encut": "${inputs.encut}",
+        "kpoints": "${inputs.kpoints}",
+        "kspacing": "${inputs.kspacing}",
+        "supercell": "${inputs.supercell}",
+        "structure": "${inputs.structure}"
+      },
+      "depends_on": [],
+      "max_repair_attempts": 1
+    }
+  ]
+}

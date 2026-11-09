@@ -1,0 +1,39 @@
+{
+  "template_id": "v1_vasp_relax",
+  "description": "VASP variable-cell relaxation (ions + cell) with force-convergence verification",
+  "inputs": {
+    "_parameters_locked": false,
+    "material": "Si",
+    "encut": null,
+    "kpoints": null,
+    "kspacing": null,
+    "ediffg": null,
+    "supercell": null,
+    "structure": null
+  },
+  "outputs": {
+    "energy_ev": "${nodes.vc_relax.outputs.energy_ev}",
+    "final_volume_ang3": "${nodes.vc_relax.outputs.final_volume_ang3}",
+    "max_force_ev_ang": "${nodes.vc_relax.outputs.max_force_ev_ang}",
+    "final_structure_cif": "${nodes.vc_relax.outputs.final_structure_cif}"
+  },
+  "nodes": [
+    {
+      "id": "vc_relax",
+      "tool": "vasp",
+      "params": {
+        "calc": "vc-relax",
+        "_parameters_locked": "${inputs._parameters_locked}",
+        "material": "${inputs.material}",
+        "encut": "${inputs.encut}",
+        "kpoints": "${inputs.kpoints}",
+        "kspacing": "${inputs.kspacing}",
+        "ediffg": "${inputs.ediffg}",
+        "supercell": "${inputs.supercell}",
+        "structure": "${inputs.structure}"
+      },
+      "depends_on": [],
+      "max_repair_attempts": 2
+    }
+  ]
+}

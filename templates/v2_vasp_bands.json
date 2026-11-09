@@ -1,0 +1,52 @@
+{
+  "template_id": "v2_vasp_bands",
+  "description": "VASP band structure: scf (writes CHGCAR) -> bands (ICHARG=11 line-mode k-path)",
+  "inputs": {
+    "_parameters_locked": false,
+    "material": "Si",
+    "encut": null,
+    "kpoints": null,
+    "kspacing": null,
+    "nkpoints_bands": 40,
+    "structure": null
+  },
+  "outputs": {
+    "scf_energy_ev": "${nodes.scf.outputs.energy_ev}",
+    "band_gap_ev": "${nodes.bands.outputs.band_gap_ev}",
+    "is_metal": "${nodes.bands.outputs.is_metal}",
+    "n_bands": "${nodes.bands.outputs.n_bands}"
+  },
+  "nodes": [
+    {
+      "id": "scf",
+      "tool": "vasp",
+      "params": {
+        "calc": "scf",
+        "_parameters_locked": "${inputs._parameters_locked}",
+        "material": "${inputs.material}",
+        "encut": "${inputs.encut}",
+        "kpoints": "${inputs.kpoints}",
+        "kspacing": "${inputs.kspacing}",
+        "structure": "${inputs.structure}"
+      },
+      "depends_on": [],
+      "max_repair_attempts": 2
+    },
+    {
+      "id": "bands",
+      "tool": "vasp",
+      "params": {
+        "calc": "bands",
+        "_parameters_locked": "${inputs._parameters_locked}",
+        "material": "${inputs.material}",
+        "encut": "${inputs.encut}",
+        "nkpoints_bands": "${inputs.nkpoints_bands}",
+        "structure": "${inputs.structure}"
+      },
+      "depends_on": [
+        "scf"
+      ],
+      "max_repair_attempts": 1
+    }
+  ]
+}

@@ -16,6 +16,7 @@ import binascii
 import dataclasses
 import hashlib
 import json
+import shutil
 import logging
 import os
 import re
@@ -243,6 +244,35 @@ class FakeExecutor(Executor):
     def run_matdyn_x(self, input_file: Path, workdir: Path, timeout: float | None = None) -> JobResult:
         return self.run_pw(input_file, workdir, timeout=timeout)
 
+    def run_vasp(self, workdir: Path, *, timeout: float | None = None) -> JobResult:
+        """VASP reads its inputs from workdir and writes OUTCAR/vasprun.xml
+        there; tests inject those via ``output_files`` written ahead of time or
+        rely on the parser fallback to ``stdout``."""
+        return JobResult(
+            success=(self.mode != "failure"),
+            exit_code=self.exit_code,
+            stdout=self.stdout,
+            output_files=self.output_files,
+            walltime_sec=self.walltime_sec,
+            job_done=(self.mode != "failure"),
+            remote_path=str(Path(workdir).resolve()),
+        )
+
+    def run_abinit(self, input_file: Path, workdir: Path, *, timeout: float | None = None,
+                   binary: str = "abinit") -> JobResult:
+        """ABINIT (and anaddb) read a single input file and write a .abo text
+        output; tests inject that via files written ahead of time or rely on the
+        parser fallback to ``stdout``. ``binary`` selects abinit vs anaddb."""
+        return JobResult(
+            success=(self.mode != "failure"),
+            exit_code=self.exit_code,
+            stdout=self.stdout,
+            output_files=self.output_files,
+            walltime_sec=self.walltime_sec,
+            job_done=(self.mode != "failure"),
+            remote_path=str(Path(workdir).resolve()),
+        )
+
 
 # ── LocalExecutor ──────────────────────────────────────────────────────────────
 
@@ -255,20 +285,32 @@ class LocalExecutor(Executor):
 
     def __init__(
         self,
-        qe_bin_dir: Path,
+        qe_bin_dir: Optional[Path] = None,
         max_walltime_sec: int = 600,
         max_retries: int = 2,
         workdir: Optional[Path] = None,
+        vasp_bin: Optional[str] = None,
+        abinit_bin: Optional[str] = None,
     ):
-        self.qe_bin_dir = Path(qe_bin_dir)
+        self.qe_bin_dir = Path(qe_bin_dir) if qe_bin_dir is not None else None
         self.max_walltime_sec = max_walltime_sec
         self.max_retries = max_retries
         self.workdir = Path(workdir) if workdir else None
+        # Full path to vasp_std (or vasp_gam/vasp_ncl). VASP is licensed and
+        # user-supplied; None means this executor cannot run VASP nodes.
+        self.vasp_bin = vasp_bin
+        # Directory holding the abinit/anaddb binaries (free, open source).
+        # None means this executor cannot run ABINIT nodes.
+        self.abinit_bin = abinit_bin
         self._running: Dict[int, subprocess.Popen] = {}
         self._proc_lock = threading.Lock()
         self._validate_bins()
 
     def _validate_bins(self) -> None:
+        if self.qe_bin_dir is None:
+            if self.abinit_bin or self.vasp_bin:
+                return
+            raise FileNotFoundError("No local computation engine configured")
         required = ["pw.x"]
         for binary in required:
             path = self.qe_bin_dir / binary
@@ -357,7 +399,106 @@ class LocalExecutor(Executor):
     def run_matdyn_x(self, input_file: Path, workdir: Path, timeout: float | None = None) -> JobResult:
         return self._run_tool("matdyn.x", input_file, workdir, timeout=timeout)
 
+    def run_vasp(self, workdir: Path, *, timeout: float | None = None) -> JobResult:
+        """Run vasp_std in workdir. VASP reads INCAR/POSCAR/KPOINTS/POTCAR from
+        the current directory and takes no input-file argument, unlike QE."""
+        return self._run_workdir_tool(self.vasp_bin, workdir, timeout=timeout)
+
+    def run_abinit(self, input_file: Path, workdir: Path, *, timeout: float | None = None,
+                   binary: str = "abinit") -> JobResult:
+        """Run abinit/anaddb on a single input file (ABINIT 9.x positional-arg
+        convention: ``abinit run.abi``). ``DFT_FORGE_ABINIT_BIN`` points at the
+        abinit binary; anaddb is resolved as a sibling in the same directory.
+        ABINIT is free/open source, so unlike VASP this path is user-runnable."""
+        if not self.abinit_bin:
+            return JobResult(success=False, exit_code=-1,
+                             error_message="no ABINIT binary configured (set DFT_FORGE_ABINIT_BIN)")
+        abinit_path = Path(self.abinit_bin)
+        if binary not in {"abinit", "anaddb"}:
+            return JobResult(success=False, exit_code=-1, error_message="unsupported ABINIT binary")
+        if not abinit_path.is_absolute():
+            abinit_path = Path(shutil.which(str(abinit_path)) or abinit_path).expanduser().resolve()
+        bin_path = abinit_path if binary == "abinit" else abinit_path.parent / binary
+        return self._run_workdir_input_tool(bin_path, input_file, workdir, timeout=timeout)
+
+    def merge_abinit_ddb(self, ddb_files, output_file: Path, workdir: Path, *, timeout=None) -> JobResult:
+        """Merge DFPT datasets with ABINIT's mrgddb, using the same cancellation path."""
+        if not self.abinit_bin:
+            return JobResult(success=False, exit_code=-1, error_message="no ABINIT binary configured")
+        abinit = Path(shutil.which(str(self.abinit_bin)) or self.abinit_bin).expanduser().resolve()
+        paths = [Path(p).resolve() for p in ddb_files]
+        if not paths or any(not p.is_file() for p in paths):
+            return JobResult(success=False, exit_code=-1, error_message="missing DFPT DDB inputs")
+        control = "\n".join([str(Path(output_file).resolve()), "DFT-Forge DFPT q-mesh",
+                             str(len(paths)), *map(str, paths)]) + "\n"
+        (Path(workdir) / "mrgddb.files").write_text(control)
+        return self._run_workdir_input_tool(abinit.parent / "mrgddb", paths[0], workdir,
+            timeout=timeout, arguments=[], stdin_text=control, log_stem="mrgddb")
+
+    def _run_workdir_input_tool(self, bin_path: Path, input_file: Path, workdir: Path,
+                                timeout: float | None = None, *, arguments=None, stdin_text=None, log_stem=None) -> JobResult:
+        """Run a binary that takes the input file as a positional argument and
+        writes outputs into workdir (ABINIT/anaddb convention)."""
+        workdir = Path(workdir).resolve()
+        workdir.mkdir(parents=True, exist_ok=True)
+        input_file = Path(input_file).resolve()
+        if not input_file.exists():
+            return JobResult(success=False, exit_code=-1, error_message=f"Input file not found: {input_file}")
+        if not bin_path.exists():
+            return JobResult(success=False, exit_code=-1, error_message=f"Binary not found: {bin_path}")
+        try:
+            input_arg = str(input_file.relative_to(workdir))
+        except ValueError:
+            input_arg = str(input_file)
+        start_time = time.time()
+        try:
+            proc = subprocess.Popen(
+                [str(bin_path), *(arguments if arguments is not None else [input_arg])],
+                cwd=str(workdir),
+                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+        except Exception as e:
+            return JobResult(success=False, exit_code=-1, walltime_sec=time.time() - start_time,
+                             error_message=f"failed to launch {bin_path.name}: {e}",
+                             remote_path=str(workdir))
+        with self._proc_lock:
+            self._running[proc.pid] = proc
+        try:
+            stdout, stderr = proc.communicate(input=stdin_text, timeout=timeout or self.max_walltime_sec)
+            cancelled = self._was_cancelled(proc)
+        except subprocess.TimeoutExpired:
+            self._terminate_group(proc)
+            stdout, stderr = proc.communicate()
+            (workdir / f"{log_stem or input_file.stem}.log").write_text(stdout or "")
+            (workdir / f"{log_stem or input_file.stem}.err").write_text(stderr or "")
+            return JobResult(success=False, exit_code=-1, walltime_sec=time.time() - start_time,
+                             stdout=stdout or "", stderr=stderr or "",
+                             error_message=f"{bin_path.name} timed out after {timeout or self.max_walltime_sec}s",
+                             remote_path=str(workdir))
+        finally:
+            with self._proc_lock:
+                self._running.pop(proc.pid, None)
+        walltime = time.time() - start_time
+        stem = log_stem or input_file.stem
+        (workdir / f"{stem}.log").write_text(stdout)
+        (workdir / f"{stem}.err").write_text(stderr)
+        output_files = self._find_outputs(workdir, stem)
+        if cancelled:
+            return JobResult(success=False, exit_code=proc.returncode, stdout=stdout, stderr=stderr,
+                             output_files=output_files, walltime_sec=walltime,
+                             error_message=f"{bin_path.name} cancelled by user", remote_path=str(workdir))
+        return JobResult(
+            success=(proc.returncode == 0), exit_code=proc.returncode,
+            stdout=stdout, stderr=stderr, output_files=output_files, walltime_sec=walltime,
+            error_message=stderr[:1000] if proc.returncode != 0 else "", remote_path=str(workdir))
+
     def _run_tool(self, binary: str, input_file: Path, workdir: Path, timeout: float | None = None) -> JobResult:
+        if self.qe_bin_dir is None:
+            return JobResult(success=False, exit_code=-1, error_message="QE is not configured")
         workdir = Path(workdir).resolve()
         workdir.mkdir(parents=True, exist_ok=True)
         input_file = Path(input_file).resolve()
@@ -424,6 +565,79 @@ class LocalExecutor(Executor):
             success=(proc.returncode == 0),
             exit_code=proc.returncode,
             stdout=stdout,
+            stderr=stderr,
+            output_files=output_files,
+            walltime_sec=walltime,
+            error_message=stderr[:1000] if proc.returncode != 0 else "",
+            remote_path=str(workdir),
+        )
+
+    def _run_workdir_tool(self, binary: Optional[str], workdir: Path, timeout: float | None = None) -> JobResult:
+        """Run a binary that reads all inputs from and writes outputs to workdir
+        (VASP convention: no input-file argument). stdout is teed to OUTCAR when
+        the program does not write one itself."""
+        workdir = Path(workdir).resolve()
+        workdir.mkdir(parents=True, exist_ok=True)
+        if not binary:
+            return JobResult(success=False, exit_code=-1,
+                             error_message="no VASP binary configured (set DFT_FORGE_VASP_BIN)")
+        bin_path = Path(binary)
+        if not bin_path.exists():
+            return JobResult(success=False, exit_code=-1, error_message=f"VASP binary not found: {bin_path}")
+        for required in ("INCAR", "POSCAR", "KPOINTS", "POTCAR"):
+            if not (workdir / required).is_file():
+                return JobResult(success=False, exit_code=-1,
+                                 error_message=f"missing VASP input {required} in {workdir}")
+        start_time = time.time()
+        try:
+            proc = subprocess.Popen(
+                [str(bin_path)],
+                cwd=str(workdir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+        except Exception as e:
+            return JobResult(
+                success=False, exit_code=-1, walltime_sec=time.time() - start_time,
+                error_message=f"failed to launch {bin_path}: {e}", remote_path=str(workdir),
+            )
+        with self._proc_lock:
+            self._running[proc.pid] = proc
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout or self.max_walltime_sec)
+            cancelled = self._was_cancelled(proc)
+        except subprocess.TimeoutExpired:
+            self._terminate_group(proc)
+            stdout, stderr = proc.communicate()
+            return JobResult(
+                success=False, exit_code=-1, walltime_sec=time.time() - start_time,
+                stdout=stdout or "", stderr=stderr or "",
+                error_message=f"vasp timed out after {timeout or self.max_walltime_sec}s",
+                remote_path=str(workdir),
+            )
+        finally:
+            with self._proc_lock:
+                self._running.pop(proc.pid, None)
+        walltime = time.time() - start_time
+        # VASP writes its own OUTCAR/vasprun.xml; keep the console log too.
+        (workdir / "vasp.stdout").write_text(stdout)
+        (workdir / "vasp.stderr").write_text(stderr)
+        outcar = workdir / "OUTCAR"
+        output_files = [str(p) for p in (outcar, workdir / "vasprun.xml") if p.is_file()]
+        if cancelled:
+            return JobResult(
+                success=False, exit_code=proc.returncode, stdout=stdout, stderr=stderr,
+                output_files=output_files, walltime_sec=walltime,
+                error_message="vasp cancelled by user", remote_path=str(workdir),
+            )
+        # VASP can exit 0 without finishing; OUTCAR presence is the floor and the
+        # tool layer's parser makes the authoritative convergence call.
+        return JobResult(
+            success=(proc.returncode == 0 and outcar.is_file()),
+            exit_code=proc.returncode,
+            stdout=stdout or (outcar.read_text(errors="ignore") if outcar.is_file() else ""),
             stderr=stderr,
             output_files=output_files,
             walltime_sec=walltime,

@@ -55,6 +55,19 @@ def _as_int(params: dict, key: str, default: int) -> int:
     return int(v) if v is not None else default
 
 
+def _read_structure_preserving_pbc(path):
+    """Use extxyz's explicit PBC instead of inferring it from vacuum gaps."""
+    from dft_forge.compiler import read_structure
+
+    if Path(str(path)).suffix.lower() == ".extxyz":
+        from ase.io import read as ase_read
+
+        if not Path(path).is_file():
+            raise FileNotFoundError(f"structure file not found: {path}")
+        return ase_read(str(path), format="extxyz")
+    return read_structure(path)
+
+
 class QECalcTool:
     """Graph tool executing a single Quantum ESPRESSO calculation."""
 
@@ -86,17 +99,30 @@ class QECalcTool:
         structure = params.get("structure")
         atoms = None
         if structure:
-            from dft_forge.compiler import read_structure
-
-            atoms = read_structure(structure)
+            source = Path(str(structure)).resolve()
+            # Existing graphs refer to the CIF output.  When the same upstream
+            # relax also produced an extxyz, consume its exact PBC metadata
+            # without changing the graph binding or its source-lock contract.
+            relaxed_source = structure
+            for upstream in ctx.upstream.values():
+                produced = upstream.get("final_structure_cif")
+                if produced and source == Path(str(produced)).resolve():
+                    extxyz = upstream.get("final_structure_extxyz")
+                    if extxyz:
+                        if not Path(str(extxyz)).is_file():
+                            raise ToolError(
+                                "upstream relaxed extxyz structure is missing",
+                                category="missing_upstream", repairable=False,
+                            )
+                        relaxed_source = extxyz
+                    break
+            atoms = _read_structure_preserving_pbc(relaxed_source)
             if not material or material.lower() in ("", "si"):
                 # Si is the template default; a real structure overrides it
                 material = Path(str(structure)).stem.replace(" ", "_")
-        elif material and material not in MATERIAL_DB and Path(material).suffix.lower() in (".cif", ".poscar", ".xyz"):
+        elif material and material not in MATERIAL_DB and Path(material).suffix.lower() in (".cif", ".poscar", ".xyz", ".extxyz"):
             # material param itself pointing at a structure file
-            from dft_forge.compiler import read_structure
-
-            atoms = read_structure(material)
+            atoms = _read_structure_preserving_pbc(material)
             material = Path(material).stem.replace(" ", "_")
         elif material and material not in MATERIAL_DB:
             # unknown material key: try formula → prototype (e.g. CaTiO3)
@@ -119,6 +145,40 @@ class QECalcTool:
             m, n, p = parse_supercell_3d(str(params["supercell"]))
             atoms = make_supercell(atoms, [[m, 0, 0], [0, n, 0], [0, 0, p]])
         prefix = str(params.get("prefix", re.sub(r"[^A-Za-z0-9]", "_", material.lower())[:24] or "calc"))
+        if atoms is not None:
+            atoms.info.pop("_qe_method_profile", None)
+            # Structure files carry geometry, not the electronic method.
+            # Recover it only from the exact upstream relaxation producing it.
+            for upstream in ctx.upstream.values():
+                produced = (upstream.get("final_structure_cif"), upstream.get("final_structure_extxyz"))
+                if structure and any(path and Path(str(structure)).resolve() == Path(str(path)).resolve()
+                                     for path in produced):
+                    if not upstream.get("method_profile"):
+                        raise ToolError("relaxed structure has no electronic-method provenance", category="method_source")
+                    atoms.info["_qe_method_profile"] = upstream["method_profile"]
+        def with_method(output):
+            profile, _, _ = self.compiler._resolve(material, atoms)
+            output["method_profile"] = {
+                key: profile[key] for key in ("pseudos", "species", "masses", "occupations", "smearing", "degauss",
+                    "is_metal", "input_dft", "ecutwfc_default", "ecutrho_default", "kpoints_default") if key in profile
+            }
+            output["method_profile"]["effective"] = {
+                "ecutwfc": params.get("ecutwfc") if params.get("ecutwfc") is not None else profile.get("ecutwfc_default"),
+                "ecutrho": params.get("ecutrho") if params.get("ecutrho") is not None else profile.get("ecutrho_default"),
+                "kpoints": list(params.get("kpoints") or profile.get("kpoints_default") or []),
+                "conv_thr": _as_float(params, "conv_thr", 1.0e-8),
+                "tot_charge": float(params.get("tot_charge", 0.0) or 0.0),
+                "spin_polarized": bool(params.get("spin_polarized", False)
+                    or str(params.get("magnetic_order") or "").lower().replace("-", "") in {"fm", "afm"}),
+                "magnetic_order": params.get("magnetic_order"),
+                "magnetic_element": params.get("magnetic_element"),
+                "initial_moment_muB": params.get("initial_moment_muB"),
+                "total_magnetization_muB": params.get("total_magnetization_muB"),
+                "occupations": params.get("occupations") if params.get("occupations") is not None else profile.get("occupations"),
+                "smearing": params.get("smearing") if params.get("smearing") is not None else profile.get("smearing"),
+                "degauss": params.get("degauss") if params.get("degauss") is not None else profile.get("degauss"),
+            }
+            return output
         workdir = ctx.node_workdir(node.node_id)
         workdir.mkdir(parents=True, exist_ok=True)
 
@@ -126,15 +186,15 @@ class QECalcTool:
             self._link_upstream_save(ctx, workdir, prefix)
 
         if calc == "vc-relax":
-            return self._run_vc_relax(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds)
+            return with_method(self._run_vc_relax(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds))
         if calc == "scf":
-            return self._run_scf(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds)
+            return with_method(self._run_scf(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds))
         if calc == "relax":
             params = dict(params)
             params["cell_optimization"] = False
-            return self._run_vc_relax(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds)
+            return with_method(self._run_vc_relax(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds))
         if calc == "nscf":
-            return self._run_nscf(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds)
+            return with_method(self._run_nscf(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds))
         if calc == "bands":
             return self._run_bands(material, prefix, params, workdir, atoms, timeout=ctx.timeout_seconds)
         if calc == "dos":
@@ -162,8 +222,21 @@ class QECalcTool:
             ecutwfc=params.get("ecutwfc"),
             ecutrho=params.get("ecutrho"),
             kpoints=tuple(params["kpoints"]) if params.get("kpoints") else None,
+            force_threshold=_as_float(params, "force_threshold", 1.0e-3),
+            pressure_threshold=_as_float(params, "pressure_threshold", 0.5),
+            conv_thr=_as_float(params, "conv_thr", 1.0e-8),
+            nstep=_as_int(params, "nstep", 200),
             cell_optimization=bool(params.get("cell_optimization", True)),
             atoms=atoms,
+            spin_polarized=bool(params.get("spin_polarized", False)),
+            magnetic_order=params.get("magnetic_order"),
+            magnetic_element=params.get("magnetic_element"),
+            initial_moment_muB=params.get("initial_moment_muB"),
+            total_magnetization_muB=params.get("total_magnetization_muB"),
+            tot_charge=float(params.get("tot_charge", 0.0) or 0.0),
+            occupations=params.get("occupations"),
+            smearing=params.get("smearing"),
+            degauss=params.get("degauss"),
         )
         result = self._run_pw(input_file, workdir, timeout=timeout)
         xml = workdir / f"{prefix}.xml"
@@ -174,6 +247,8 @@ class QECalcTool:
                     stdout=result.stdout,
                     xml_path=xml if xml.exists() else None,
                     job_success=bool(getattr(result, "success", True)),
+                    force_threshold_ry=_as_float(params, "force_threshold", 1.0e-3),
+                    pressure_threshold_kbar=_as_float(params, "pressure_threshold", 0.5),
                 ),
                 parsed,
             )
@@ -186,32 +261,68 @@ class QECalcTool:
         else:
             scf = QEParser.parse_scf(result.stdout)
             force_present = bool(re.search(r"\batom\s+\d+.*?\bforce\s*=", result.stdout, re.IGNORECASE))
-            if not scf.converged or not force_present or parsed.max_force_ry_bohr > self.verifier.force_threshold_ry:
+            requested_force_threshold = _as_float(params, "force_threshold", 1.0e-3)
+            if (not bool(getattr(result, "success", True)) or "JOB DONE" not in result.stdout
+                    or not parsed.converged or not scf.converged or not force_present
+                    or parsed.max_force_ry_bohr > requested_force_threshold):
                 raise ToolError(
-                    "relax verification failed: missing SCF/force convergence evidence",
+                    "relax verification failed: missing job/geometry/SCF/force convergence evidence",
                     category="verification",
                     repairable=True,
                 )
+        fixed_cell_relax = not bool(params.get("cell_optimization", True))
         cell = parsed.cell
+        fixed_atoms = None
+        if fixed_cell_relax:
+            # Fixed-cell relaxations must report the exact input lattice.  QE's
+            # XML cell is a fallback for parsing, but geometry cannot change by
+            # construction and the input also preserves non-periodic axes.
+            _, fixed_atoms, _ = self.compiler._resolve(material, atoms)
+            a_angstrom = float(fixed_atoms.cell.lengths()[0])
+            volume_a3 = float(fixed_atoms.get_volume())
+        else:
+            a_angstrom = (cell.a_bohr * BOHR_TO_ANG) if cell else None
+            volume_a3 = (cell.volume_bohr3 * BOHR3_TO_ANG3) if cell else None
         outputs = {
             "energy_ry": parsed.final_energy_ry,
             "max_force_ry_bohr": parsed.max_force_ry_bohr,
+            "force_threshold_ry_bohr": _as_float(params, "force_threshold", 1.0e-3),
             "pressure_kbar": parsed.pressure_kbar if bool(params.get("cell_optimization", True)) else None,
             "n_iterations": parsed.n_iterations,
-            "a_angstrom": (cell.a_bohr * BOHR_TO_ANG) if cell else None,
-            "volume_a3": (cell.volume_bohr3 * BOHR3_TO_ANG3) if cell else None,
+            "a_angstrom": a_angstrom,
+            "volume_a3": volume_a3,
             "stdout_file": str(input_file.with_suffix(".out")),
+            "natoms": len(atoms) if atoms is not None else None,
+            "fixed_cell_relax": fixed_cell_relax,
+            "tot_charge": float(params.get("tot_charge", 0.0) or 0.0),
         }
+        if (params.get("spin_polarized") or params.get("magnetic_order")
+                or params.get("total_magnetization_muB") is not None):
+            magnet = QEParser.parse_magnetization(result.stdout)
+            outputs.update({
+                "total_magnetization_muB": magnet.total_magnetization_muB,
+                "absolute_magnetization_muB": magnet.absolute_magnetization_muB,
+                "atom_magnetizations_muB": magnet.atom_magnetizations_muB,
+            })
 
         # export the relaxed structure and attach a geometry/symmetry report so
         # downstream steps (and the chat reply) can cite bond lengths directly
-        final_atoms = QEParser.extract_final_structure(result.stdout)
+        fixed_cell = fixed_atoms.cell if fixed_atoms is not None else None
+        input_pbc = fixed_atoms.pbc if fixed_atoms is not None else (atoms.pbc if atoms is not None else None)
+        final_atoms = QEParser.extract_final_structure(
+            result.stdout,
+            fixed_cell=fixed_cell,
+            pbc=input_pbc,
+        )
         if final_atoms is not None:
             cif_path = workdir / f"{prefix}_relaxed.cif"
+            extxyz_path = workdir / f"{prefix}_relaxed.extxyz"
             from ase.io import write as ase_write
 
             ase_write(str(cif_path), final_atoms, format="cif")
+            ase_write(str(extxyz_path), final_atoms, format="extxyz")
             outputs["final_structure_cif"] = str(cif_path)
+            outputs["final_structure_extxyz"] = str(extxyz_path)
             from dft_forge.structure_analysis import analyze
 
             try:
@@ -236,6 +347,7 @@ class QECalcTool:
             magnetic_order=params.get("magnetic_order"),
             magnetic_element=params.get("magnetic_element"),
             initial_moment_muB=params.get("initial_moment_muB"),
+            total_magnetization_muB=params.get("total_magnetization_muB"),
             tot_charge=float(params.get("tot_charge", 0.0) or 0.0),
             occupations=params.get("occupations"),
             smearing=params.get("smearing"),
@@ -257,12 +369,17 @@ class QECalcTool:
             "n_iterations": parsed.n_iterations,
             "natoms": int(nat_match.group(1)) if nat_match else (len(atoms) if atoms is not None else None),
             "stdout_file": str(input_file.with_suffix(".out")),
+            "tot_charge": float(params.get("tot_charge", 0.0) or 0.0),
         }
-        if params.get("magnetic_order"):
+        if (params.get("spin_polarized") or params.get("magnetic_order")
+                or params.get("total_magnetization_muB") is not None):
             magnet = QEParser.parse_magnetization(result.stdout)
             outputs.update({
-                "requested_order": str(params["magnetic_order"]).upper(),
-                "spin_polarized": str(params["magnetic_order"]).lower() in {"fm", "afm"},
+                "requested_order": (
+                    str(params["magnetic_order"]).upper() if params.get("magnetic_order") else None
+                ),
+                "spin_polarized": bool(params.get("spin_polarized", False)
+                    or str(params.get("magnetic_order") or "").lower() in {"fm", "afm"}),
                 "total_magnetization_muB": magnet.total_magnetization_muB,
                 "absolute_magnetization_muB": magnet.absolute_magnetization_muB,
                 "atom_magnetizations_muB": magnet.atom_magnetizations_muB,
@@ -295,7 +412,9 @@ class QECalcTool:
                 repairable=True,
             )
         return {
-            "energy_ry": parsed.total_energy_ry,
+            # QE NSCF often emits no total energy; parser's legacy default
+            # zero is not an observation and must not enter thermodynamics.
+            "energy_ry": parsed.total_energy_ry if re.search(r"!\s+total energy\s*=", result.stdout) else None,
             "nbnd_used": params.get("nbnd"),
             "stdout_file": str(input_file.with_suffix(".out")),
         }
@@ -335,7 +454,9 @@ class QECalcTool:
             "n_bands": parsed.n_bands,
             "n_kpoints": parsed.n_kpoints,
             "band_gap_ev": parsed.band_gap_ev,
+            "gap_known": parsed.gap_known,
             "is_metal": parsed.is_metal,
+            "smearing_resolution_ev": parsed.smearing_resolution_ev,
             "fermi_ev": parsed.fermi_energy_ev,
         }
         # plotting axis from the same bandpath the nscf sampling used
@@ -362,7 +483,8 @@ class QECalcTool:
             input_file,
             prefix=prefix,
             deltae=_as_float(params, "dos_deltae", 0.01),
-            fwhm=_as_float(params, "dos_fwhm", 0.05),
+            fwhm=_as_float(params, "dos_fwhm", 0.5),
+            ngauss=_as_int(params, "dos_ngauss", 0),
             atoms=atoms,
         )
         result = self._run_tool("dos.x", input_file, workdir, timeout=timeout)
@@ -410,7 +532,8 @@ class QECalcTool:
             input_file,
             prefix=prefix,
             deltae=_as_float(params, "dos_deltae", 0.01),
-            fwhm=_as_float(params, "dos_fwhm", 0.05),
+            fwhm=_as_float(params, "dos_fwhm", 0.5),
+            ngauss=_as_int(params, "dos_ngauss", 0),
             atoms=atoms,
         )
         result = self._run_projwfc(input_file, workdir, timeout=timeout)
@@ -430,8 +553,15 @@ class QECalcTool:
         outputs: Dict[str, Any] = {
             "n_energy_points": parsed.n_energy_points,
             "elements": sorted(parsed.element_dos.keys()),
-            "fermi_ev": parsed.fermi_energy_ev or None,
+            "fermi_ev": parsed.fermi_energy_ev,
         }
+        ef = parsed.fermi_energy_ev
+        if (ef is not None and np.isfinite(ef) and parsed.energies is not None
+                and len(parsed.energies) > 1 and parsed.energies[0] <= ef <= parsed.energies[-1]):
+            outputs["element_dos_at_fermi"] = {
+                el: float(np.interp(ef, parsed.energies, values))
+                for el, values in sorted(parsed.element_dos.items())
+            }
         outputs["pdos_curve"] = {
             "energies_ev": np.round(parsed.energies, 4).tolist(),
             "element_dos": {
@@ -578,7 +708,10 @@ class QECalcTool:
     def _qe_error_snippet(result) -> Optional[str]:
         """Extract the 'Error in routine (...)' block from pw.x stdout."""
         stdout = result.stdout or ""
-        m = re.search(r"Error in routine\s+(\S+)\s*\(\d+\):\s*\n(.+?)\n\s*\n", stdout)
+        m = re.search(
+            r"Error in routine\s+([^\s(]+)\s*\(\d+\):\s*\n\s*([^\n]+)",
+            stdout,
+        )
         if m:
             return f"{m.group(1)}: {m.group(2).strip()}"
         return None
@@ -675,6 +808,16 @@ class QEParamRepairer:
         if error.category not in self.REPAIRABLE_CATEGORIES:
             return False
         params = node.params
+        if "charge is wrong" in str(error).lower():
+            # This is an occupations/Fermi-level inconsistency, not a basis-set
+            # convergence problem.  A node-local cutoff bump both wastes work
+            # and breaks matched-energy comparisons.  Require the caller to
+            # revise the spin/occupation policy for the whole workflow.
+            node.error = (node.error or "") + (
+                " | charge/occupation inconsistency; revise occupations, smearing "
+                "or the spin constraint consistently for the full comparison"
+            )
+            return False
         # nbnd failures must not be repaired with cutoff bumps
         if "too few bands" in str(error):
             current = int(params.get("nbnd") or 0)

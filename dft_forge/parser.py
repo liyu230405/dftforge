@@ -22,8 +22,14 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-RY_TO_EV = 13.605693122994
-HA_TO_EV = 27.211386245988
+from dft_forge.constants import (
+    BOHR_TO_ANG,
+    HARTREE_TO_EV,
+    RY_TO_EV,
+    qe_label_to_element as _qe_label_to_element,
+)
+
+HA_TO_EV = HARTREE_TO_EV
 HA_TO_RY = HA_TO_EV / RY_TO_EV  # 2.0
 
 logger = logging.getLogger(__name__)
@@ -40,7 +46,9 @@ class ParsedSCF:
     converged: bool = False
     convergence_thr: float = 0.0
     final_delta: float = 0.0
-    fermi_energy_ev: float = 0.0
+    # None when the stdout does not report a Fermi energy (e.g. fixed
+    # occupations) — 0.0 is a legitimate level and must not be fabricated.
+    fermi_energy_ev: Optional[float] = None
     k_points: int = 0
     n_bands: int = 0
 
@@ -74,9 +82,16 @@ class ParsedBands:
     """Parsed band structure data (T2)."""
     n_bands: int = 0
     n_kpoints: int = 0
-    fermi_energy_ev: float = 0.0
-    band_gap_ev: float = 0.0
+    # None until a Fermi energy/HOMO is found in the XML. Never fabricated.
+    fermi_energy_ev: Optional[float] = None
+    band_gap_ev: Optional[float] = None  # None = cannot be determined
     is_metal: bool = False
+    # True only when a Fermi reference was available and the VBM/CBM split
+    # along the sampled k-points could actually be evaluated.
+    gap_known: bool = False
+    # 2x smearing width in eV when the run used smearing; gaps below this are
+    # below the smearing resolution and must be reported as near-zero/metallic.
+    smearing_resolution_ev: Optional[float] = None
     k_labels: List[str] = field(default_factory=list)
     # eigenvalues: array of shape (n_kpoints, n_bands)
     eigenvalues: Optional[np.ndarray] = None
@@ -85,7 +100,7 @@ class ParsedBands:
 @dataclass
 class ParsedDOS:
     """Parsed DOS data (T2)."""
-    fermi_energy_ev: float = 0.0
+    fermi_energy_ev: Optional[float] = None
     n_energy_points: int = 0
     dos_at_fermi: float = 0.0
     # energy and dos arrays
@@ -96,7 +111,7 @@ class ParsedDOS:
 @dataclass
 class ParsedPDOS:
     """Parsed projected DOS from projwfc.x output files."""
-    fermi_energy_ev: float = 0.0
+    fermi_energy_ev: Optional[float] = None
     n_energy_points: int = 0
     # element -> summed projected DOS on a common energy grid
     energies: Optional[np.ndarray] = None
@@ -181,26 +196,62 @@ class QEParser:
     def parse_magnetization(stdout: str) -> ParsedMagnetization:
         """Parse total and per-atom collinear magnetizations from pw.x."""
         result = ParsedMagnetization()
+        text = stdout or ""
         total = re.findall(
             r"total\s+magnetization\s*=\s*([-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?)",
-            stdout or "", re.IGNORECASE,
+            text, re.IGNORECASE,
         )
         absolute = re.findall(
             r"absolute\s+magnetization\s*=\s*([-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?)",
-            stdout or "", re.IGNORECASE,
+            text, re.IGNORECASE,
         )
         if total:
             result.total_magnetization_muB = float(total[-1])
         if absolute:
             result.absolute_magnetization_muB = float(absolute[-1])
+
+        # QE <= 7.4 commonly printed ``atom: 1 ... magnetization: 2.1``;
+        # QE 7.5 prints ``atom 1 ... magn= 2.1``.  A relax or repeated SCF can
+        # contain several per-site blocks, so collecting matches into a dict
+        # can silently combine a final truncated block with an earlier one.
+        number = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?"
         atom_matches = re.findall(
-            r"atom\s*:\s*(\d+).*?(?:magnetization|magn)\s*[:=]\s*"
-            r"([-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?)",
-            stdout or "", re.IGNORECASE,
+            rf"^[ \t]*atom\s*:?\s*(\d+)\b[^\r\n]*?"
+            rf"\b(?:magnetization|magn)\s*[:=]\s*({number})",
+            text,
+            re.IGNORECASE | re.MULTILINE,
         )
-        indexed = {int(i): float(v) for i, v in atom_matches}
-        if indexed:
-            result.atom_magnetizations_muB = [indexed[i] for i in sorted(indexed)]
+        blocks = []
+        current = []
+        previous_index = 0
+        for raw_index, raw_value in atom_matches:
+            index = int(raw_index)
+            # Atomic indices are emitted in ascending order.  An index reset
+            # marks the next electronic/ionic iteration's per-site block.
+            if current and index <= previous_index:
+                blocks.append(current)
+                current = []
+            current.append((index, float(raw_value.replace("D", "E").replace("d", "e"))))
+            previous_index = index
+        if current:
+            blocks.append(current)
+
+        contiguous_blocks = [
+            block
+            for block in blocks
+            if [index for index, _ in block] == list(range(1, len(block) + 1))
+        ]
+        natoms = re.findall(r"number\s+of\s+atoms/cell\s*=\s*(\d+)", text, re.IGNORECASE)
+        if natoms:
+            expected_size = int(natoms[-1])
+            complete_blocks = [block for block in contiguous_blocks if len(block) == expected_size]
+        else:
+            # Without an explicit atom count, the largest observed contiguous
+            # block defines completeness.  Choose its final occurrence.
+            expected_size = max((len(block) for block in contiguous_blocks), default=0)
+            complete_blocks = [block for block in contiguous_blocks if len(block) == expected_size]
+        if complete_blocks:
+            result.atom_magnetizations_muB = [value for _, value in complete_blocks[-1]]
         return result
 
     @staticmethod
@@ -281,8 +332,10 @@ class QEParser:
         # Forces: only the FINAL configuration matters — the whole-trajectory
         # max includes early steps far from equilibrium and misjudges a
         # converged relax as failed (verifier compares against a threshold)
-        final_marker = "Begin final coordinates"
-        search_text = stdout.split(final_marker)[-1] if final_marker in stdout else stdout
+        # Fixed-cell relax puts the final force block BEFORE its coordinate
+        # marker; vc-relax may also print a later final SCF. Use the last
+        # actual force block in either layout, never a missing-block zero.
+        search_text = stdout
         force_blocks = list(re.finditer(
             r"(?:^[ \t]*atom[ \t]+\d+.*?force[ \t]*=[ \t]*[-\d.eE+]+[ \t]+[-\d.eE+]+[ \t]+[-\d.eE+]+[ \t]*$\n?)+",
             search_text,
@@ -347,16 +400,19 @@ class QEParser:
         return result
 
     @staticmethod
-    def extract_final_structure(stdout: str):
-        """Final relaxed structure from vc-relax stdout.
+    def extract_final_structure(stdout: str, *, fixed_cell=None, pbc=None):
+        """Final relaxed structure from vc-relax or fixed-cell relax stdout.
 
         QE prints the last CELL_PARAMETERS + ATOMIC_POSITIONS after
         'Begin final coordinates'. Cell vectors are in bohr (alat units);
         positions respect their own declared unit.
         Returns ASE Atoms (Å) or None.
         """
-        BOHR = 0.529177210903
+        BOHR = BOHR_TO_ANG
         _num = r"-?\d+\.?\d*(?:[eE][+-]?\d+)?"
+        # ATOMIC_SPECIES labels may carry suffixes (Fe1/FeA/O_up for AFM);
+        # accept a leading element token followed by up to ~6 word chars.
+        _label = r"[A-Za-z][A-Za-z0-9_]{0,6}"
         cell_blocks = re.findall(
             r"CELL_PARAMETERS\s+\(\w+\s*=\s*([\d.]+)\)\s*\n"
             rf"((?:\s*{_num}\s+{_num}\s+{_num}\s*\n){{3}})",
@@ -364,30 +420,43 @@ class QEParser:
         )
         pos_blocks = re.findall(
             r"ATOMIC_POSITIONS\s*[({]\s*(\w+)\s*[=)}][^\n]*\n"
-            rf"((?:\s*[A-Za-z]{{1,2}}\s+{_num}\s+{_num}\s+{_num}[^\n]*\n)+)",
+            rf"((?:\s*{_label}\s+{_num}\s+{_num}\s+{_num}[^\n]*\n)+)",
             stdout,
         )
-        if not cell_blocks or not pos_blocks:
+        if not pos_blocks:
             return None
 
-        alat_bohr = float(cell_blocks[-1][0])
-        cell_bohr = np.array([
-            [float(x) for x in line.split()]
-            for line in cell_blocks[-1][1].strip().splitlines()
-        ]) * alat_bohr
-        cell_ang = cell_bohr * BOHR
+        if cell_blocks:
+            alat_bohr = float(cell_blocks[-1][0])
+            cell_bohr = np.array([
+                [float(x) for x in line.split()]
+                for line in cell_blocks[-1][1].strip().splitlines()
+            ]) * alat_bohr
+            cell_ang = cell_bohr * BOHR
+        elif fixed_cell is not None:
+            # Fixed-cell relax prints final positions without CELL_PARAMETERS.
+            # The structure used to compile that relax supplies the cell.
+            cell_ang = np.asarray(fixed_cell, dtype=float)
+            alat = re.search(r"lattice parameter \(alat\)\s*=\s*([\d.]+)", stdout)
+            alat_bohr = float(alat.group(1)) if alat else None
+        else:
+            return None
 
         mode = pos_blocks[-1][0].lower()
+        if mode == "crystal_sg":
+            mode = "crystal"
         symbols, cart_ang = [], []
         for line in pos_blocks[-1][1].strip().splitlines():
             parts = line.split()
             if len(parts) < 4 or parts[0][0].isdigit():
                 continue
-            symbols.append(parts[0])
+            symbols.append(_qe_label_to_element(parts[0]))
             xyz = np.array([float(x) for x in parts[1:4]])
             if mode == "crystal":
                 cart_ang.append(xyz @ cell_ang)
             elif mode == "alat":
+                if alat_bohr is None:
+                    return None
                 cart_ang.append(xyz * alat_bohr * BOHR)
             elif mode in ("bohr", "au"):
                 cart_ang.append(xyz * BOHR)
@@ -399,7 +468,12 @@ class QEParser:
 
         from ase import Atoms
 
-        return Atoms(symbols, positions=np.array(cart_ang), cell=cell_ang, pbc=True)
+        return Atoms(
+            symbols,
+            positions=np.array(cart_ang),
+            cell=cell_ang,
+            pbc=True if pbc is None else pbc,
+        )
 
     @staticmethod
     def parse_bands(xml_path: Path) -> ParsedBands:
@@ -458,26 +532,51 @@ class QEParser:
                 fermi_ev = float(fermi_elem.text) * HA_TO_EV
             elif hoc_elem is not None and hoc_elem.text:
                 fermi_ev = float(hoc_elem.text) * HA_TO_EV
+            result.fermi_energy_ev = fermi_ev
+
+            # Smearing width straight from the XML (attribute in Hartree,
+            # e.g. <smearing degauss="5.0E-003">mv</smearing>). Gaps below
+            # 2×degauss are below the smearing resolution; with un-smeared
+            # occupations (fixed/tetrahedra) there is no such floor.
+            smearing_elem = find_one(bs_elem, 'smearing')
+            if smearing_elem is not None and smearing_elem.get('degauss'):
+                try:
+                    result.smearing_resolution_ev = (
+                        2.0 * float(smearing_elem.get('degauss')) * HA_TO_EV
+                    )
+                except (TypeError, ValueError):
+                    result.smearing_resolution_ev = None
 
             all_evals = result.eigenvalues.flatten()
             if fermi_ev is None:
-                fermi_ev = float(np.max(all_evals) / 2.0)
-            result.fermi_energy_ev = fermi_ev
+                # No Fermi reference: the occupied/empty split and the gap
+                # cannot be evaluated. Do NOT invent a midpoint of the
+                # spectrum — that produced systematically wrong VBM/CBM.
+                logger.warning(
+                    "parse_bands: XML %s has no fermi_energy/highestOccupiedLevel; "
+                    "band gap left undetermined", xml_path
+                )
+                result.band_gap_ev = None
+                result.gap_known = False
+                return result
 
             # Gap via Fermi level: VBM = max eval <= fermi, CBM = min eval > fermi
             occupied = all_evals[all_evals <= fermi_ev + 1e-9]
             empty = all_evals[all_evals > fermi_ev + 1e-9]
+            result.gap_known = True
             if len(occupied) == 0 or len(empty) == 0:
                 result.band_gap_ev = 0.0
-                result.is_metal = False
+                result.is_metal = True
             else:
                 vbm = float(np.max(occupied))
                 cbm = float(np.min(empty))
                 if cbm > vbm:
-                    result.band_gap_ev = cbm - vbm
-                    # gaps below 2×degauss (0.01 Ry ≈ 0.27 eV) are smaller than
-                    # the smearing resolution — the system is effectively metal
-                    result.is_metal = result.band_gap_ev < 0.272
+                    gap = cbm - vbm
+                    result.band_gap_ev = gap
+                    floor = result.smearing_resolution_ev
+                    # NOTE: evaluated along the high-symmetry path only;
+                    # an indirect crossing elsewhere would be missed.
+                    result.is_metal = floor is not None and gap < floor
                 else:
                     result.band_gap_ev = 0.0
                     result.is_metal = True
@@ -616,7 +715,7 @@ class QEParser:
         return out
 
     @staticmethod
-    def _xml_fermi_ev(xml_path: Path) -> float:
+    def _xml_fermi_ev(xml_path: Path) -> Optional[float]:
         """Fermi level in eV from a QE XML (Hartree internally)."""
         try:
             root = ET.parse(xml_path).getroot()
@@ -628,7 +727,7 @@ class QEParser:
                     return float(elem.text) * 27.211386245988
         except Exception:
             pass
-        return 0.0
+        return None
 
     @staticmethod
     def _stdout_atom_species(stdout: str) -> Dict[int, str]:
@@ -691,10 +790,14 @@ class QEParser:
                 ibrav = int(atomic_struct.get('bravais_index', 0))
 
                 cell_elem = _find(atomic_struct, "cell")
-                if cell_elem is not None and alat > 0:
-                    a1 = np.array([float(x) for x in cell_elem[0].text.split()]) * alat
-                    a2 = np.array([float(x) for x in cell_elem[1].text.split()]) * alat
-                    a3 = np.array([float(x) for x in cell_elem[2].text.split()]) * alat
+                if cell_elem is not None:
+                    # QE XML stores the cell vectors directly in bohr.  The
+                    # ``alat`` attribute is metadata, not a scale factor for
+                    # these vectors.  Multiplying by it inflated lengths by
+                    # alat and volumes by alat**3 for every fixed-cell relax.
+                    a1 = np.array([float(x) for x in cell_elem[0].text.split()])
+                    a2 = np.array([float(x) for x in cell_elem[1].text.split()])
+                    a3 = np.array([float(x) for x in cell_elem[2].text.split()])
                     a, b, c = QEParser._compute_cell_constants(
                         np.array([a1, a2, a3]), ibrav
                     )

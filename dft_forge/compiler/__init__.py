@@ -21,6 +21,7 @@ from pymatgen.core import Structure
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from pymatgen.symmetry.kpath import KPathSeek
 
+from ..constants import ANG_TO_BOHR, EV_TO_RY, GAUSS_FWHM_PER_SIGMA
 from .pseudopotentials import read_pseudo_metadata
 
 
@@ -173,8 +174,22 @@ def build_atoms(material: str) -> Atoms:
 
 # ── Generic structures (any CIF/POSCAR via ASE) ───────────────────────────────
 
-BOHR_PER_ANG = 1.8897261246
+BOHR_PER_ANG = ANG_TO_BOHR  # backwards-compatible alias (Å → bohr)
 DEFAULT_PSEUDO_DIR = Path(__file__).resolve().parents[2] / "assets" / "pseudos"
+
+
+def _degauss_fwhm_ev_to_ry(fwhm_ev: float) -> float:
+    """Convert a Gaussian FWHM given in eV to QE degauss in Ry.
+
+    dos.x/projwfc.x read ``degauss`` as a Gaussian sigma in Ry.  The public
+    compiler parameter is a FWHM in eV, so sigma = FWHM / 2 sqrt(2 ln2) and
+    eV → Ry.  Passing the eV number straight through (the historical bug)
+    broadened DOS features 13.6x too much.
+    """
+    fwhm_ev = float(fwhm_ev)
+    if not math.isfinite(fwhm_ev) or fwhm_ev <= 0:
+        raise ValueError(f"fwhm must be a positive finite number, got {fwhm_ev!r}")
+    return fwhm_ev / GAUSS_FWHM_PER_SIGMA * EV_TO_RY
 
 
 def read_structure(path) -> Atoms:
@@ -585,6 +600,16 @@ class QECompiler:
         """Material profile + atoms + alat(bohr), from MATERIAL_DB or a raw structure."""
         if atoms is not None:
             db = profile_from_atoms(atoms, self.pseudo_dir)
+            inherited = atoms.info.get("_qe_method_profile")
+            if inherited:
+                if set(inherited["species"]) != set(atoms.get_chemical_symbols()):
+                    raise ValueError("relaxed structure species do not match the inherited QE method")
+                # Cell shape/scale come from the new coordinates. The
+                # electronic Hamiltonian must remain that of the parent run.
+                for key in ("pseudos", "species", "masses", "occupations", "smearing", "degauss", "is_metal",
+                            "input_dft", "ecutwfc_default", "ecutrho_default", "kpoints_default"):
+                    if key in inherited:
+                        db[key] = inherited[key]
             return db, atoms, db["_alat_bohr"]
         if material not in MATERIAL_DB:
             raise ValueError(f"Unknown material: {material}. Known: {list(MATERIAL_DB.keys())}")
@@ -607,6 +632,15 @@ class QECompiler:
         nstep: int = 200,
         cell_optimization: bool = True,
         atoms: Optional[Atoms] = None,
+        spin_polarized: bool = False,
+        magnetic_order: Optional[str] = None,
+        magnetic_element: Optional[str] = None,
+        initial_moment_muB: Optional[float] = None,
+        total_magnetization_muB: Optional[float] = None,
+        tot_charge: float = 0.0,
+        occupations: Optional[str] = None,
+        smearing: Optional[str] = None,
+        degauss: Optional[float] = None,
     ) -> str:
         """Compile a T1 vc-relax input file.
         
@@ -632,11 +666,52 @@ class QECompiler:
         ecutwfc = ecutwfc if ecutwfc is not None else db["ecutwfc_default"]
         ecutrho = ecutrho if ecutrho is not None else db["ecutrho_default"]
         kpoints = tuple(kpoints) if kpoints else tuple(db.get("kpoints_default", (4, 4, 4, 1, 1, 1)))
+
+        order = str(magnetic_order or "").strip().lower().replace("-", "")
+        if order not in {"", "nm", "fm", "afm"}:
+            raise ValueError("magnetic_order must be NM, FM, or AFM")
+        magnetic_element = str(magnetic_element or (atoms.symbols[0] if len(atoms) else "")).strip()
+        atom_labels = list(atoms.symbols)
+        species = list(db["species"])
+        masses = list(db["masses"])
+        pseudos = dict(db["pseudos"])
+        spin = bool(spin_polarized or order in {"fm", "afm"})
+        starting: Dict[str, float] = {}
+        if order == "afm":
+            indices = [i for i, symbol in enumerate(atom_labels) if symbol == magnetic_element]
+            if len(indices) < 2:
+                raise ValueError(
+                    f"AFM requires at least two atoms of magnetic_element={magnetic_element!r}; "
+                    "provide a magnetic supercell"
+                )
+            left, right = f"{magnetic_element}A", f"{magnetic_element}B"
+            for j, index in enumerate(indices):
+                atom_labels[index] = left if j % 2 == 0 else right
+            species = [left, right] + [s for s in species if s != magnetic_element]
+            mass = float(db["masses"][db["species"].index(magnetic_element)])
+            masses = [mass, mass] + [m for s, m in zip(db["species"], db["masses"]) if s != magnetic_element]
+            pseudos = {left: db["pseudos"][magnetic_element], right: db["pseudos"][magnetic_element]}
+            pseudos.update({s: db["pseudos"][s] for s in db["species"] if s != magnetic_element})
         
         # Check pseudos
-        missing = self._check_pseudos(db["pseudos"])
+        missing = self._check_pseudos(pseudos)
         if missing:
             raise FileNotFoundError(f"Missing pseudopotentials: {missing}")
+        valences = {filename: self._pseudo_z_valence(filename) for filename in set(pseudos.values())}
+        if order in {"fm", "afm"}:
+            moment = abs(float(initial_moment_muB if initial_moment_muB is not None else 1.0))
+            for label in species:
+                base = label[:-1] if label.endswith(("A", "B")) else label
+                if base == magnetic_element:
+                    zval = valences[pseudos[label]]
+                    sign = -1.0 if order == "afm" and label.endswith("B") else 1.0
+                    starting[label] = max(-1.0, min(1.0, sign * moment / zval))
+        charge_info = resolve_band_count(
+            valence_electrons=sum(valences[db["pseudos"][s]] for s in atoms.symbols),
+            natoms=len(atoms), is_metal=bool(db["is_metal"]), nbnd=None,
+            tot_charge=tot_charge, spin_polarized=spin,
+        )
+        charge = charge_info["charge"]
         
         # Build QE input
         lines = []
@@ -646,6 +721,8 @@ class QECompiler:
         lines.append(f'  prefix = "{prefix}"')
         lines.append(f'  outdir = "./"')
         lines.append(f'  pseudo_dir = "{self.pseudo_dir}"')
+        if spin:
+            lines.append('  verbosity = "high"')
         lines.append(f"  nstep = {nstep}")
         lines.append(f"  forc_conv_thr = {force_threshold:.6g}")
         lines.append("/")
@@ -654,14 +731,28 @@ class QECompiler:
         lines.append(f"  ibrav = {db['ibrav']}")
         lines.append(f"  celldm(1) = {alat_bohr:.6f}")
         lines.append(f"  nat = {len(atoms)}")
-        lines.append(f"  ntyp = {db['nspecies']}")
+        lines.append(f"  ntyp = {len(species)}")
         lines.append(f"  ecutwfc = {ecutwfc}")
         lines.append(f"  ecutrho = {ecutrho}")
-        lines.append(f'  occupations = "{db["occupations"]}"')
-        lines.append(f'  smearing = "{db["smearing"]}"')
-        lines.append(f"  degauss = {db['degauss']}")
+        occupation_mode = occupations or db["occupations"]
+        lines.append(f'  occupations = "{occupation_mode}"')
+        if str(occupation_mode).lower() == "smearing":
+            lines.append(f'  smearing = "{smearing or db["smearing"]}"')
+            lines.append(f"  degauss = {degauss if degauss is not None else db['degauss']}")
         if db.get("input_dft"):
             lines.append(f'  input_dft = "{db["input_dft"]}"')
+        if spin:
+            lines.append("  nspin = 2")
+        if total_magnetization_muB is not None:
+            total_magnetization = float(total_magnetization_muB)
+            if not spin or not math.isfinite(total_magnetization):
+                raise ValueError("total_magnetization_muB requires a finite spin-polarized calculation")
+            lines.append(f"  tot_magnetization = {total_magnetization:.8g}")
+        if abs(charge) > 1e-12:
+            lines.append(f"  tot_charge = {charge:.8g}")
+        for i, label in enumerate(species, start=1):
+            if label in starting:
+                lines.append(f"  starting_magnetization({i}) = {starting[label]:.8g}")
         lines.append("/")
         lines.append("")
         lines.append("&ELECTRONS")
@@ -685,14 +776,14 @@ class QECompiler:
         
         # ATOMIC_SPECIES
         lines.append("ATOMIC_SPECIES")
-        for elem, mass in zip(db["species"], db["masses"]):
-            pseudo_file = db["pseudos"][elem]
+        for elem, mass in zip(species, masses):
+            pseudo_file = pseudos[elem]
             lines.append(f"  {elem}  {mass:.3f}  {pseudo_file}")
         lines.append("")
         
         # ATOMIC_POSITIONS (crystal) — primitive cell
         lines.append("ATOMIC_POSITIONS (crystal)")
-        for sym, pos in zip(atoms.symbols, atoms.get_scaled_positions()):
+        for sym, pos in zip(atom_labels, atoms.get_scaled_positions()):
             lines.append(f"  {sym}  {pos[0]:.8f}  {pos[1]:.8f}  {pos[2]:.8f}")
         lines.append("")
         
@@ -740,6 +831,7 @@ class QECompiler:
         magnetic_order: Optional[str] = None,
         magnetic_element: Optional[str] = None,
         initial_moment_muB: Optional[float] = None,
+        total_magnetization_muB: Optional[float] = None,
         tot_charge: float = 0.0,
         occupations: Optional[str] = None,
         smearing: Optional[str] = None,
@@ -832,13 +924,22 @@ class QECompiler:
         lines.append(f"  celldm(1) = {alat_bohr:.6f}")
         lines.append(f"  nat = {len(atoms)}")
         lines.append(f"  ntyp = {len(species)}")
+        if db.get("input_dft"):
+            lines.append(f'  input_dft = "{db["input_dft"]}"')
         lines.append(f"  ecutwfc = {ecutwfc}")
         lines.append(f"  ecutrho = {ecutrho}")
-        lines.append(f'  occupations = "{occupations or db["occupations"]}"')
-        lines.append(f'  smearing = "{smearing or db["smearing"]}"')
-        lines.append(f"  degauss = {degauss if degauss is not None else db['degauss']}")
+        occupation_mode = occupations or db["occupations"]
+        lines.append(f'  occupations = "{occupation_mode}"')
+        if str(occupation_mode).lower() == "smearing":
+            lines.append(f'  smearing = "{smearing or db["smearing"]}"')
+            lines.append(f"  degauss = {degauss if degauss is not None else db['degauss']}")
         if spin:
             lines.append("  nspin = 2")
+        if total_magnetization_muB is not None:
+            total_magnetization = float(total_magnetization_muB)
+            if not spin or not math.isfinite(total_magnetization):
+                raise ValueError("total_magnetization_muB requires a finite spin-polarized calculation")
+            lines.append(f"  tot_magnetization = {total_magnetization:.8g}")
         if abs(charge) > 1e-12:
             lines.append(f"  tot_charge = {charge:.8g}")
         for i, label in enumerate(species, start=1):
@@ -976,8 +1077,8 @@ class QECompiler:
         emin: Optional[float] = None,
         emax: Optional[float] = None,
         deltae: float = 0.01,
-        fwhm: float = 0.05,
-        ngauss: int = 1,
+        fwhm: float = 0.5,
+        ngauss: int = 0,
         atoms: Optional[Atoms] = None,
     ) -> str:
         """Compile a dos.x post-processing input file.
@@ -989,8 +1090,11 @@ class QECompiler:
             emin: Minimum energy in eV (None = auto)
             emax: Maximum energy in eV (None = auto)
             deltae: Energy grid step in eV
-            fwhm: Broadening width in eV
-            ngauss: Broadening type (1=Gaussian, 0=Methfessel-Paxton)
+            fwhm: Gaussian broadening FWHM in eV (converted to degauss in Ry;
+                QE's degauss is a Gaussian sigma, Ry — NEVER pass an eV value
+                directly, that inflates the broadening 13.6-fold)
+            ngauss: Broadening type (0=Gaussian, 1=Marzari-Vanderbilt cold
+                smearing, -1=Fermi-Dirac)
             atoms: Optional ASE Atoms (accepted for symmetry with other compilers)
 
         Returns:
@@ -1000,13 +1104,14 @@ class QECompiler:
             raise ValueError(f"Unknown material: {material}")
 
         prefix = prefix or material.lower()
+        degauss_ry = _degauss_fwhm_ev_to_ry(fwhm)
 
         lines = []
         lines.append("&dos")
         lines.append(f'  prefix = "{prefix}"')
         lines.append('  outdir = "./"')
         lines.append(f"  ngauss = {ngauss}")
-        lines.append(f"  degauss = {fwhm}")
+        lines.append(f"  degauss = {degauss_ry:.6f}")
         lines.append(f"  DeltaE = {deltae}")
         if emin is not None:
             lines.append(f"  Emin = {emin}")
@@ -1026,8 +1131,8 @@ class QECompiler:
         *,
         prefix: Optional[str] = None,
         deltae: float = 0.01,
-        fwhm: float = 0.05,
-        ngauss: int = 1,
+        fwhm: float = 0.5,
+        ngauss: int = 0,
         atoms: Optional[Atoms] = None,
     ) -> str:
         """Compile a projwfc.x input for projected DOS.
@@ -1035,11 +1140,15 @@ class QECompiler:
         Requires a prior nscf with the same prefix; produces one
         {prefix}.pdos_atm#N(wfc#M) file per atomic wavefunction plus
         {prefix}.pdos_tot for the total DOS.
+
+        ``fwhm`` is the Gaussian broadening FWHM in eV; projwfc's degauss is
+        in Ry, so it is converted here.
         """
         if atoms is None and material not in MATERIAL_DB:
             raise ValueError(f"Unknown material: {material}")
 
         prefix = prefix or material.lower()
+        degauss_ry = _degauss_fwhm_ev_to_ry(fwhm)
 
         lines = []
         lines.append("&projwfc")
@@ -1047,7 +1156,7 @@ class QECompiler:
         lines.append('  outdir = "./"')
         lines.append(f'  filpdos = "{prefix}"')
         lines.append(f"  ngauss = {ngauss}")
-        lines.append(f"  degauss = {fwhm}")
+        lines.append(f"  degauss = {degauss_ry:.6f}")
         lines.append(f"  DeltaE = {deltae}")
         # QE 7.x writes the pdos files ONLY when lsym=.true. (projwfc.f90:
         # "ELSE IF ( lsym .OR. kresolveddos ) THEN CALL partialdos")

@@ -1,0 +1,76 @@
+{
+  "template_id": "v4_vasp_phonon_dispersion",
+  "description": "VASP + phonopy finite-displacement phonon dispersion: relax -> phonopy_disp (fans out displaced supercells, collects forces) -> phonopy_bands (dispersion + DOS + stability). Requires the optional 'phonopy' package.",
+  "inputs": {
+    "_parameters_locked": false,
+    "material": "Si",
+    "encut": null,
+    "kpoints": null,
+    "kspacing": null,
+    "structure": null,
+    "phonon_supercell": [2, 2, 2],
+    "displacement_distance": 0.01,
+    "nqpoints": 51,
+    "dos_mesh": [8, 8, 8],
+    "imaginary_threshold_thz": 0.1
+  },
+  "outputs": {
+    "relaxed_energy_ev": "${nodes.relax.outputs.energy_ev}",
+    "n_displacements": "${nodes.phonopy_disp.outputs.n_displacements}",
+    "min_frequency_thz": "${nodes.phonopy_bands.outputs.min_frequency_thz}",
+    "max_frequency_thz": "${nodes.phonopy_bands.outputs.max_frequency_thz}",
+    "stability": "${nodes.phonopy_bands.outputs.stability}"
+  },
+  "nodes": [
+    {
+      "id": "relax",
+      "tool": "vasp",
+      "params": {
+        "calc": "relax",
+        "_parameters_locked": "${inputs._parameters_locked}",
+        "material": "${inputs.material}",
+        "encut": "${inputs.encut}",
+        "kpoints": "${inputs.kpoints}",
+        "kspacing": "${inputs.kspacing}",
+        "structure": "${inputs.structure}"
+      },
+      "depends_on": [],
+      "max_repair_attempts": 2
+    },
+    {
+      "id": "phonopy_disp",
+      "tool": "vasp",
+      "params": {
+        "calc": "phonopy_disp",
+        "_parameters_locked": "${inputs._parameters_locked}",
+        "material": "${inputs.material}",
+        "encut": "${inputs.encut}",
+        "kpoints": "${inputs.kpoints}",
+        "kspacing": "${inputs.kspacing}",
+        "structure": "${inputs.structure}",
+        "phonon_supercell": "${inputs.phonon_supercell}",
+        "displacement_distance": "${inputs.displacement_distance}"
+      },
+      "depends_on": [
+        "relax"
+      ],
+      "max_repair_attempts": 1
+    },
+    {
+      "id": "phonopy_bands",
+      "tool": "vasp",
+      "params": {
+        "calc": "phonopy_bands",
+        "material": "${inputs.material}",
+        "structure": "${inputs.structure}",
+        "nqpoints": "${inputs.nqpoints}",
+        "dos_mesh": "${inputs.dos_mesh}",
+        "imaginary_threshold_thz": "${inputs.imaginary_threshold_thz}"
+      },
+      "depends_on": [
+        "phonopy_disp"
+      ],
+      "max_repair_attempts": 0
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "template_id": "a0_abinit_scf",
+  "description": "ABINIT single-point SCF energy (third engine, free/open source; requires DFT_FORGE_ABINIT_BIN + DFT_FORGE_ABINIT_PP_DIR)",
+  "inputs": {
+    "material": "Si",
+    "ecut": null,
+    "ngkpt": null,
+    "structure": null,
+    "_parameters_locked": false
+  },
+  "outputs": {
+    "energy_ev": "${nodes.scf.outputs.energy_ev}",
+    "converged": "${nodes.scf.outputs.converged}",
+    "natoms": "${nodes.scf.outputs.natoms}"
+  },
+  "nodes": [
+    {
+      "id": "scf",
+      "tool": "abinit",
+      "params": {
+        "calc": "scf",
+        "material": "${inputs.material}",
+        "ecut": "${inputs.ecut}",
+        "ngkpt": "${inputs.ngkpt}",
+        "structure": "${inputs.structure}",
+        "_parameters_locked": "${inputs._parameters_locked}"
+      },
+      "depends_on": [],
+      "max_repair_attempts": 2
+    }
+  ]
+}

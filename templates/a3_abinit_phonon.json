@@ -1,0 +1,75 @@
+{
+  "template_id": "a3_abinit_phonon",
+  "description": "ABINIT DFPT: fixed-cell relax -> complete commensurate q-mesh (all atoms, mrgddb merge) -> anaddb dispersion/DOS; no non-analytic LO/TO correction",
+  "inputs": {
+    "_parameters_locked": false,
+    "material": "Si",
+    "ecut": null,
+    "ngkpt": null,
+    "ngqpt": null,
+    "structure": null,
+    "path_points": 81,
+    "dos_ngqpt": [
+      8,
+      8,
+      8
+    ]
+  },
+  "outputs": {
+    "n_modes": "${nodes.anaddb.outputs.n_modes}",
+    "frequencies_thz": "${nodes.anaddb.outputs.frequencies_thz}",
+    "has_imaginary_modes": "${nodes.anaddb.outputs.has_imaginary_modes}",
+    "stability": "${nodes.anaddb.outputs.stability}",
+    "phonon_bands_file": "${nodes.anaddb.outputs.phonon_bands_file}",
+    "phonon_dos_file": "${nodes.anaddb.outputs.phonon_dos_file}"
+  },
+  "nodes": [
+    {
+      "id": "relax",
+      "tool": "abinit",
+      "params": {
+        "calc": "relax",
+        "_parameters_locked": "${inputs._parameters_locked}",
+        "material": "${inputs.material}",
+        "ecut": "${inputs.ecut}",
+        "ngkpt": "${inputs.ngkpt}",
+        "structure": "${inputs.structure}"
+      },
+      "depends_on": [],
+      "max_repair_attempts": 2
+    },
+    {
+      "id": "dfpt",
+      "tool": "abinit",
+      "params": {
+        "calc": "dfpt",
+        "_parameters_locked": "${inputs._parameters_locked}",
+        "material": "${inputs.material}",
+        "ecut": "${inputs.ecut}",
+        "ngkpt": "${inputs.ngkpt}",
+        "ngqpt": "${inputs.ngqpt}",
+        "structure": "${inputs.structure}"
+      },
+      "depends_on": [
+        "relax"
+      ],
+      "max_repair_attempts": 1
+    },
+    {
+      "id": "anaddb",
+      "tool": "abinit",
+      "params": {
+        "calc": "anaddb",
+        "material": "${inputs.material}",
+        "ngqpt": "${inputs.ngqpt}",
+        "structure": "${inputs.structure}",
+        "path_points": "${inputs.path_points}",
+        "dos_ngqpt": "${inputs.dos_ngqpt}"
+      },
+      "depends_on": [
+        "dfpt"
+      ],
+      "max_repair_attempts": 1
+    }
+  ]
+}
