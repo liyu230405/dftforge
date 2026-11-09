@@ -1,0 +1,78 @@
+{
+  "schema_version": "1.0",
+  "id": "PLAN-07",
+  "layer": "PLAN",
+  "title": "形成能（可闭环）",
+  "prompt": "算 MgO 相对于 Mg 和 O 参考态的形成能。 只规划，不要实际运行。",
+  "run_config": {
+    "mode": "research",
+    "approved": true
+  },
+  "expect": {
+    "execution_mode": "plan",
+    "support_status": [
+      "complete"
+    ]
+  },
+  "budget_seconds": 120,
+  "checks": [
+    {
+      "id": "c1",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "tool_planned",
+      "args": {
+        "tool": "thermo.formation"
+      }
+    },
+    {
+      "id": "c2",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "energy_sources_count",
+      "args": {
+        "minimum": 3
+      }
+    },
+    {
+      "id": "c3",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "no_side_effect_calls"
+    },
+    {
+      "id": "c4",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "O2.*?(分子|气相|gas)|(分子|气相|gas).*?O2"
+        ]
+      }
+    },
+    {
+      "id": "c5",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(不等于|≠|不代表|不意味|不能说明).*?(convex hull|凸包|热力学稳定)|(convex hull|凸包).*?(未|没有|不).*?(穷举|验证|检索)"
+        ]
+      }
+    },
+    {
+      "id": "c6",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(方法|赝势|泛函|截断|参数).*?(一致|相同|统一)|同一.*?(方法|赝势|泛函)"
+        ]
+      }
+    }
+  ],
+  "notes": "Mg 与 O 都在 REFERENCE_PHASES（33 元素）里，这题能闭环。"
+}

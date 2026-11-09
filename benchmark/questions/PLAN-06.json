@@ -1,0 +1,110 @@
+{
+  "schema_version": "1.0",
+  "id": "PLAN-06",
+  "layer": "PLAN",
+  "title": "多位点吸附（预算边界）",
+  "prompt": "算 O 在 MoS2 单层上 top、bridge、hollow 三个位点的吸附能，用 O2 做参考态。 只规划，不要实际运行。",
+  "run_config": {
+    "mode": "research",
+    "approved": true
+  },
+  "expect": {
+    "execution_mode": "plan",
+    "support_status": [
+      "complete",
+      "partial"
+    ]
+  },
+  "budget_seconds": 120,
+  "checks": [
+    {
+      "id": "c1",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "tool_planned",
+      "args": {
+        "tool": "workflow.adsorption_scan",
+        "args_contains": {
+          "kind": "mos2"
+        }
+      }
+    },
+    {
+      "id": "c2",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "tool_planned",
+      "args": {
+        "tool": "workflow.adsorption_scan",
+        "args_contains": {
+          "sites": [
+            "top",
+            "bridge",
+            "hollow"
+          ]
+        }
+      }
+    },
+    {
+      "id": "c3",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "tool_planned",
+      "args": {
+        "tool": "workflow.adsorption_scan",
+        "args_contains": {
+          "adsorbate_element": "O"
+        }
+      }
+    },
+    {
+      "id": "c4",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "no_side_effect_calls"
+    },
+    {
+      "id": "c5",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "1/2\\s*[·*x×]?\\s*E?\\s*\\(?\\s*O2|0\\.5\\s*[·*x×]?\\s*E?\\s*\\(?\\s*O2|½.*?O2|(半个|一半).*?O2|E\\(O2\\)\\s*/\\s*2"
+        ]
+      }
+    },
+    {
+      "id": "c6",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "固定(晶胞|胞|面内|晶格)|面内晶格.*?(不变|固定)|fixed.?cell"
+        ]
+      }
+    },
+    {
+      "id": "c7",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "三重态|triplet|自旋极化.*?O2|O2.*?自旋极化"
+        ]
+      }
+    },
+    {
+      "id": "c8",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "budget_honest",
+      "args": {
+        "note": "若动作数>8 须标 over_budget+partial 且完整描述留在 advisory"
+      }
+    }
+  ],
+  "notes": "c5：公式必须是 1/2·E(O2)（2026-09-07 P6 把它写成 E(O2)）。"
+}

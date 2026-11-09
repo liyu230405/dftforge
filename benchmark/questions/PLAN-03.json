@@ -1,0 +1,69 @@
+{
+  "schema_version": "1.0",
+  "id": "PLAN-03",
+  "layer": "PLAN",
+  "title": "能带与带隙",
+  "prompt": "算一下 GaAs 的能带结构和带隙，走高对称路径。 只规划，不要实际运行。",
+  "run_config": {
+    "mode": "research",
+    "approved": true
+  },
+  "expect": {
+    "execution_mode": "plan",
+    "support_status": [
+      "complete"
+    ]
+  },
+  "budget_seconds": 120,
+  "checks": [
+    {
+      "id": "c1",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "template_used",
+      "args": {
+        "template_id": "t2_bands"
+      }
+    },
+    {
+      "id": "c2",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "no_side_effect_calls"
+    },
+    {
+      "id": "c3",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "SCF.*?NSCF.*?(bands|能带)"
+        ]
+      }
+    },
+    {
+      "id": "c4",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "PBE.*?(低估|偏小|underestimat)|不能?.*?(等同|直接比较|等于).*?实验|实验.*?(不能|不可).*?直接"
+        ]
+      }
+    },
+    {
+      "id": "c5",
+      "kind": "assertion",
+      "weight": 0.5,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "直接带隙|direct.?gap|Γ.*?(VBM|CBM|带隙)"
+        ]
+      }
+    }
+  ],
+  "notes": "c5 是材料常识加分项。"
+}

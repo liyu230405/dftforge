@@ -1,0 +1,105 @@
+{
+  "schema_version": "1.0",
+  "id": "PLAN-05",
+  "layer": "PLAN",
+  "title": "掺杂对照（原子数陷阱）",
+  "prompt": "比较 P 掺杂 Si 和纯 Si 的能带，用 2x2x2 超胞。 只规划，不要实际运行。",
+  "run_config": {
+    "mode": "research",
+    "approved": true
+  },
+  "expect": {
+    "execution_mode": "plan",
+    "support_status": [
+      "complete",
+      "partial"
+    ]
+  },
+  "budget_seconds": 120,
+  "checks": [
+    {
+      "id": "c1",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "tool_planned",
+      "args": {
+        "tool": "structure.dope"
+      }
+    },
+    {
+      "id": "c2",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "tool_planned",
+      "args": {
+        "tool": "structure.supercell"
+      }
+    },
+    {
+      "id": "c3",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "no_self_doping"
+    },
+    {
+      "id": "c4",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "tool_planned",
+      "args": {
+        "tool": "analysis.compare"
+      }
+    },
+    {
+      "id": "c5",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "no_side_effect_calls"
+    },
+    {
+      "id": "c6",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "\\b16\\s*(个)?原子|Si15P|Si_?15|16-atom"
+        ]
+      }
+    },
+    {
+      "id": "c7",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_not_match",
+      "args": {
+        "patterns": [
+          "\\b64\\s*(个)?原子"
+        ]
+      }
+    },
+    {
+      "id": "c8",
+      "kind": "assertion",
+      "weight": 0.5,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "6\\.25\\s*%|高掺杂|浓度.*?(高|偏高)|需要.*?弛豫"
+        ]
+      }
+    },
+    {
+      "id": "c9",
+      "kind": "assertion",
+      "weight": 0.5,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(能带)?折叠|band.?folding|超胞.*?布里渊区.*?(缩小|折叠)"
+        ]
+      }
+    }
+  ],
+  "notes": "三个历史陷阱：原子数 16 非 64；纯对照不能自掺杂；需要比较步骤收口。"
+}

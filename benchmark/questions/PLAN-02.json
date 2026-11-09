@@ -1,0 +1,71 @@
+{
+  "schema_version": "1.0",
+  "id": "PLAN-02",
+  "layer": "PLAN",
+  "title": "双层收敛扫描",
+  "prompt": "我要把 Si 的 ecutwfc 和 k 点收敛到 1 meV/atom，给我一个可复现的扫描方案。 只规划，不要实际运行。",
+  "run_config": {
+    "mode": "research",
+    "approved": true
+  },
+  "expect": {
+    "execution_mode": "plan",
+    "support_status": [
+      "complete",
+      "partial"
+    ]
+  },
+  "budget_seconds": 120,
+  "checks": [
+    {
+      "id": "c1",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "tool_planned",
+      "args": {
+        "tool": "workflow.convergence"
+      }
+    },
+    {
+      "id": "c2",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "no_side_effect_calls"
+    },
+    {
+      "id": "c3",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "tool_planned",
+      "args": {
+        "tool": "workflow.convergence",
+        "args_contains": {
+          "threshold_mev_per_atom": 1
+        }
+      }
+    },
+    {
+      "id": "c4",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(固定|保持).*?(其余|其他|另一)|单变量|逐一|一次只(改|变|扫)"
+        ]
+      }
+    },
+    {
+      "id": "c5",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "能量收敛.*?(不等于|≠|不代表|不意味).*?(带隙|物性|声子|其他)|(带隙|物性|声子).*?(另需|单独|独立).*?收敛"
+        ]
+      }
+    }
+  ],
+  "notes": "收敛扫描是一等工具，不能只口头承诺后续自动执行（2026-09-07 P2 缺陷）。"
+}

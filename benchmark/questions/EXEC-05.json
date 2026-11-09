@@ -1,0 +1,107 @@
+{
+  "schema_version": "1.0",
+  "id": "EXEC-05",
+  "layer": "EXEC",
+  "title": "MgO Γ 点声子",
+  "prompt": "用 workflow.phonon_dfpt 算 MgO 的 Γ 点声子，q_grid=[1,1,1]、relax=true、tr2_ph=1e-12。作为 Γ 链路测试，不外推全布里渊区稳定性。 直接运行本地 QE。本轮是有限参数下的链路验证，数值未经过收敛测试；只执行当前任务，不添加扫描。",
+  "run_config": {
+    "mode": "research",
+    "approved": true,
+    "accuracy": "custom",
+    "ecutwfc": 40,
+    "ecutrho": 320,
+    "kpoints": [
+      2,
+      2,
+      2,
+      0,
+      0,
+      0
+    ]
+  },
+  "expect": {
+    "execution_mode": "execute"
+  },
+  "budget_seconds": 120,
+  "checks": [
+    {
+      "id": "c1",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "nodes_succeeded",
+      "args": {
+        "nodes": [
+          "relax",
+          "scf",
+          "ph",
+          "q2r",
+          "matdyn"
+        ]
+      }
+    },
+    {
+      "id": "c2",
+      "kind": "numeric",
+      "weight": 1.0,
+      "rule": "acoustic_modes_near_zero",
+      "args": {
+        "field": "phonon_freqs_thz",
+        "limit": 0.5,
+        "count": 3,
+        "unit": "THz"
+      }
+    },
+    {
+      "id": "c3",
+      "kind": "numeric",
+      "weight": 1.0,
+      "rule": "graded_relative",
+      "args": {
+        "field": "optical_mode_thz",
+        "value": 25.9187,
+        "tolerance": 0.05,
+        "unit": "THz"
+      }
+    },
+    {
+      "id": "c4",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(0\\.1\\s*THz|阈值).*?(未|没有|无).*?(虚频|显著虚频)"
+        ]
+      }
+    },
+    {
+      "id": "c5",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(仅|只有?).*?(Γ|Gamma|gamma).*?(不|≠|不能).*?(代表|等于|外推|说明)|(Γ|Gamma).*?点.*?(不足以|不代表)"
+        ]
+      }
+    },
+    {
+      "id": "c6",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(方法|赝势|泛函|截断|参数).*?(一致|相同|统一)|同一.*?(方法|赝势|泛函)"
+        ]
+      }
+    },
+    {
+      "id": "c7",
+      "kind": "audit",
+      "weight": 1.0,
+      "rule": "gating_all_pass"
+    }
+  ],
+  "notes": "GT 光学模 25.9187 THz。c6 针对 2026-09-22 修复的弛豫→SCF 赝势传递 bug。"
+}

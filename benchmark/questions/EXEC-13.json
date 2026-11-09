@@ -1,0 +1,96 @@
+{
+  "schema_version": "1.0",
+  "id": "EXEC-13",
+  "layer": "EXEC",
+  "title": "O@MoS2 单位点吸附能",
+  "prompt": "用 workflow.adsorption_scan 算 O 在 MoS2 单层 top 位的吸附能，3x3 超胞、O2 做参考、固定晶胞弛豫。 直接运行本地 QE。本轮是有限参数下的链路验证，数值未经过收敛测试；只执行当前任务，不添加扫描。",
+  "run_config": {
+    "mode": "research",
+    "approved": true,
+    "accuracy": "custom",
+    "ecutwfc": 30,
+    "ecutrho": 240,
+    "kpoints": [
+      2,
+      2,
+      1,
+      0,
+      0,
+      0
+    ]
+  },
+  "expect": {
+    "execution_mode": "execute"
+  },
+  "budget_seconds": 600,
+  "checks": [
+    {
+      "id": "c1",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "node_count",
+      "args": {
+        "minimum": 4
+      }
+    },
+    {
+      "id": "c2",
+      "kind": "tool_trace",
+      "weight": 1.0,
+      "rule": "energy_steps_bound",
+      "args": {
+        "tool": "thermo.eads"
+      }
+    },
+    {
+      "id": "c3",
+      "kind": "numeric",
+      "weight": 1.0,
+      "rule": "finite",
+      "args": {
+        "field": "e_ads_ev",
+        "unit": "eV"
+      }
+    },
+    {
+      "id": "c4",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "三重态|triplet|自旋极化.*?O2|O2.*?自旋极化"
+        ]
+      }
+    },
+    {
+      "id": "c5",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "固定(晶胞|胞|面内|晶格)|面内晶格.*?(不变|固定)|fixed.?cell"
+        ]
+      }
+    },
+    {
+      "id": "c6",
+      "kind": "assertion",
+      "weight": 1.0,
+      "rule": "must_match",
+      "args": {
+        "patterns": [
+          "(单|一个|仅).*?位点.*?(不等于|≠|不代表|不一定).*?(最稳|最低|全局)"
+        ]
+      }
+    },
+    {
+      "id": "c7",
+      "kind": "audit",
+      "weight": 1.0,
+      "rule": "gating_all_pass"
+    }
+  ],
+  "notes": "本套最重的题（~5 min）。只做 top 一个位点控预算；E_ads 公式核对在 c3 的解析里。"
+}

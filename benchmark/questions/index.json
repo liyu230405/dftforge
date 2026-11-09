@@ -1,0 +1,42 @@
+{
+  "bench_version": "1.0",
+  "generated_for": "dft-forge",
+  "layers": {
+    "PLAN": 10,
+    "EXEC": 13,
+    "EDGE": 7
+  },
+  "total": 30,
+  "question_ids": [
+    "PLAN-01",
+    "PLAN-02",
+    "PLAN-03",
+    "PLAN-04",
+    "PLAN-05",
+    "PLAN-06",
+    "PLAN-07",
+    "PLAN-08",
+    "PLAN-09",
+    "PLAN-10",
+    "EXEC-01",
+    "EXEC-02",
+    "EXEC-03",
+    "EXEC-04",
+    "EXEC-05",
+    "EXEC-06",
+    "EXEC-07",
+    "EXEC-08",
+    "EXEC-09",
+    "EXEC-10",
+    "EXEC-11",
+    "EXEC-12",
+    "EXEC-13",
+    "EDGE-01",
+    "EDGE-02",
+    "EDGE-03",
+    "EDGE-04",
+    "EDGE-05",
+    "EDGE-06",
+    "EDGE-07"
+  ]
+}

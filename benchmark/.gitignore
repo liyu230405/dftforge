@@ -1,0 +1,4 @@
+# 每轮的完整 record 和 QE 中间文件，体积大，不入库；汇总见 results/
+runs/
+runs-*.log
+input_tmp.in
