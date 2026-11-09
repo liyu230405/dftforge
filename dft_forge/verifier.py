@@ -77,6 +77,18 @@ class ScientificVerifier:
             parsed = QEParser.parse_vc_relax(inp.stdout, xml)
         stdout = inp.stdout
 
+        # The node's requested thresholds win over verifier-wide defaults.
+        force_threshold = (
+            inp.force_threshold_ry
+            if inp.force_threshold_ry is not None
+            else self.force_threshold_ry
+        )
+        pressure_threshold = (
+            inp.pressure_threshold_kbar
+            if inp.pressure_threshold_kbar is not None
+            else self.pressure_threshold_kbar
+        )
+
         # Check 0: Executor-reported failure
         if not inp.job_success:
             report.passed = False
@@ -128,17 +140,17 @@ class ScientificVerifier:
         if not force_present:
             report.passed = False
             report.failure_reasons.append("No atomic-force block found in vc-relax output")
-        elif parsed.max_force_ry_bohr > self.force_threshold_ry:
+        elif parsed.max_force_ry_bohr > force_threshold:
             report.passed = False
             report.failure_reasons.append(
                 f"Max force {parsed.max_force_ry_bohr:.2e} Ry/Bohr exceeds "
-                f"threshold {self.force_threshold_ry:.0e}"
+                f"threshold {force_threshold:.0e}"
             )
         report.checks["forces"] = {
-            "pass": force_present and parsed.max_force_ry_bohr <= self.force_threshold_ry,
+            "pass": force_present and parsed.max_force_ry_bohr <= force_threshold,
             "present": force_present,
             "value": parsed.max_force_ry_bohr,
-            "threshold": self.force_threshold_ry,
+            "threshold": force_threshold,
         }
         
         # Check 4: Pressure
@@ -149,17 +161,17 @@ class ScientificVerifier:
         if not pressure_present:
             report.passed = False
             report.failure_reasons.append("No pressure value found in vc-relax output")
-        elif abs(parsed.pressure_kbar) > self.pressure_threshold_kbar:
+        elif abs(parsed.pressure_kbar) > pressure_threshold:
             report.passed = False
             report.failure_reasons.append(
                 f"Pressure {parsed.pressure_kbar:.2f} kbar exceeds "
-                f"threshold {self.pressure_threshold_kbar}"
+                f"threshold {pressure_threshold}"
             )
         report.checks["pressure"] = {
-            "pass": pressure_present and abs(parsed.pressure_kbar) <= self.pressure_threshold_kbar,
+            "pass": pressure_present and abs(parsed.pressure_kbar) <= pressure_threshold,
             "present": pressure_present,
             "value": parsed.pressure_kbar,
-            "threshold": self.pressure_threshold_kbar,
+            "threshold": pressure_threshold,
         }
         
         # Check 5: Energy monotonicity (vc-relax)
@@ -313,8 +325,15 @@ class ScientificVerifier:
                 # "succeeds" while every downstream number is missing
                 report.passed = False
                 report.failure_reasons.append("bands XML parsed but empty (no eigenvalues)")
+            if bands.fermi_energy_ev is None:
+                # A missing Fermi reference makes every reported gap/VBM/CBM
+                # meaningless; older parser versions fabricated a midpoint.
+                report.passed = False
+                report.failure_reasons.append(
+                    "bands XML has no Fermi energy/HOMO; band gap cannot be evaluated"
+                )
             report.checks["bands_data"] = {
-                "pass": bands.n_bands > 0,
+                "pass": bands.n_bands > 0 and bands.fermi_energy_ev is not None,
                 "n_bands": bands.n_bands,
                 "n_kpoints": bands.n_kpoints,
                 "fermi_ev": bands.fermi_energy_ev,

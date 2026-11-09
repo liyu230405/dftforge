@@ -17,6 +17,11 @@ from dft_forge.agent_loop.planning import mark_blocked
 
 _FIELDS = {
     "workflow.neutral_vacancy": ("chemical_potential_ry", "chemical_potential_ev"),
+    "workflow.charged_vacancy": (
+        "chemical_potential_ry", "chemical_potential_ev", "dielectric_constant",
+        "potential_alignment_ev_by_charge", "electrostatic_correction_ev_by_charge",
+        "band_gap_ev",
+    ),
     "thermo.chemical_potential_scan": ("formation_energy_ev_per_formula", "competitors"),
 }
 
@@ -25,10 +30,19 @@ def _finite_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
+def _charge_observation(mapping, charge):
+    if not isinstance(mapping, dict):
+        return None
+    for key in (str(charge), f"{charge:+d}", charge):
+        if key in mapping:
+            return mapping[key]
+    return None
+
+
 def trusted_thermodynamic_inputs(message, ctx):
     """Only parse explicitly named JSON data; prose/model claims are not evidence."""
     trusted = {}
-    for value in (ctx.get("thermodynamic_inputs"), (ctx.get("run_config") or {}).get("thermodynamic_inputs")):
+    for value in (ctx.get("thermodynamic_inputs"),):
         if isinstance(value, dict):
             trusted.update(copy.deepcopy(value))
     decoder = json.JSONDecoder()
@@ -51,8 +65,6 @@ def guard_scientific_inputs(plan, steps, message, ctx):
     by the model is discarded; it never authorizes a value by itself.
     """
     trusted = trusted_thermodynamic_inputs(message, ctx)
-    if trusted:
-        ctx["thermodynamic_inputs"] = copy.deepcopy(trusted)
     kept, blocked_tools = [], set()
     for step in steps:
         tool_id = step.get("tool")
@@ -64,6 +76,15 @@ def guard_scientific_inputs(plan, steps, message, ctx):
         supplied = trusted.get(tool_id)
         supplied = supplied if isinstance(supplied, dict) else {}
         if tool_id == "workflow.neutral_vacancy":
+            if args.get("reference_mode") == "same_method_bulk_per_atom":
+                if not any(args.get(key) is not None for key in _FIELDS[tool_id]):
+                    # This is a computed reference strategy, not a guessed
+                    # observed number. Runtime validates the actual atoms.
+                    kept.append(step)
+                    continue
+                mark_blocked(plan, "same_method_bulk_per_atom 不能混用显式化学势；请只选择一种参考方式")
+                blocked_tools.add(tool_id)
+                continue
             present = [key for key in _FIELDS[tool_id] if supplied.get(key) is not None]
             valid = (len(present) == 1 and _finite_number(supplied[present[0]])
                      and supplied.get("reference") == "absolute_dft"
@@ -73,6 +94,41 @@ def guard_scientific_inputs(plan, steps, message, ctx):
                 "中性空位形成能需要与总能量同一参考的绝对 DFT 化学势（每个移除原子）；"
                 "O-rich 的 Δμ=0 不能作为绝对 μ。请用 thermodynamic_inputs JSON 提供"
                 " chemical_potential_ry 或 chemical_potential_ev，并标明 reference=absolute_dft、source 和 element"
+            )
+        elif tool_id == "workflow.charged_vacancy":
+            charges = args.get("charges") or []
+            nonzero = [int(value) for value in charges if isinstance(value, int) and not isinstance(value, bool) and value != 0]
+            identity_ok = supplied.get("source") == args.get("source") and supplied.get("element") == args.get("element")
+            alignments = supplied.get("potential_alignment_ev_by_charge")
+            alignment_ok = bool(nonzero) and all(
+                _finite_number(_charge_observation(alignments, charge)) for charge in nonzero
+            )
+            reference_mode = args.get("reference_mode", "explicit")
+            mu_present = [key for key in ("chemical_potential_ry", "chemical_potential_ev") if supplied.get(key) is not None]
+            if reference_mode == "same_method_bulk_per_atom":
+                mu_ok = not mu_present
+            else:
+                mu_ok = (len(mu_present) == 1 and _finite_number(supplied[mu_present[0]])
+                         and supplied.get("reference") == "absolute_dft")
+            correction_mode = args.get("correction_mode", "makov_payne_cubic")
+            if correction_mode == "makov_payne_cubic":
+                correction_ok = (
+                    _finite_number(supplied.get("dielectric_constant"))
+                    and supplied["dielectric_constant"] > 0
+                )
+            else:
+                corrections = supplied.get("electrostatic_correction_ev_by_charge")
+                correction_ok = bool(nonzero) and all(
+                    _finite_number(_charge_observation(corrections, charge)) for charge in nonzero
+                )
+            gap = supplied.get("band_gap_ev")
+            gap_ok = gap is None or (_finite_number(gap) and gap > 0)
+            valid = identity_ok and alignment_ok and mu_ok and correction_ok and gap_ok
+            reason = (
+                "带电空位形成能需要用户结构化提供与 source/element 匹配的绝对化学势"
+                "（纯元素 same_method_bulk_per_atom 可省略）、每个非零电荷态的 potential_alignment_ev_by_charge，"
+                "以及 Makov-Payne 所需的正 dielectric_constant 或 explicit 模式下的逐电荷静电修正；"
+                "这些材料观测量不会由模型猜测。"
             )
         else:
             competitors = supplied.get("competitors", [])

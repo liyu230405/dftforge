@@ -206,6 +206,54 @@ class TestParseQEInput:
         with pytest.raises(ValueError, match="no ATOMIC_POSITIONS"):
             _parse_qe_input(text)
 
+    def test_qe_alat_crystal_units(self):
+        # Regression for the compiler's own output convention:
+        # CELL_PARAMETERS (alat=1.0) rows are in units of celldm(1) bohr.
+        text = (
+            "&system\n celldm(1) = 10.255208\n ibrav = 0\n nat = 2\n ntyp = 1\n/\n"
+            "ATOMIC_SPECIES\nSi 28.086 Si.upf\n"
+            "ATOMIC_POSITIONS (crystal)\n"
+            "Si 0.0 0.0 0.0\nSi 0.25 0.25 0.25\n"
+            "CELL_PARAMETERS (alat=1.0)\n"
+            "0.0 0.5 0.5\n0.5 0.0 0.5\n0.5 0.5 0.0\n"
+        )
+        atoms = _parse_qe_input(text)
+        # a = 10.255208 bohr ≈ 5.427 Å; primitive vector length = a/√2
+        assert atoms.cell.lengths()[0] == pytest.approx(10.255208 * 0.529177210903 / 2 ** 0.5, rel=1e-4)
+        nn = atoms.get_all_distances(mic=True)
+        assert nn[~np.eye(2, dtype=bool)].min() == pytest.approx(2.35, abs=0.02)
+
+    def test_qe_angstrom_cell_roundtrip(self):
+        text = (
+            "&system\n ibrav = 0\n nat = 1\n ntyp = 1\n/\n"
+            "ATOMIC_SPECIES\nSi 28.086 Si.upf\n"
+            "ATOMIC_POSITIONS (crystal)\nSi 0.0 0.0 0.0\n"
+            "CELL_PARAMETERS (angstrom)\n4.0 0 0\n0 4.0 0\n0 0 4.0\n"
+        )
+        atoms = _parse_qe_input(text)
+        assert np.allclose(atoms.cell.lengths(), 4.0)
+
+    def test_qe_cartesian_bohr_positions(self):
+        text = (
+            "&system\n ibrav = 0\n nat = 2\n ntyp = 1\n/\n"
+            "ATOMIC_SPECIES\nSi 28.086 Si.upf\n"
+            "ATOMIC_POSITIONS (bohr)\nSi 0.0 0.0 0.0\nSi 1.0 0.0 0.0\n"
+            "CELL_PARAMETERS (bohr)\n4 0 0\n0 4 0\n0 0 4\n"
+        )
+        atoms = _parse_qe_input(text)
+        # 1 bohr = 0.529177 Å
+        assert atoms.get_positions()[1, 0] == pytest.approx(0.529177210903, rel=1e-8)
+
+    def test_qe_afm_suffixed_species_labels(self):
+        text = (
+            "&system\n ibrav = 0\n nat = 2\n ntyp = 2\n/\n"
+            "ATOMIC_SPECIES\nFeA 55.85 FeA.upf\nFeB 55.85 FeB.upf\n"
+            "ATOMIC_POSITIONS (crystal)\nFeA 0.0 0.0 0.0\nFeB 0.5 0.5 0.5\n"
+            "CELL_PARAMETERS (angstrom)\n2.87 0 0\n0 2.87 0\n0 0 2.87\n"
+        )
+        atoms = _parse_qe_input(text)
+        assert atoms.get_chemical_symbols() == ["Fe", "Fe"]
+
 
 # ── Explicit structure parser ─────────────────────────────────────────────────
 

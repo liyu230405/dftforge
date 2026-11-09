@@ -237,7 +237,8 @@ def _structure_build2d(args: dict) -> dict:
             if args.get("adsorb")
             else None
         ),
-        height=args.get("height", 1.5),
+        height=(args.get("adsorb") or {}).get("height", args.get("height", 1.5)),
+        site_index=int((args.get("adsorb") or {}).get("site_index", 0)),
         vacuum=args.get("vacuum", 15.0),
         output=args.get("output"),
     )
@@ -346,6 +347,18 @@ def _workflow_neutral_vacancy(args: dict) -> dict:
     return run_neutral_vacancy(args)
 
 
+def _workflow_charged_vacancy(args: dict) -> dict:
+    from dft_forge.workflows import run_charged_vacancy
+
+    return run_charged_vacancy(args)
+
+
+def _workflow_adsorption_scan(args: dict) -> dict:
+    from dft_forge.workflows import run_adsorption_scan
+
+    return run_adsorption_scan(args)
+
+
 def _chemical_potential_scan(args: dict) -> dict:
     from dft_forge.workflows import chemical_potential_scan
 
@@ -372,7 +385,8 @@ def _workflow_phonon_dfpt(args: dict) -> dict:
 def _analysis_compare(args: dict) -> dict:
     """Deterministic comparison of calculation results across systems.
 
-    entries: [{label, band_gap_ev?, is_metal?, fermi_ev?, energy_ry?, natoms?}]
+    entries: [{label, band_gap_ev?, is_metal?, fermi_ev?, energy_ry?, natoms?,
+               formula?/composition?/material?, method_profile?}]
     metric: "band_gap" | "energy" | "auto" (auto = band gap if any entry has one)
     """
     entries = args.get("entries") or []
@@ -395,6 +409,10 @@ def _analysis_compare(args: dict) -> dict:
             "energy_ry": e.get("energy_ry"),
             "natoms": e.get("natoms"),
             "template": e.get("template"),
+            "formula": e.get("formula"),
+            "composition": e.get("composition"),
+            "material": e.get("material"),
+            "method_profile": e.get("method_profile"),
         })
     if len(clean) < 2:
         return {"error": "comparison needs at least 2 valid calculations"}
@@ -430,19 +448,141 @@ def _analysis_compare(args: dict) -> dict:
                     "wider": items[j]["label"] if d > 0 else items[i]["label"],
                 })
     else:
+        import math
+
+        def _energy_error(message: str) -> dict:
+            return {
+                "error": message,
+                "metric": "energy",
+                "comparable": False,
+            }
+
+        def _entry_composition(entry: dict, natoms: int):
+            raw = entry.get("composition")
+            if raw is None:
+                raw = entry.get("formula")
+            if raw is None:
+                raw = entry.get("material")
+            if raw is None or raw == "":
+                return None
+            try:
+                from pymatgen.core import Composition
+
+                comp = Composition(raw)
+                fractions = comp.fractional_composition.as_dict()
+            except Exception:
+                return None
+            if not fractions or any(
+                not math.isfinite(float(amount)) or float(amount) <= 0
+                for amount in fractions.values()
+            ):
+                return None
+            counts = {
+                str(element): float(fraction) * natoms
+                for element, fraction in fractions.items()
+            }
+            if any(abs(count - round(count)) > 1.0e-6 for count in counts.values()):
+                return None
+            return {element: int(round(count)) for element, count in sorted(counts.items())}
+
+        def _method_signature(profile: dict, elements: set[str]):
+            if not isinstance(profile, dict) or not profile:
+                return None, "method_profile is missing"
+            effective = profile.get("effective")
+            pseudos = profile.get("pseudos")
+            if not isinstance(effective, dict):
+                return None, "method_profile.effective is missing"
+            if not isinstance(pseudos, dict) or any(not pseudos.get(el) for el in elements):
+                return None, "method_profile lacks pseudopotential evidence for the compared elements"
+            required = ("ecutwfc", "ecutrho", "kpoints")
+            missing = [key for key in required if effective.get(key) is None]
+            if missing:
+                return None, f"method_profile lacks {', '.join(missing)} evidence"
+            if not isinstance(effective.get("kpoints"), (list, tuple)) or not effective["kpoints"]:
+                return None, "method_profile has invalid kpoints evidence"
+            return {
+                "pseudos": {el: pseudos[el] for el in sorted(elements)},
+                "input_dft": profile.get("input_dft") or "pseudo_default",
+                "ecutwfc": effective.get("ecutwfc"),
+                "ecutrho": effective.get("ecutrho"),
+                "kpoints": list(effective.get("kpoints") or []),
+                "occupations": effective.get("occupations", profile.get("occupations")),
+                "smearing": effective.get("smearing", profile.get("smearing")),
+                "degauss": effective.get("degauss", profile.get("degauss")),
+                "tot_charge": effective.get("tot_charge", 0.0),
+            }, None
+
         ry_to_ev = 13.605693122994
+        evidence = []
+        profiles_present = any(c.get("method_profile") is not None for c in clean)
         for c in clean:
             if c.get("energy_ry") is None:
                 return {"error": f"'{c['label']}' has no SCF total energy (need t0_scf for both systems)"}
-            e_ry = float(c["energy_ry"])
-            n = int(c.get("natoms") or 0)
+            try:
+                e_ry = float(c["energy_ry"])
+            except (TypeError, ValueError):
+                return _energy_error(f"'{c['label']}' has an invalid SCF total energy")
+            if not math.isfinite(e_ry):
+                return _energy_error(f"'{c['label']}' has a non-finite SCF total energy")
+            raw_natoms = c.get("natoms")
+            try:
+                n = int(raw_natoms)
+            except (TypeError, ValueError, OverflowError):
+                return _energy_error(
+                    f"energy comparison requires a verifiable positive integer atom count; "
+                    f"'{c['label']}' has natoms={raw_natoms!r}"
+                )
+            if n <= 0 or isinstance(raw_natoms, bool) or float(raw_natoms) != n:
+                return _energy_error(
+                    f"energy comparison requires a verifiable positive integer atom count; "
+                    f"'{c['label']}' has natoms={raw_natoms!r}"
+                )
+            composition = _entry_composition(c, n)
+            if composition is None:
+                return _energy_error(
+                    f"energy comparison requires formula/composition evidence consistent with natoms; "
+                    f"cannot verify '{c['label']}'"
+                )
+            evidence.append((c, n, composition))
             items.append({
                 "label": c["label"],
                 "energy_ry": round(e_ry, 6),
                 "energy_ev": round(e_ry * ry_to_ev, 4),
-                "energy_ev_per_atom": round(e_ry * ry_to_ev / n, 4) if n else None,
-                "natoms": n or None,
+                "energy_ev_per_atom": round(e_ry * ry_to_ev / n, 4),
+                "natoms": n,
+                "composition": composition,
             })
+        expected_natoms = evidence[0][1]
+        expected_composition = evidence[0][2]
+        for c, n, composition in evidence[1:]:
+            if n != expected_natoms:
+                return _energy_error(
+                    "absolute total-energy comparison requires identical atom counts; "
+                    f"'{evidence[0][0]['label']}' has {expected_natoms}, "
+                    f"'{c['label']}' has {n}"
+                )
+            if composition != expected_composition:
+                return _energy_error(
+                    "absolute total-energy comparison requires identical elemental composition; "
+                    f"'{evidence[0][0]['label']}' has {expected_composition}, "
+                    f"'{c['label']}' has {composition}"
+                )
+        if profiles_present:
+            elements = set(expected_composition)
+            signatures = []
+            for c, _, _ in evidence:
+                signature, error = _method_signature(c.get("method_profile"), elements)
+                if error:
+                    return _energy_error(f"cannot verify method compatibility for '{c['label']}': {error}")
+                signatures.append((c["label"], signature))
+            reference_label, reference = signatures[0]
+            for label, signature in signatures[1:]:
+                for key in reference:
+                    if signature[key] != reference[key]:
+                        return _energy_error(
+                            f"method mismatch for {key}: '{reference_label}' uses "
+                            f"{reference[key]!r}, '{label}' uses {signature[key]!r}"
+                        )
         diffs = []
         for i in range(len(items)):
             for j in range(i + 1, len(items)):
@@ -466,9 +606,9 @@ def _analysis_compare(args: dict) -> dict:
         "items": items,
         "differences": diffs,
         "note": (
-            "带隙差 = 两者带隙之差；能量差为负表示后者更稳定（能量更低）。"
+            "带隙差仅描述本次计算得到的数值间隔差异，不用于判断结构稳定性。"
             if metric == "band_gap"
-            else "总能量受原子数影响，每原子能量更适合不同体系间的比较。"
+            else "仅对组成、原子数和可用方法证据一致的结构比较绝对总能量；负差值表示后者能量更低。"
         ),
     }
 
@@ -545,6 +685,11 @@ def register_default_tools() -> None:
                             "element": {"type": "string", "pattern": "^[A-Z][a-z]?$", "description": "One atomic element symbol, not a molecule such as CO2"},
                             "site": {"type": "string", "enum": ["top", "bridge", "hollow"]},
                             "height": {"type": "number"},
+                            "site_index": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "Reference-atom ordinal within the topmost surface layer; use it to distinguish e.g. B-top and N-top on h-BN",
+                            },
                         },
                         "required": ["element"],
                         "additionalProperties": False,
@@ -626,14 +771,14 @@ def register_default_tools() -> None:
             name="Build Gas Molecule",
             description=(
                 "Build a gas-phase molecule in a cubic box (Γ-point reference for "
-                "adsorption energies). kind: o2|n2|h2|cl2|co|oh|no|h2o|co2|nh3. "
+                "adsorption energies). kind: o2|n2|h2|f2|cl2|co|oh|no|h2o|co2|nh3. "
                 "Example: {kind: 'o2'}"
             ),
             category="structure",
             input_schema={
                 "type": "object",
                 "properties": {
-                    "kind": {"type": "string", "enum": ["o2", "n2", "h2", "cl2", "co", "oh", "no", "h2o", "co2", "nh3"]},
+                    "kind": {"type": "string", "enum": ["o2", "n2", "h2", "f2", "cl2", "co", "oh", "no", "h2o", "co2", "nh3"]},
                     "box": {"type": "number"},
                     "output": {"type": "string"},
                 },
@@ -665,7 +810,9 @@ def register_default_tools() -> None:
             name="Compare Calculations",
             description=(
                 "Compare two (or more) calculations from this session: band gaps "
-                "(from t2_bands) or total/per-atom energies (from t0_scf). "
+                "(from t2_bands) or total/per-atom energies (from t0_scf). Energy "
+                "ranking is emitted only for entries with verified identical composition "
+                "and atom count, plus compatible method profiles when present. "
                 "Leave args empty (or set use_last) and the executor injects the "
                 "session ledger entries. Example: {use_last: 2, metric: 'band_gap'}"
             ),
@@ -675,7 +822,10 @@ def register_default_tools() -> None:
                 "properties": {
                     "entries": {
                         "type": "array",
-                        "description": "explicit entries [{label, band_gap_ev, energy_ry, natoms, ...}] (usually auto-injected)",
+                        "description": (
+                            "explicit entries [{label, band_gap_ev, energy_ry, natoms, "
+                            "formula/composition/material, method_profile, ...}] (usually auto-injected)"
+                        ),
                         "items": {"type": "object"},
                     },
                     "use_last": {"type": "integer", "description": "compare the last N ledger entries (default 2)"},
@@ -700,6 +850,11 @@ def register_default_tools() -> None:
                     "ry_m": {"type": "number", "description": "E(molecule) in Ry"},
                     "nat_a": {"type": "integer", "description": "adsorbed atoms on the surface"},
                     "nat_mol": {"type": "integer", "description": "atoms in the gas molecule (2 for O2)"},
+                    "energy_steps": {
+                        "type": "object", "description": "Bind successful prior graph.run step IDs; never guess energies",
+                        "properties": {role: {"type": "string"} for role in ("adsorbed", "surface", "molecule")},
+                        "required": ["adsorbed", "surface", "molecule"], "additionalProperties": False,
+                    },
                 },
                 "required": ["ry_a", "ry_s", "ry_m"],
             },
@@ -761,7 +916,8 @@ def register_default_tools() -> None:
             description=(
                 "Build a matched pristine/vacancy bulk supercell, optionally relax the "
                 "neutral defect at fixed cell, run SCF energies, and compute "
-                "Edef-Ebulk+mu_removed. chemical_potential must be explicit."
+                "Edef-Ebulk+mu_removed. reference_mode=explicit requires an absolute chemical potential; "
+                "same_method_bulk_per_atom derives mu=Ebulk/N for an elemental host only."
             ),
             category="analysis",
             input_schema={
@@ -775,6 +931,7 @@ def register_default_tools() -> None:
                     "relax": {"type": "boolean"},
                     "chemical_potential_ry": {"type": "number"},
                     "chemical_potential_ev": {"type": "number"},
+                    "reference_mode": {"type": "string", "enum": ["explicit", "same_method_bulk_per_atom"], "default": "explicit"},
                     "ecutwfc": {"type": "number"},
                     "ecutrho": {"type": "number"},
                     "kpoints": {"type": "array", "items": {"type": "integer"}},
@@ -784,6 +941,115 @@ def register_default_tools() -> None:
                 "required": ["source", "element"],
             },
             execute_fn=_workflow_neutral_vacancy,
+        ),
+        ToolEntry(
+            id="workflow.charged_vacancy",
+            name="Charged Vacancy Formation",
+            description=(
+                "Run matched pristine and charged-vacancy fixed-cell calculations for explicit charge states, "
+                "then form E_f(E_F) using a user-supplied absolute chemical potential, potential alignment, "
+                "and either a cubic first-order Makov-Payne image correction or explicit correction values. "
+                "The workflow never guesses dielectric screening or alignment."
+            ),
+            category="analysis",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string"},
+                    "element": {"type": "string", "pattern": "^[A-Z][a-z]?$"},
+                    "supercell": {"type": "string"},
+                    "index": {"type": "integer", "minimum": 0},
+                    "charges": {
+                        "type": "array", "minItems": 1, "uniqueItems": True,
+                        "items": {"type": "integer", "minimum": -4, "maximum": 4},
+                    },
+                    "fermi_levels_ev": {"type": "array", "minItems": 1, "items": {"type": "number", "minimum": 0}},
+                    "band_gap_ev": {"type": "number", "exclusiveMinimum": 0},
+                    "relax": {"type": "boolean"},
+                    "force_threshold": {"type": "number", "exclusiveMinimum": 0},
+                    "nstep": {"type": "integer", "minimum": 1},
+                    "chemical_potential_ry": {"type": "number"},
+                    "chemical_potential_ev": {"type": "number"},
+                    "reference_mode": {"type": "string", "enum": ["explicit", "same_method_bulk_per_atom"], "default": "explicit"},
+                    "correction_mode": {"type": "string", "enum": ["makov_payne_cubic", "explicit"], "default": "makov_payne_cubic"},
+                    "dielectric_constant": {"type": "number", "exclusiveMinimum": 0},
+                    "madelung_alpha": {"type": "number", "exclusiveMinimum": 0},
+                    "cubic_tolerance": {"type": "number", "exclusiveMinimum": 0, "maximum": 0.1},
+                    "potential_alignment_ev_by_charge": {"type": "object", "additionalProperties": {"type": "number"}},
+                    "electrostatic_correction_ev_by_charge": {"type": "object", "additionalProperties": {"type": "number"}},
+                    "spin_by_charge": {"type": "object", "additionalProperties": {"type": "object"}},
+                    "magnetization_tolerance_muB": {"type": "number", "minimum": 0},
+                    "ecutwfc": {"type": "number", "exclusiveMinimum": 0},
+                    "ecutrho": {"type": "number", "exclusiveMinimum": 0},
+                    "kpoints": {"type": "array", "items": {"type": "integer"}},
+                    "conv_thr": {"type": "number", "exclusiveMinimum": 0},
+                    "workdir": {"type": "string"},
+                },
+                "required": ["source", "element", "charges"],
+            },
+            execute_fn=_workflow_charged_vacancy,
+        ),
+        ToolEntry(
+            id="workflow.adsorption_scan",
+            name="Multi-site Atomic Adsorption",
+            description=(
+                "Build one clean 2D surface, one homonuclear gas reference, and every requested atomic "
+                "adsorption site; optionally relax each at fixed cell, run final SCFs, validate the O2 "
+                "triplet reference, and rank E_ads over the successfully verified requested sites."
+            ),
+            category="analysis",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["graphene", "bn", "mos2", "ws2", "mose2", "wse2", "mote2", "wte2"]},
+                    "adsorbate_element": {"type": "string", "pattern": "^[A-Z][a-z]?$"},
+                    "element": {"type": "string", "pattern": "^[A-Z][a-z]?$"},
+                    "supercell": {"type": "string"},
+                    "sites": {
+                        "type": "array", "minItems": 1, "maxItems": 32,
+                        "items": {
+                            "anyOf": [
+                                {"type": "string", "enum": ["top", "bridge", "hollow"]},
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "site": {"type": "string", "enum": ["top", "bridge", "hollow"]},
+                                        "site_index": {"type": "integer", "minimum": 0},
+                                        "site_id": {"type": "string"},
+                                        "height": {"type": "number", "exclusiveMinimum": 0},
+                                    },
+                                    "required": ["site"], "additionalProperties": False,
+                                },
+                            ],
+                        },
+                    },
+                    "site": {"type": "string", "enum": ["top", "bridge", "hollow"]},
+                    "site_index": {"type": "integer", "minimum": 0},
+                    "height": {"type": "number", "exclusiveMinimum": 0},
+                    "vacuum": {"type": "number", "exclusiveMinimum": 0},
+                    "reference_molecule": {"type": "string"},
+                    "molecule_box": {"type": "number", "exclusiveMinimum": 0},
+                    "relax": {"type": "boolean"},
+                    "force_threshold": {"type": "number", "exclusiveMinimum": 0},
+                    "nstep": {"type": "integer", "minimum": 1},
+                    "surface_spin": {"type": "object"},
+                    "adsorbed_spin": {"type": "object"},
+                    "reference_spin": {"type": "object"},
+                    "reference_magnetization_tolerance_muB": {"type": "number", "minimum": 0},
+                    "adsorbed_magnetization_tolerance_muB": {"type": "number", "minimum": 0},
+                    "max_adsorbate_surface_distance_angstrom": {"type": "number", "exclusiveMinimum": 0},
+                    "ecutwfc": {"type": "number", "exclusiveMinimum": 0},
+                    "ecutrho": {"type": "number", "exclusiveMinimum": 0},
+                    "kpoints": {"type": "array", "items": {"type": "integer"}},
+                    "conv_thr": {"type": "number", "exclusiveMinimum": 0},
+                    "max_sites": {"type": "integer", "minimum": 1, "maximum": 32},
+                    "max_jobs": {"type": "integer", "minimum": 1},
+                    "workdir": {"type": "string"},
+                },
+                "required": ["kind"],
+                "anyOf": [{"required": ["adsorbate_element"]}, {"required": ["element"]}],
+            },
+            execute_fn=_workflow_adsorption_scan,
         ),
         ToolEntry(
             id="thermo.chemical_potential_scan",
@@ -1045,6 +1311,8 @@ def register_default_tools() -> None:
         "thermo.formation": ("read_only", "reduce a compound energy and elemental references into formation energy", ["compound_energy", "refs"]),
         "workflow.convergence": ("external_execution", "run a bounded SCF parameter sweep and select a converged point", []),
         "workflow.neutral_vacancy": ("external_execution", "run matched pristine/neutral-vacancy energies and reduce formation energy", []),
+        "workflow.charged_vacancy": ("external_execution", "run matched charged-vacancy states with explicit correction evidence", []),
+        "workflow.adsorption_scan": ("external_execution", "run shared-reference fixed-cell atomic adsorption site scans", []),
         "thermo.chemical_potential_scan": ("read_only", "solve elemental and supplied competing-phase chemical-potential constraints", []),
         "workflow.magnetic_compare": ("external_execution", "run collinear NM/FM/AFM pw.x states and compare realized magnetism", []),
         "workflow.phonon_dfpt": ("external_execution", "run ph.x/q2r.x/matdyn.x DFPT and verify frequencies", []),

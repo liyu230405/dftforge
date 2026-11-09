@@ -238,10 +238,30 @@ def compile_plan(plan: PlanIR, registry: Any, *, templates_dir: Optional[Path] =
         if capability and capability not in plan.required_capabilities:
             plan.required_capabilities.append(capability)
         resolved = _CAPABILITY_ALIASES.get(capability, capability)
-        if capability.startswith("run.") and capability in by_id:
+        if capability in by_id and by_id[capability].category == "graph-template":
             resolved = "graph.run"
             args = dict(action.get("args") or {})
-            args.setdefault("template_id", capability[4:])
+            template_id = capability[4:]
+            if args.get("template_id", template_id) != template_id:
+                errors.append(f"{capability}: conflicting template_id")
+                mark_blocked(plan, errors[-1])
+                continue
+            inputs = args.get("inputs", {})
+            if not isinstance(inputs, dict):
+                errors.append(f"{capability}: inputs must be an object")
+                mark_blocked(plan, errors[-1])
+                continue
+            inputs = dict(inputs)
+            for key in by_id[capability].inputs:
+                if key in args:
+                    value = args.pop(key)
+                    if key in inputs and inputs[key] != value:
+                        errors.append(f"{capability}: conflicting input {key}")
+                        mark_blocked(plan, errors[-1])
+                    else:
+                        inputs[key] = value
+            args["template_id"] = template_id
+            args["inputs"] = inputs
         else:
             args = dict(action.get("args") or {})
         if resolved not in tool_ids:

@@ -202,6 +202,28 @@ class TestBuilders:
         sym = symmetry_info(res.atoms)
         assert sym["space_group_number"] == 227
 
+    @pytest.mark.parametrize("element,lattice_a", [("Cu", 3.615), ("Al", 4.050), ("Ni", 3.524)])
+    def test_reference_fcc_nearest_neighbour(self, element, lattice_a):
+        # Regression: fcc conventional fractional sites must sit in the
+        # conventional cubic cell. Pairing them with fcc primitive vectors
+        # collapsed every bond to a/(2√2) (~1.28 Å for Cu).
+        import numpy as np
+
+        res = build_reference(element)
+        atoms = res.atoms
+        assert len(atoms) == 4
+        d = atoms.get_all_distances(mic=True)
+        nn = d[~np.eye(len(atoms), dtype=bool)].min()
+        assert nn == pytest.approx(lattice_a / np.sqrt(2), rel=0.01)
+
+    def test_reference_bcc_nearest_neighbour(self):
+        import numpy as np
+
+        res = build_reference("Fe")  # bcc, a = 2.866
+        d = res.atoms.get_all_distances(mic=True)
+        nn = d[~np.eye(len(res.atoms), dtype=bool)].min()
+        assert nn == pytest.approx(np.sqrt(3) / 2 * 2.866, rel=0.01)
+
     def test_reference_o2_molecule(self):
         res = build_reference("O")
         assert res.atoms.get_chemical_formula() == "O2"
@@ -278,16 +300,9 @@ class TestThermoPlanning:
 
         steps = AgentLoop().plan("O吸附在石墨烯的吸附能")
         tools = [s["tool"] for s in steps]
-        assert tools == [
-            "structure.build2d", "graph.run",
-            "structure.build2d", "graph.run",
-            "structure.molecule", "graph.run",
-            "thermo.eads",
-        ]
-        assert steps[0]["args"]["adsorb"]["element"] == "O"
-        assert "adsorb" not in steps[2]["args"]
-        assert steps[4]["args"]["kind"] == "o2"
-        assert steps[6]["args"] == {}  # energies auto-injected at run time
+        assert tools == ["workflow.adsorption_scan"]
+        assert steps[0]["args"]["adsorbate_element"] == "O"
+        assert steps[0]["args"]["sites"] == ["top"]
 
     def test_formation_workflow(self):
         from dft_forge.agent_loop import AgentLoop

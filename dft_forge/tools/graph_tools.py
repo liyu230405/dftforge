@@ -25,12 +25,33 @@ _ENGINE_CACHE: dict = {}
 _DEFAULT_WALLTIME = 1800
 _MIN_WALLTIME = 30
 _MAX_WALLTIME = 604800
+_QE_EXECUTABLES = (
+    "pw.x",
+    "bands.x",
+    "dos.x",
+    "projwfc.x",
+    "ph.x",
+    "q2r.x",
+    "matdyn.x",
+)
 
 
 class _ReadOnlyTool:
     """Tool-name placeholder used to validate QE templates without running them."""
 
     name = "qe"
+
+
+class _ReadOnlyVASPTool:
+    """Placeholder so VASP templates validate in read-only engines."""
+
+    name = "vasp"
+
+
+class _ReadOnlyABINITTool:
+    """Placeholder so ABINIT templates validate in read-only engines."""
+
+    name = "abinit"
 
 
 def reset_engine_cache() -> None:
@@ -51,7 +72,8 @@ def _get_engine(workdir: Optional[str] = None, *, read_only: bool = False):
 
             engine = GraphEngine(
                 base_dir=Path(key),
-                tools={"qe": _ReadOnlyTool()},
+                tools={"qe": _ReadOnlyTool(), "vasp": _ReadOnlyVASPTool(),
+                       "abinit": _ReadOnlyABINITTool()},
                 templates_dir=DEFAULT_TEMPLATES,
             )
             _ENGINE_CACHE[cache_key] = engine
@@ -68,13 +90,25 @@ def _get_engine(workdir: Optional[str] = None, *, read_only: bool = False):
     profile_key = json.dumps(profile, sort_keys=True, separators=(",", ":"))
     cache_key = (key, False, identity, profile_key)
     if cache_key not in _ENGINE_CACHE:
+        from dft_forge.engines.abinit import ABINITCalcTool
+        from dft_forge.engines.abinit.tool import ABINITParamRepairer
         from dft_forge.engines.qe import QECalcTool, QEParamRepairer
+        from dft_forge.engines.vasp import VASPCalcTool
+        from dft_forge.engines.vasp.tool import VASPParamRepairer
         from dft_forge.runtime.engine import GraphEngine
 
         engine = GraphEngine(
             base_dir=Path(key),
-            tools={"qe": QECalcTool(executor=executor)},
-            repairers={"qe_param_bump": QEParamRepairer()},
+            tools={
+                "qe": QECalcTool(executor=executor),
+                "vasp": VASPCalcTool(executor=executor),
+                "abinit": ABINITCalcTool(executor=executor),
+            },
+            repairers={
+                "qe_param_bump": QEParamRepairer(),
+                "vasp_param_bump": VASPParamRepairer(),
+                "abinit_param_bump": ABINITParamRepairer(),
+            },
             templates_dir=DEFAULT_TEMPLATES,
             execution_identity=identity,
             execution_profile=profile,
@@ -138,6 +172,24 @@ def _config_digest(payload: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _file_sha256(path: Path) -> str:
+    """Hash executable contents so provenance identifies the program, not its path."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _local_qe_executable_hashes(qe_bin_dir: Path) -> dict[str, str]:
+    """Return content hashes for every supported QE executable that is present."""
+    return {
+        name: _file_sha256(path)
+        for name in _QE_EXECUTABLES
+        if _executable_file(path := qe_bin_dir / name)
+    }
+
+
 def _build_execution():
     from dft_forge.executor import FakeExecutor, LocalExecutor, SSHExecutor
 
@@ -193,15 +245,47 @@ def _build_execution():
         identity = _stable_identity({"backend": "fake"})
         return FakeExecutor(), profile, identity
 
-    qe_bin_dir = _local_qe_bin_dir()
+    vasp_bin = os.environ.get("DFT_FORGE_VASP_BIN", "").strip() or None
+    abinit_bin = os.environ.get("DFT_FORGE_ABINIT_BIN", "").strip() or None
+    if abinit_bin:
+        abinit_bin = str(Path(shutil.which(abinit_bin) or abinit_bin).expanduser().resolve())
+    try:
+        qe_bin_dir = _local_qe_bin_dir()
+    except ValueError:
+        if not (abinit_bin and _executable_file(Path(abinit_bin))):
+            raise
+        qe_bin_dir = None
+    qe_executables_sha256 = _local_qe_executable_hashes(qe_bin_dir) if qe_bin_dir else {}
+    abinit_executables_sha256 = {
+        name: _file_sha256(path)
+        for name in ("abinit", "anaddb", "mrgddb")
+        if abinit_bin and _executable_file(path := (Path(abinit_bin) if name == "abinit" else Path(abinit_bin).parent / name))
+    }
+    abinit_pp_dir = os.environ.get("DFT_FORGE_ABINIT_PP_DIR", "").strip()
+    qe_bin_config_sha256 = _config_digest({"qe_bin_dir": str(qe_bin_dir)})
     profile = {
         "backend": "local",
         "simulated": False,
         "walltime_limit_sec": walltime,
-        "qe_bin_sha256": _config_digest({"qe_bin_dir": str(qe_bin_dir)}),
+        "qe_bin_config_sha256": qe_bin_config_sha256,
+        "qe_executables_sha256": qe_executables_sha256,
+        "vasp_enabled": bool(vasp_bin),
+        "abinit_enabled": bool(abinit_bin),
+        "abinit_executables_sha256": abinit_executables_sha256,
     }
-    identity = _stable_identity({"backend": "local", "qe_bin_dir": str(qe_bin_dir)})
-    return LocalExecutor(qe_bin_dir=qe_bin_dir, max_walltime_sec=walltime), profile, identity
+    identity = _stable_identity({
+        "backend": "local",
+        "qe_bin_dir": str(qe_bin_dir),
+        "qe_executables_sha256": qe_executables_sha256,
+        "vasp_bin": vasp_bin,
+        "abinit_bin": abinit_bin,
+        "abinit_executables_sha256": abinit_executables_sha256,
+        "abinit_pp_dir": str(Path(abinit_pp_dir).expanduser().resolve()) if abinit_pp_dir else None,
+    })
+    return LocalExecutor(
+        qe_bin_dir=qe_bin_dir, max_walltime_sec=walltime,
+        vasp_bin=vasp_bin, abinit_bin=abinit_bin,
+    ), profile, identity
 
 
 def _graph_templates(args: dict) -> dict:

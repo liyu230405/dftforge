@@ -210,9 +210,10 @@ def analyze(atoms: Atoms, pair_types=None) -> Dict[str, Any]:
         "is_2d": bool(any(~np.asarray(atoms.pbc, dtype=bool))),
     }
 
-    # nearest-neighbor floor (raw distances, no MIC — same as before)
+    # nearest-neighbour floor with minimum-image convention: atoms related
+    # by a lattice translation (common in supercells) must count as bonded.
     if len(atoms) >= 2:
-        positions = atoms.get_positions()
+        all_dist = atoms.get_all_distances(mic=True)
         symbols = atoms.get_chemical_symbols()
         min_dist = float("inf")
         min_pair = None
@@ -225,7 +226,7 @@ def analyze(atoms: Atoms, pair_types=None) -> Dict[str, Any]:
                     allowed = pair in pair_types or (symbols[i], symbols[j]) in pair_types or (symbols[j], symbols[i]) in pair_types
                 if not allowed:
                     continue
-                dist = float(np.linalg.norm(positions[i] - positions[j]))
+                dist = float(all_dist[i, j])
                 if dist <= 1e-12:
                     continue
                 pair_dists.setdefault(str(pair), []).append(dist)

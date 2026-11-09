@@ -48,6 +48,8 @@ class BuildResult:
     atoms: Atoms
     description: str = ""
     sites: Dict[str, List[float]] = field(default_factory=dict)
+    site_metadata: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    selected_site: Optional[Dict[str, Any]] = None
     selected_index: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -61,6 +63,10 @@ class BuildResult:
             "sites": {k: [round(c, 4) for c in v] for k, v in self.sites.items()},
             "min_distance": round(float(min_distance(self.atoms)), 4),
         }
+        if self.site_metadata:
+            data["site_metadata"] = self.site_metadata
+        if self.selected_site is not None:
+            data["selected_site"] = self.selected_site
         if self.selected_index is not None:
             data["selected_index"] = self.selected_index
         return data
@@ -143,7 +149,11 @@ def remove_atom(atoms: Atoms, index: int) -> Atoms:
     return atoms
 
 
-def surface_sites(atoms: Atoms, *, site_index: int = 0) -> Dict[str, List[float]]:
+def _surface_site_details(
+    atoms: Atoms,
+    *,
+    site_index: int = 0,
+) -> Tuple[Dict[str, List[float]], Dict[str, Dict[str, Any]]]:
     """top / bridge / hollow sites on the topmost layer of a 2D slab.
 
     Geometry works for both honeycomb sheets (graphene, h-BN: 3 in-plane
@@ -154,7 +164,8 @@ def surface_sites(atoms: Atoms, *, site_index: int = 0) -> Dict[str, List[float]
     """
     z_top = max(atoms.positions[:, 2])
     layer = [i for i in range(len(atoms)) if abs(atoms.positions[i, 2] - z_top) < 0.1]
-    ref = layer[site_index % len(layer)]
+    surface_site_index = site_index % len(layer)
+    ref = layer[surface_site_index]
     pos = atoms.positions[ref]
 
     # generous cutoff: TMD in-plane X-X spacing (a ≈ 3.2 Å) exceeds the
@@ -185,7 +196,41 @@ def surface_sites(atoms: Atoms, *, site_index: int = 0) -> Dict[str, List[float]
     top = xy((0.0, 0.0, 0.0))
     bridge = xy((v1[0] / 2, v1[1] / 2, 0.0))
     hollow = xy(hollow_v)
-    return {"top": top, "bridge": bridge, "hollow": hollow}
+    sites = {"top": top, "bridge": bridge, "hollow": hollow}
+
+    anchor_element = atoms[ref].symbol
+    anchor_position = [round(float(c), 4) for c in pos]
+    metadata: Dict[str, Dict[str, Any]] = {}
+    for site, site_position in sites.items():
+        neighbours = []
+        if site == "bridge":
+            neighbours = [int(nbrs[0][0])]
+        elif site == "hollow":
+            neighbours = [int(nbrs[0][0]), int(nbrs[1][0])]
+        metadata[site] = {
+            "site_id": f"{site}:anchor-{ref}:{anchor_element}",
+            "site": site,
+            "requested_site_index": int(site_index),
+            "surface_site_index": int(surface_site_index),
+            "anchor_index": int(ref),
+            "anchor_element": anchor_element,
+            "anchor_position": anchor_position,
+            "neighbour_indices": neighbours,
+            "position": [round(float(c), 4) for c in site_position],
+        }
+    return sites, metadata
+
+
+def surface_sites(atoms: Atoms, *, site_index: int = 0) -> Dict[str, List[float]]:
+    """Return top / bridge / hollow coordinates for one surface anchor."""
+    sites, _metadata = _surface_site_details(atoms, site_index=site_index)
+    return sites
+
+
+def surface_site_metadata(atoms: Atoms, *, site_index: int = 0) -> Dict[str, Dict[str, Any]]:
+    """Return stable site identifiers and anchor information for surface sites."""
+    _sites, metadata = _surface_site_details(atoms, site_index=site_index)
+    return metadata
 
 
 def add_adsorbate(
@@ -239,23 +284,41 @@ def build_2d(
 
     check_distances(atoms, "after lattice modifications")
 
+    requested_site_index = int((adsorbate or {}).get("site_index", 0))
+    site_metadata: Dict[str, Dict[str, Any]] = {}
     try:
-        sites = surface_sites(atoms, site_index=int((adsorbate or {}).get("site_index", 0)))
+        sites, site_metadata = _surface_site_details(atoms, site_index=requested_site_index)
     except StructureBuildError:
         # informational only (e.g. vacancy adjacent to the reference atom);
         # a real adsorbate call re-raises with a precise error
         sites = {}
+    selected_site: Optional[Dict[str, Any]] = None
     if adsorbate:
+        site = str(adsorbate.get("site", "top")).lower()
+        adsorbate_height = float(adsorbate.get("height", height))
         atoms = add_adsorbate(
             atoms,
             str(adsorbate["element"]),
-            str(adsorbate.get("site", "top")),
-            height=float(adsorbate.get("height", height)),
-            site_index=int(adsorbate.get("site_index", 0)),
+            site,
+            height=adsorbate_height,
+            site_index=requested_site_index,
         )
-        parts.append(f"{adsorbate['element']}@{adsorbate.get('site', 'top')}")
+        selected_site = {
+            **site_metadata[site],
+            "adsorbate_element": str(adsorbate["element"]),
+            "adsorbate_index": len(atoms) - 1,
+            "height": adsorbate_height,
+            "adsorbate_position": [round(float(c), 4) for c in atoms.positions[-1]],
+        }
+        parts.append(f"{adsorbate['element']}@{site}")
 
-    return BuildResult(atoms=atoms, description=" + ".join(parts), sites=sites)
+    return BuildResult(
+        atoms=atoms,
+        description=" + ".join(parts),
+        sites=sites,
+        site_metadata=site_metadata,
+        selected_site=selected_site,
+    )
 
 
 def parse_supercell(spec: str) -> Tuple[int, int]:
@@ -418,6 +481,7 @@ MOLECULES: Dict[str, list] = {
     "o2": [("O", -0.605, 0.0, 0.0), ("O", 0.605, 0.0, 0.0)],
     "n2": [("N", -0.550, 0.0, 0.0), ("N", 0.550, 0.0, 0.0)],
     "cl2": [("Cl", -0.995, 0.0, 0.0), ("Cl", 0.995, 0.0, 0.0)],
+    "f2": [("F", -0.710, 0.0, 0.0), ("F", 0.710, 0.0, 0.0)],
     "co": [("C", -0.570, 0.0, 0.0), ("O", 0.570, 0.0, 0.0)],
     "oh": [("O", -0.490, 0.0, 0.0), ("H", 0.490, 0.0, 0.0)],
     "no": [("N", -0.575, 0.0, 0.0), ("O", 0.575, 0.0, 0.0)],
@@ -466,6 +530,33 @@ REFERENCE_PHASES: Dict[str, tuple] = {
 }
 
 _BOX = 10.0
+
+# Ground-state spin of the gas-phase references. A molecule is a Γ-point,
+# integer-occupation calculation; O2 is a triplet and OH/NO are doublets.
+# Running O2 as a closed-shell, smeared, k-sampled "crystal" is wrong by
+# about 1 eV per molecule.
+MOLECULE_SPIN: Dict[str, Dict[str, Any]] = {
+    "o2": {"spin_polarized": True, "magnetic_order": "FM", "magnetic_element": "O",
+           "initial_moment_muB": 1.0, "total_magnetization_muB": 2.0},
+    "oh": {"spin_polarized": True, "magnetic_order": "FM", "magnetic_element": "O",
+           "initial_moment_muB": 1.0, "total_magnetization_muB": 1.0},
+    "no": {"spin_polarized": True, "magnetic_order": "FM", "magnetic_element": "N",
+           "initial_moment_muB": 1.0, "total_magnetization_muB": 1.0},
+}
+
+
+def molecule_scf_inputs(kind: str) -> Dict[str, Any]:
+    """t0_scf inputs for an isolated molecule: Γ only, fixed occupations, ground-state spin."""
+    key = kind.lower().replace("-", "").replace("_", "").replace(" ", "")
+    return {"kpoints": [1, 1, 1, 0, 0, 0], "occupations": "fixed", **MOLECULE_SPIN.get(key, {})}
+
+
+def reference_molecule_kind(element: str) -> Optional[str]:
+    """Molecule key when the element's reference phase is a gas molecule."""
+    el = element.strip()
+    el = el.capitalize() if len(el) > 1 else el.upper()
+    spec = REFERENCE_PHASES.get(el)
+    return spec[1] if spec and spec[0] == "molecule" else None
 
 
 def build_molecule(kind: str, *, box: float = _BOX) -> BuildResult:
@@ -520,12 +611,15 @@ def build_reference(element: str) -> BuildResult:
         )
         phase = "BCC"
     elif kind == "fcc":
+        # Conventional cubic cell (a·I) with the 4 conventional-cell sites.
+        # Do NOT pair conventional fractional coordinates with the fcc
+        # primitive vectors — that contracts every nearest-neighbour bond to
+        # a/(2√2) and produces dimer-like garbage reference energies.
         a = spec[1]
-        cell = [[0, a / 2, a / 2], [a / 2, 0, a / 2], [a / 2, a / 2, 0]]
         atoms = Atoms(
             [el] * 4,
             scaled_positions=[(0, 0, 0), (0.5, 0.5, 0), (0.5, 0, 0.5), (0, 0.5, 0.5)],
-            cell=cell, pbc=True,
+            cell=np.eye(3) * a, pbc=True,
         )
         phase = "FCC"
     else:  # hcp

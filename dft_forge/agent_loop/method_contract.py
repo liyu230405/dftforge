@@ -16,20 +16,37 @@ from pathlib import Path
 from .execution_policy import ExecutionPolicyError
 
 METHOD_KEYS = ("ecutwfc", "ecutrho", "kpoints", "nbnd", "nkpoints_bands")
-_MACROS = {"workflow.neutral_vacancy", "workflow.magnetic_compare", "workflow.phonon_dfpt", "workflow.convergence"}
+_MACROS = {
+    "workflow.neutral_vacancy", "workflow.charged_vacancy", "workflow.adsorption_scan",
+    "workflow.magnetic_compare", "workflow.phonon_dfpt", "workflow.convergence",
+}
 _PRESETS = {
     "quick": {"nkpoints_bands": 60},
     "precise": {"kpoints": [8, 8, 8, 1, 1, 1], "nkpoints_bands": 160},
 }
 _MACRO_DEFAULTS = {
-    "workflow.neutral_vacancy": {"supercell": "2x2x2", "charge": 0, "relax": True, "conv_thr": 1e-8},
+    "workflow.neutral_vacancy": {"supercell": "2x2x2", "charge": 0, "relax": True, "conv_thr": 1e-8, "reference_mode": "explicit"},
+    "workflow.charged_vacancy": {
+        "supercell": "2x2x2", "relax": True, "conv_thr": 1e-8,
+        "reference_mode": "explicit", "correction_mode": "makov_payne_cubic",
+        "fermi_levels_ev": [0.0],
+    },
+    "workflow.adsorption_scan": {
+        "supercell": "3x3", "sites": [{"site": "top", "site_index": 0}],
+        "vacuum": 15.0, "relax": True, "conv_thr": 1e-8,
+        "force_threshold": 1e-3, "max_sites": 8, "max_jobs": 24,
+    },
     "workflow.magnetic_compare": {"material": "Fe", "orders": ["NM", "FM", "AFM"], "supercell": "1x1x1", "initial_moment_muB": 2.2},
     "workflow.phonon_dfpt": {"material": "MgO", "q_grid": [2, 2, 2], "relax": True, "tr2_ph": 1e-14, "imaginary_threshold_thz": 0.1},
     "workflow.convergence": {"ecutwfc_values": [30, 40, 50, 60], "kpoints_values": [4, 6, 8], "smearing_values": ["mv"], "degauss_values": [0.01], "threshold_mev_per_atom": 1.0, "max_jobs": 64},
 }
 _DETAIL_KEYS = {
     "material", "structure", "source", "element", "supercell", "index", "charge", "relax",
-    "chemical_potential_ry", "chemical_potential_ev", "orders", "magnetic_element", "initial_moment_muB",
+    "chemical_potential_ry", "chemical_potential_ev", "reference_mode", "orders", "magnetic_element", "initial_moment_muB",
+    "charges", "fermi_levels_ev", "band_gap_ev", "correction_mode", "dielectric_constant",
+    "potential_alignment_ev_by_charge", "electrostatic_correction_ev_by_charge", "spin_by_charge",
+    "kind", "adsorbate_element", "sites", "site", "site_index", "height", "vacuum",
+    "reference_molecule", "surface_spin", "adsorbed_spin", "reference_spin", "force_threshold", "nstep",
     "q_grid", "tr2_ph", "imaginary_threshold_thz", "ecutrho", "conv_thr", "type",
     "ecutwfc_values", "kpoints_values", "smearing_values", "degauss_values", "threshold_mev_per_atom", "max_jobs",
 }

@@ -23,9 +23,9 @@ from dft_forge.agent_loop.planning import (
     requested_plan_only,
 )
 from dft_forge.agent_loop.result_views import RunState, handle_tool_result
-from dft_forge.agent_loop.step_prep import check_self_doping, prepare_step_args
+from dft_forge.agent_loop.step_prep import align_formation_compounds, check_self_doping, prepare_step_args
 from dft_forge.agent_loop.step_validator import semantic_plan_errors
-from dft_forge.agent_loop.scientific_inputs import guard_scientific_inputs
+from dft_forge.agent_loop.scientific_inputs import guard_scientific_inputs, trusted_thermodynamic_inputs
 
 
 _STOP_REPLY = "计算已停止（进行中的步骤已终止；已完成的结果保留在会话中）。"
@@ -60,6 +60,8 @@ async def run_session(
 ) -> Dict[str, Any]:
     ctx = dict(ctx or {})
     confirmed_plan = ctx.pop("_confirmed_method_plan", None)
+    if confirmed_plan and confirmed_plan.get("thermodynamic_inputs"):
+        ctx["thermodynamic_inputs"] = copy.deepcopy(confirmed_plan["thermodynamic_inputs"])
 
     def emit(ev: Dict[str, Any]) -> None:
         if on_event is None:
@@ -169,11 +171,13 @@ async def run_session(
             "commands": [],
             "results": [],
             "chain": chain,
-            "ctx": ctx,
+            "ctx": {key: value for key, value in ctx.items() if key != "thermodynamic_inputs"},
             "planner": planner_name,
         }
     # Authorize the whole plan before running even its preparation prefix.
     # Text matching in the browser is only a convenience for opening a dialog.
+    for note in align_formation_compounds(steps, session_dir):
+        plan_ir.assumptions.append(note)
     automatic_method = bool((ctx.get("run_config") or {}).get("auto_parameters"))
     if not automatic_method:
         check_execution_policy(steps, ctx, registry)
@@ -182,6 +186,7 @@ async def run_session(
     except MethodContractError as exc:
         if exc.code == "method_confirmation_required":
             exc.pending_plan = {"steps": copy.deepcopy(steps), "plan_ir": plan_ir.to_dict(), "planner": planner_name}
+            exc.pending_plan["thermodynamic_inputs"] = trusted_thermodynamic_inputs(message, ctx)
         raise
     if automatic_method:
         check_execution_policy(steps, ctx, registry)
@@ -350,6 +355,8 @@ async def run_session(
                     pass
             result_dict: Dict[str, Any] = {
                 "tool_id": result.tool_id,
+                "step_id": step_id,
+                "step_index": idx,
                 "returncode": 0 if result.error is None else 1,
                 "json": inner,
                 "error": result.error,
@@ -457,7 +464,7 @@ async def run_session(
         "commands": commands,
         "results": results,
         "chain": chain,
-        "ctx": ctx,
+        "ctx": {key: value for key, value in ctx.items() if key != "thermodynamic_inputs"},
         "planner": planner_name,
     }
 

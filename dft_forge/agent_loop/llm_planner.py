@@ -11,12 +11,18 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dft_forge.agent_loop.helpers import _CHAT_SKIP_TOOLS
+from dft_forge.agent_loop.intent import detect_intents
+from dft_forge.agent_loop.macro_narration import (
+    apply_macro_narration,
+    narrate_macro_plan,
+)
 from dft_forge.agent_loop.planning import (
     PlanIR,
     capability_catalog_text,
     compile_plan,
     mark_blocked,
 )
+from dft_forge.agent_loop.rule_planner import RulePlanner
 from dft_forge.agent_loop.step_validator import semantic_plan_errors, validate_steps
 from dft_forge.agent_loop.scientific_inputs import guard_scientific_inputs
 
@@ -69,10 +75,28 @@ class LLMPlanner:
             self.registry, Path(__file__).resolve().parents[2] / "templates"
         ).splitlines() if not any(f"(tool={skip})" in line for skip in _CHAT_SKIP_TOOLS)]
         lines.append(f"Available bulk materials: {', '.join(sorted(MATERIAL_DB))}")
+        source_counts = {
+            name: entry.get("natoms_primitive") or len(entry.get("sites") or [])
+            for name, entry in MATERIAL_DB.items()
+        }
+        lines.append("Default source-cell atom counts (multipliers act on THESE cells): " + json.dumps(source_counts, sort_keys=True))
         lines.append(f"Additional trusted bcc elemental prototypes: {', '.join(sorted(_BCC_ELS - MATERIAL_DB.keys()))}; lattice constants are initial estimates, not optimized results.")
         lines.append(f"Trusted ideal cubic perovskite starting prototypes: {', '.join(sorted(PEROVSKITE_A))}.")
         lines.append(f"Trusted bulk 2H TMD starting prototypes: {', '.join(sorted(TMD_BULKS))}.")
         return "\n".join(lines)
+
+    def _deterministic_plan_ir(
+        self, provider: Any, message: str, steps: List[Dict[str, Any]]
+    ) -> PlanIR:
+        """PlanIR for a rule-decided macro, with narrative-only LLM explanation.
+
+        The tool and its arguments are already fixed by deterministic routing.
+        Narration is best-effort and cannot alter them, so an unavailable or
+        malformed reply simply leaves the bare plan in place.
+        """
+        plan = PlanIR.from_steps(message, steps, source="deterministic-macro")
+        apply_macro_narration(plan, narrate_macro_plan(provider, message, steps))
+        return plan
 
     def plan(self, message: str, ctx: Dict[str, Any], history: Optional[List[Dict[str, Any]]] = None):
         """Returns (steps, direct_reply) or (None, None) to fall back to rules."""
@@ -80,6 +104,43 @@ class LLMPlanner:
         if provider is None:
             return None, None
         self.last_plan_ir = None
+        # These two scientific intents carry compact, loss-sensitive lists
+        # (charge states or adsorption sites).  Route them before free-form
+        # generation so a model cannot silently collapse a charged defect to
+        # the neutral macro or drop one requested site.
+        signals = detect_intents(message, ctx)
+        deterministic_tool = None
+        if (
+            signals.wants_vacancy
+            and signals.wants_formation
+            and any(charge != 0 for charge in signals.vacancy_charges)
+        ):
+            deterministic_tool = "workflow.charged_vacancy"
+        elif signals.wants_eads and signals.ads_sites:
+            deterministic_tool = "workflow.adsorption_scan"
+        elif signals.wants_eads and signals.build2d_kind and not signals.ads_el:
+            # Missing adsorbate identity is a scientific input gap.  Route the
+            # deterministic help response before free-form planning so a model
+            # cannot silently choose O (or another species) for the user.
+            deterministic_steps = RulePlanner().plan(message, ctx)
+            if len(deterministic_steps) == 1 and deterministic_steps[0].get("tool") == "help":
+                # No narration here: this path asks the user which species to
+                # adsorb.  There is no decided calculation to explain, and the
+                # rule's own question is the response.
+                self.last_plan_ir = PlanIR.from_steps(
+                    message, deterministic_steps, source="deterministic-macro"
+                )
+                return deterministic_steps, None
+        if deterministic_tool:
+            deterministic_steps = RulePlanner().plan(message, ctx)
+            if (
+                len(deterministic_steps) == 1
+                and deterministic_steps[0].get("tool") == deterministic_tool
+            ):
+                self.last_plan_ir = self._deterministic_plan_ir(
+                    provider, message, deterministic_steps
+                )
+                return deterministic_steps, None
         # Short confirmations are common after the agent has offered to
         # inspect a completed run. Route them deterministically so a model
         # cannot turn "需要" into another generic one-step calculation.
@@ -152,6 +213,11 @@ Rules:
   macros instead of expanding arbitrary QE steps:
   workflow.convergence for ecutwfc/k-point/smearing sweeps;
   workflow.neutral_vacancy for matched neutral vacancy formation;
+  workflow.charged_vacancy for every vacancy request that explicitly names
+  any nonzero charge state (preserve the complete charges list; never route
+  such a request to workflow.neutral_vacancy);
+  workflow.adsorption_scan for relaxed atomic adsorption energies over one or
+  several sites with shared clean-surface and molecular references;
   thermo.chemical_potential_scan for supplied parent/competitor formation
   energies (never invent these thermodynamic inputs); workflow.magnetic_compare
   for NM/FM/AFM; and
@@ -167,6 +233,17 @@ Rules:
   them with zero, an experimental estimate, or any other placeholder. O-rich
   delta_mu=0 is a RELATIVE offset, never an absolute DFT chemical potential.
   Without supplied data keep the corresponding action advisory and mark partial.
+- For a PURE ELEMENT vacancy referenced to its own same-method bulk, you may
+  explicitly choose workflow.neutral_vacancy (no explicit nonzero charge) or
+  workflow.charged_vacancy reference_mode='same_method_bulk_per_atom'.
+  It computes mu=E(pristine)/N internally; leave both chemical_potential fields
+  absent. Explain the chosen bulk reservoir. This mode is invalid for compounds
+  such as MgO and never supplies charged-defect corrections. For every nonzero
+  charge, potential_alignment_ev_by_charge and spin_by_charge are explicit
+  evidence. makov_payne_cubic additionally requires dielectric_constant;
+  explicit correction mode requires electrostatic_correction_ev_by_charge.
+  Never guess dielectric screening, potential alignment, spin state, or an
+  electrostatic correction; keep the action advisory/partial when absent.
 - 2D monolayers (单层/monolayer/二维/2D intent, or 石墨烯/graphene, 氮化硼/h-BN,
   MoS2/WS2/MoSe2/WSe2 单层): FIRST structure.build2d with kind 'graphene'|'bn'|
   'mos2'|'ws2'|'mose2'|'wse2' plus supercell/dopants/adsorb as requested,
@@ -187,17 +264,15 @@ Rules:
 - Supercell multipliers apply to the source cell, which may be primitive.
   Never infer atom counts or label a supercell conventional from its formula
   and multipliers alone; use the actual source structure metadata.
-- Site scan ("different sites/positions"): emit one structure.build2d step per site
-  (top/bridge/hollow), each with its own output path.
-- Adsorption energy (吸附能/E_ads): a 3-calculation workflow —
-  (1) structure.build2d with adsorb + supercell '3x3', (2) graph.run t0_scf,
-  (3) structure.build2d same supercell WITHOUT adsorb, (4) graph.run t0_scf,
-  (5) structure.molecule (O→o2, H→h2, N→n2, Cl→cl2), (6) graph.run t0_scf,
-  (7) thermo.eads with empty args (executor injects the three energies).
-- A multi-site adsorption request must include a final energy reduction for
-  every requested site. If the action budget cannot represent the full DAG,
-  report partial/unsupported with the missing reference/reduction actions;
-  never silently truncate a workflow.
+  Specifically source='Si' is a 2-atom primitive cell: 2x2x2 gives 16 atoms
+  (Si15P for one substitution), not 64. A 64-atom conventional supercell
+  requires an explicitly supplied 8-atom conventional source cell.
+- Atomic adsorption energy (吸附能/E_ads) and site scans use one
+  workflow.adsorption_scan action. Pass kind, adsorbate_element, supercell,
+  and the complete requested sites array in the user's order (for example
+  ["top","bridge","hollow"]). The macro owns fixed-cell relaxation, final
+  SCFs, shared clean-surface/gas references, O2 triplet verification, one
+  E_ads reduction per site, and ranking. Never expand or truncate this DAG.
 - Formation energy (形成能): (1) graph.run t0_scf with material=compound,
   then for EACH element: structure.reference {{element}} + graph.run t0_scf,
   finally thermo.formation {{formula}} with empty refs (auto-injected).
@@ -255,8 +330,6 @@ Rules:
 Tools:
 {self._catalog()}"""
         ctx_summary = {k: ctx.get(k) for k in ("last_structure_source", "last_formula", "last_input_file", "last_job_id", "last_run_id", "last_execution", "last_plan", "thermodynamic_inputs") if ctx.get(k)}
-        if (ctx.get("run_config") or {}).get("thermodynamic_inputs"):
-            ctx_summary["thermodynamic_inputs"] = ctx["run_config"]["thermodynamic_inputs"]
         if (ctx.get("run_config") or {}).get("auto_parameters"):
             from dft_forge.compiler.qe_parameters import planner_parameter_context
 

@@ -77,7 +77,13 @@ def test_unsupported_custom_field_blocks_preparation_prefix(tmp_path):
     steps = [step("structure.generate", source="Si"), step("workflow.neutral_vacancy", source="Si", element="Si")]
     calls = []
     with pytest.raises(MethodContractError) as denied:
-        execute(steps, tmp_path, {"run_config": config(accuracy="custom", nbnd=20)}, calls)
+        execute(steps, tmp_path, {
+            "run_config": config(accuracy="custom", nbnd=20),
+            "thermodynamic_inputs": {"workflow.neutral_vacancy": {
+                "source": "Si", "element": "Si", "reference": "absolute_dft",
+                "chemical_potential_ry": -0.5,
+            }},
+        }, calls)
     assert denied.value.code == "method_unsupported"
     assert denied.value.method_token is None
     assert not calls

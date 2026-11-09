@@ -58,6 +58,77 @@ def check_self_doping(tool_id: str, args: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def align_formation_compounds(steps: List[Dict[str, Any]], session_dir: Path) -> List[str]:
+    """Run formation-energy compounds on the same pseudopotential library as the references.
+
+    Elemental references are generated structures, so they always use the
+    GBRV ``{El}.upf`` library. A compound named by its MATERIAL_DB key would
+    otherwise use that entry's own pseudopotentials/functional (MgO: PZ
+    vbc/GTH), and E_form would subtract incompatible total energies.
+    Rewritten before method confirmation so the method card shows the file.
+    """
+    if not any(str(s.get("tool")) == "thermo.formation" for s in steps):
+        return []
+    from ase.io import write as ase_write
+
+    from dft_forge.compiler import DEFAULT_PSEUDO_DIR, MATERIAL_DB, build_atoms, profile_from_atoms
+
+    notes = []
+    for step in steps:
+        if str(step.get("tool")) != "graph.run":
+            continue
+        inputs = (step.get("args") or {}).get("inputs") or {}
+        material = inputs.get("material")
+        if inputs.get("structure") or material not in MATERIAL_DB:
+            continue
+        atoms = build_atoms(material)
+        try:
+            library = profile_from_atoms(atoms, DEFAULT_PSEUDO_DIR)
+        except FileNotFoundError:
+            continue
+        db = MATERIAL_DB[material]
+        if db.get("pseudos") == library["pseudos"] and not db.get("input_dft"):
+            continue
+        safe = re.sub(r"[^A-Za-z0-9]", "_", str(material))[:24]
+        path = session_dir / f"formation_{safe}.cif"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ase_write(str(path), atoms)
+        inputs = dict(inputs)
+        inputs.pop("material", None)
+        inputs["structure"] = str(path)
+        step["args"] = {**step["args"], "inputs": inputs}
+        notes.append(f"{material} 改用与元素参考态相同的赝势库 {library['pseudos']}（原材料库条目为 {db.get('pseudos')}）")
+    return notes
+
+
+def formation_method_mismatch(entries: List[Dict[str, Any]]) -> Optional[str]:
+    """Why the compound/reference SCFs are not comparable total energies.
+
+    Total energies only cancel between runs sharing the pseudopotential of
+    each common element, the functional and the plane-wave cutoffs.
+    """
+    profiles = [entry.get("method_profile") for entry in entries]
+    if not all(isinstance(p, dict) for p in profiles):
+        return None  # legacy results without method evidence
+    from ase.data import chemical_symbols
+
+    pseudo_of: Dict[str, str] = {}
+    for profile in profiles:
+        for element, filename in (profile.get("pseudos") or {}).items():
+            # AFM runs split one element into FeA/FeB species labels
+            base = element[:-1] if element not in chemical_symbols and element[-1:] in "AB" else element
+            if pseudo_of.setdefault(base, filename) != filename:
+                return f"元素 {base} 的赝势不一致（{pseudo_of[base]} vs {filename}）"
+    dfts = {str(p.get("input_dft") or "from_pseudo").lower() for p in profiles}
+    if len(dfts) > 1:
+        return f"交换关联泛函不一致（{', '.join(sorted(dfts))}）"
+    for key in ("ecutwfc", "ecutrho"):
+        values = {(p.get("effective") or {}).get(key) for p in profiles}
+        if len(values) > 1:
+            return f"{key} 不一致（{', '.join(str(v) for v in values)}）"
+    return None
+
+
 def prepare_step_args(
     tool_id: str,
     args: Dict[str, Any],
@@ -163,6 +234,8 @@ def prepare_step_args(
     elif tool_id in {
         "workflow.convergence",
         "workflow.neutral_vacancy",
+        "workflow.charged_vacancy",
+        "workflow.adsorption_scan",
         "workflow.magnetic_compare",
         "workflow.phonon_dfpt",
     }:
@@ -179,11 +252,31 @@ def prepare_step_args(
             emit({"type": "node", "step": _idx, "node": ev.get("node"), "state": ev.get("state")})
 
         args["_on_event"] = _workflow_node_cb
-    elif tool_id == "thermo.eads" and args.get("ry_a") is None:
+    elif tool_id == "thermo.eads" and (args.get("energy_steps") or args.get("ry_a") is None):
         # inject the last three SCF energies in plan order:
         # [adsorbed, surface, molecule]
-        if len(scf_energies) >= 3:
-            e_a, e_s, e_m = scf_energies[-3], scf_energies[-2], scf_energies[-1]
+        selected = scf_energies[-3:]
+        if args.get("energy_steps"):
+            import math
+            refs = args["energy_steps"]
+            if set(refs) != {"adsorbed", "surface", "molecule"} or len(set(refs.values())) != 3:
+                return "吸附能必须分别绑定吸附体系、表面、分子的三个不同步骤"
+            selected = []
+            for role in ("adsorbed", "surface", "molecule"):
+                matches = [entry for entry in scf_energies if entry.get("step_id") == refs[role]]
+                if len(matches) != 1:
+                    return f"吸附能引用 {refs[role]} 必须恰好有一个成功总能量，不能猜测节点或回退到最近结果"
+                entry = matches[0]
+                if (entry.get("graph_state") != "succeeded" or not isinstance(entry.get("step_index"), int)
+                        or entry["step_index"] >= idx or not isinstance(entry.get("energy_ry"), (int, float))
+                        or not math.isfinite(entry["energy_ry"]) or not isinstance(entry.get("natoms"), int)
+                        or entry["natoms"] <= 0):
+                    return f"吸附能引用 {refs[role]} 缺少成功状态、原子数或有效总能量证据"
+                selected.append(entry)
+            if selected[0]["natoms"] <= selected[1]["natoms"]:
+                return "吸附体系的原子数必须大于纯表面；无法确定分子参考比例"
+        if len(selected) == 3:
+            e_a, e_s, e_m = selected
             args["ry_a"] = e_a["energy_ry"]
             args["ry_s"] = e_s["energy_ry"]
             args["ry_m"] = e_m["energy_ry"]
@@ -205,7 +298,17 @@ def prepare_step_args(
             els = []
         refs_needed = len(els)
         if scf_energies and len(scf_energies) >= refs_needed + 1:
+            mismatch = formation_method_mismatch(scf_energies[:refs_needed + 1])
+            if mismatch:
+                return f"thermo.formation 拒绝混用不同方法的能量：{mismatch}"
             args["compound_energy"] = scf_energies[0]["energy_ry"]
+            args["_method_consistent"] = all(
+                isinstance(entry.get("method_profile"), dict) for entry in scf_energies[:refs_needed + 1])
+            from dft_forge.structure_builder import reference_molecule_kind
+
+            ran = set((ctx.get("structure_molecule_kind") or {}).values())
+            args["_molecular_refs"] = {
+                kind: True for kind in (reference_molecule_kind(el) for el in els) if kind in ran}
             refs = {}
             for i, el in enumerate(els):
                 e = scf_energies[i + 1]
@@ -264,6 +367,18 @@ def prepare_step_args(
                 # silently produce wrong physics for E_ads/formation flows
                 return "no structure to chain (previous build step failed) and no material given"
 
+            molecule_kind = (ctx.get("structure_molecule_kind") or {}).get(str(inputs.get("structure") or ""))
+            if molecule_kind:
+                # An isolated molecule is Γ-only with integer occupations in
+                # its ground-state spin, whatever bulk k-mesh was confirmed
+                # for the crystals in the same plan.
+                from dft_forge.structure_builder import molecule_scf_inputs
+
+                molecular = molecule_scf_inputs(molecule_kind)
+                inputs.update(molecular)
+                if method:
+                    method["step"].setdefault("notes", []).append(
+                        f"{molecule_kind} 分子参考态按孤立分子计算：Γ 点、固定占据、基态自旋 {molecular}")
             args["inputs"] = inputs
 
             def _node_cb(ev, _idx=idx, _log=node_log):

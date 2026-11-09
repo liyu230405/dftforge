@@ -152,7 +152,9 @@ class TestVerifyT2Bands:
   <qes:output>
     <qes:band_structure nks="100" nbnd="16">
       <qes:ks_energies><qes:eigenvalues>""" + " ".join(["-5.0"] * 16) + """</qes:eigenvalues></qes:ks_energies>
+      <qes:smearing degauss="5.0E-003">mv</qes:smearing>
     </qes:band_structure>
+    <qes:fermi_energy>-4.900000E-001</qes:fermi_energy>
   </qes:output>
 </qes:espresso>
 """)

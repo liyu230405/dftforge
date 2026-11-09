@@ -6,7 +6,7 @@ import asyncio
 from dft_forge.agent_loop import AgentLoop
 from dft_forge.agent_loop.llm_planner import LLMPlanner
 from dft_forge.agent_loop.planning import capability_catalog_text
-from dft_forge.agent_loop.step_validator import validate_steps
+from dft_forge.agent_loop.step_validator import validate_steps, semantic_plan_errors
 from dft_forge.tools.definitions import register_default_tools
 from dft_forge.tools.registry import registry
 
@@ -76,3 +76,11 @@ def test_advisory_only_plan_retains_metadata_and_emits_plan_event(tmp_path):
     assert result["commands"] == []
     assert "未执行任何工具" in result["reply"]
     assert any(event["type"] == "plan" for event in events)
+
+
+def test_defect_study_can_compute_parent_formation_for_mu_bounds():
+    step = {"tool": "thermo.formation", "args": {"formula": "MgO"},
+            "description": "归约 MgO 母相形成能，用于化学势约束"}
+    assert not semantic_plan_errors("MgO 空位形成能与化学势", [step])
+    step["description"] = "计算 MgO 氧空位形成能"
+    assert semantic_plan_errors("MgO 空位形成能", [step])

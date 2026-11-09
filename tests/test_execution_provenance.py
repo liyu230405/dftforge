@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -153,6 +154,39 @@ def test_executor_selection_is_fail_closed_and_walltime_is_validated(tmp_path, m
     monkeypatch.setenv("DFT_FORGE_WALLTIME", "29")
     with pytest.raises(ValueError, match="DFT_FORGE_WALLTIME"):
         graph_tools._pick_executor()
+
+
+def test_local_execution_profile_hashes_qe_executable_contents(tmp_path, monkeypatch):
+    qe_bin = tmp_path / "qe-bin"
+    qe_bin.mkdir()
+    pw = qe_bin / "pw.x"
+    ph = qe_bin / "ph.x"
+    pw.write_bytes(b"pw fixture v1\n")
+    ph.write_bytes(b"ph fixture\n")
+    pw.chmod(0o755)
+    ph.chmod(0o755)
+    monkeypatch.setenv("DFT_FORGE_EXECUTOR", "local")
+    monkeypatch.setenv("DFT_FORGE_QE_BIN", str(qe_bin))
+    monkeypatch.setenv("DFT_FORGE_WALLTIME", "30")
+
+    _executor, profile, identity_v1 = graph_tools._build_execution()
+
+    assert "qe_bin_sha256" not in profile
+    assert profile["qe_executables_sha256"] == {
+        "pw.x": hashlib.sha256(pw.read_bytes()).hexdigest(),
+        "ph.x": hashlib.sha256(ph.read_bytes()).hexdigest(),
+    }
+    assert profile["qe_bin_config_sha256"] == graph_tools._config_digest(
+        {"qe_bin_dir": str(qe_bin.resolve())}
+    )
+
+    pw.write_bytes(b"pw fixture v2\n")
+    pw.chmod(0o755)
+    _executor, profile_v2, identity_v2 = graph_tools._build_execution()
+    assert profile_v2["qe_executables_sha256"]["pw.x"] != profile[
+        "qe_executables_sha256"
+    ]["pw.x"]
+    assert identity_v2 != identity_v1
 
 
 def test_read_only_graph_paths_do_not_require_qe(tmp_path, monkeypatch):

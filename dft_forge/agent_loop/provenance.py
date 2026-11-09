@@ -11,6 +11,8 @@ _GRAPH_TOOLS = {"graph.run", "graph.status"}
 _GRAPH_BACKED_WORKFLOWS = {
     "workflow.convergence",
     "workflow.neutral_vacancy",
+    "workflow.charged_vacancy",
+    "workflow.adsorption_scan",
     "workflow.magnetic_compare",
     "workflow.phonon_dfpt",
 }
