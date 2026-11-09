@@ -1,6 +1,6 @@
 # DFT-Forge
 
-**General-purpose scientific computation agent** — a graph runtime with Quantum ESPRESSO as its first engine.
+**General-purpose scientific computation agent** — an engine-agnostic graph runtime with three DFT engines (Quantum ESPRESSO, VASP, ABINIT).
 
 > "LLM 只决定做什么；确定性程序决定输入文件如何生成、程序如何运行、结果如何解析和是否可信。"
 
@@ -9,7 +9,7 @@
 DFT-Forge is an agent-friendly CLI and web toolchain for scientific computing workflows. It is designed to be used by coding agents, chat UIs, and researchers who want structured, inspectable, and recoverable computation workflows:
 
 - **Graph runtime**: JSON-declared DAG templates, node/run state machines, dependency-driven scheduling, crash-safe SQLite persistence, repair & retry.
-- **Engine-agnostic core**: the runtime knows nothing about DFT; QE is one engine (`engines/qe.py`). New engines (VASP/ABINIT/LAMMPS/…) plug in as tools.
+- **Engine-agnostic core**: the runtime knows nothing about DFT; each engine plugs in under `engines/` (`engines/qe.py`, `engines/vasp/`, `engines/abinit/`) and covers the same calc set — scf, relax/vc-relax, nscf, bands, dos, pdos, phonons — plus spin/magnetism, charged cells, and supercells. ABINIT is free and open source, so its chain is reproducible end-to-end on a laptop. Further engines (LAMMPS/…) plug in the same way.
 - **User-supplied compute (BYOC)**: local, SSH, or HPC schedulers (SLURM/PBS) — the LLM never generates shell/SSH/scheduler strings.
 - **Agent-friendly CLI**: every command does one thing and outputs JSON.
 - **Deterministic kernels**: compiler (input generation), executor, parser, verifier — no LLM in the execution path.
@@ -56,7 +56,8 @@ dft-forge/
 │   │                   # templates, scheduler, SQLite store, GraphEngine facade
 │   ├── hpc/            # BYOC compute layer: runner abstraction, SLURM/PBS
 │   │                   # schedulers, sbatch/qsub script rendering
-│   ├── engines/        # Node tools per engine (qe.py: pw.x + DFPT post-processing)
+│   ├── engines/        # Node tools per engine: qe.py (pw.x + DFPT), vasp/ (vasp_std),
+│   │                   #   abinit/ (abinit + mrgddb + anaddb, native DFPT phonon chain)
 │   ├── workflows/      # Deterministic convergence/defect/thermo/magnetism/phonon macros
 │   ├── protocol/       # TaskSpec, WorkflowIR, PlanPatch, EvidenceBundle (schemas)
 │   ├── compiler/       # Deterministic QE input generation
@@ -75,9 +76,12 @@ dft-forge/
 │   ├── mcp/            # MCP server for external agents
 │   ├── web/            # FastAPI chat backend + frontend
 │   └── cli.py          # Agent-friendly CLI entry points
-├── templates/          # Graph templates (JSON DAGs): t1_vc_relax, t2_bands, t2_dos
+├── templates/          # Graph templates (JSON DAGs): t0_scf/t1_vc_relax/t2_bands/t2_dos (QE),
+│                        #   v0_vasp_scf/v1_vasp_relax/v2_vasp_bands/v2_vasp_dos/v3_vasp_phonon (VASP),
+│                        #   v4_vasp_phonon_dispersion (VASP+phonopy, optional),
+│                        #   a0_abinit_scf/a1_abinit_relax/a2_abinit_bands/a2_abinit_dos/a3_abinit_phonon (ABINIT)
 ├── assets/pseudos/     # Pseudopotential files
-├── tests/              # Pytest test suite (579 tests)
+├── tests/              # Pytest regression suite
 ├── scripts/            # Utility scripts
 ├── outputs/            # Experiment outputs
 └── work/               # Working files
@@ -96,26 +100,34 @@ dft-forge/
 - Generic SCF / NSCF
 - Parameter convergence scans with a bounded ecut/k-point/smearing grid
 - Neutral bulk vacancy formation-energy workflow with explicit chemical potential
+- Charged bulk-vacancy charge-state workflow with explicit spin choices, potential alignment,
+  and either cubic first-order Makov-Payne or user-supplied finite-size corrections
+- Shared-reference atomic adsorption site scans with fixed-cell relaxations and O2 triplet validation
 - Binary/ternary chemical-potential stability-domain scan with supplied competitors
 - Collinear NM/FM/AFM comparison with initial moments and realized magnetization checks
 - DFPT phonons: relax → SCF → ph.x → q2r.x → matdyn.x, including imaginary-mode detection
 
-The five composite capabilities are registered as `workflow.convergence`,
-`workflow.neutral_vacancy`, `thermo.chemical_potential_scan`,
+The seven composite capabilities are registered as `workflow.convergence`,
+`workflow.neutral_vacancy`, `workflow.charged_vacancy`,
+`workflow.adsorption_scan`, `thermo.chemical_potential_scan`,
 `workflow.magnetic_compare`, and `workflow.phonon_dfpt`. Each macro owns a
 bounded DAG and its scientific reduction; the LLM selects the macro but does
 not invent the internal graph. Real phonon runs require `ph.x`, `q2r.x`, and
 `matdyn.x` alongside `pw.x`.
 
-Current boundaries are deliberate: charged-defect electrostatics and
-finite-size corrections, SOC/noncollinear magnetism, automatic exhaustive
-competitor retrieval, finite-temperature chemical potentials, and phonon
-non-analytic LO/TO corrections are not silently approximated.
+Current boundaries are deliberate: the charged-defect workflow is limited to
+3D near-cubic cells when using first-order Makov-Payne and requires explicit
+dielectric and potential-alignment evidence; it does not claim FNV/Kumagai,
+supercell-size convergence, band-filling, or band-gap corrections. Adsorption
+scans cover atomic adsorbates over explicitly requested top/bridge/hollow
+initial sites, not molecular orientation searches. SOC/noncollinear magnetism,
+automatic exhaustive competitor retrieval, finite-temperature chemical
+potentials, and phonon non-analytic LO/TO corrections are not silently approximated.
 
 ### Structure Operations
 - Import and validate structures
 - Build unchanged bulk supercells for matched pristine controls
-- Build explicit neutral bulk vacancies (element removal; no charge correction)
+- Build explicit bulk-vacancy geometries; charge and corrections are applied only by the charged workflow
 - Normalize to primitive cell
 - Nearest-neighbor sanity checks
 - Space-group detection via spglib
@@ -146,6 +158,111 @@ non-analytic LO/TO corrections are not silently approximated.
 - Fake executor for explicit offline demonstrations (`DFT_FORGE_EXECUTOR=fake`).
   A missing local `pw.x` is a configuration error; it must not silently produce
   simulated results. `DFT_FORGE_WALLTIME` controls both local and SSH limits.
+
+#### Engine binaries & pseudopotentials
+
+- **QE** (default engine): `DFT_FORGE_QE_BIN` points at the directory holding an
+  executable `pw.x` (or leave unset to use `PATH`).
+- **VASP** (`vasp` tool; templates `v0_vasp_scf`, `v1_vasp_relax`, `v2_vasp_bands`,
+  `v2_vasp_dos`, `v3_vasp_phonon`): set `DFT_FORGE_VASP_BIN` to the `vasp_std`
+  binary and `DFT_FORGE_VASP_PP_DIR` to a `VASP_PP_PATH`-style POTCAR tree
+  (element subfolders `Si/`, `Fe_pv/`, …). POTCAR is license-restricted, so it is
+  never bundled: a missing binary or POTCAR fails closed as a configuration error
+  and never produces simulated output. VASP energies are reported in eV.
+
+  The VASP engine matches the QE calc set: `scf`, `relax`, `vc-relax`, `nscf`,
+  `bands` (line-mode k-path, band gap), `dos`/`pdos` (tetrahedron + `LORBIT=11`),
+  and `phonon` (Γ-point DFPT via `IBRION=8`). It also honors `spin_polarized` /
+  `magnetic_order` (FM/AFM `MAGMOM`), `tot_charge` (charged cell via `NELECT`
+  computed from POTCAR `ZVAL`), and `supercell`.
+
+  Full phonon **dispersion** (not just Γ-point) is available via the optional
+  finite-displacement template `v4_vasp_phonon_dispersion` (`relax` →
+  `phonopy_disp` → `phonopy_bands`). This needs the freely-installable
+  [phonopy](https://phonopy.github.io/phonopy/) package (`pip install phonopy`);
+  it is imported lazily and fails closed with an install hint when absent, so
+  the rest of the VASP engine works without it. The `phonopy_disp` node fans out
+  over the symmetry-reduced displaced supercells internally (one `vasp_std` force
+  run each) and collects `FORCE_SETS`; `phonopy_bands` builds the dynamical
+  matrix and reports the dispersion, phonon DOS, and dynamical-stability summary
+  (imaginary-mode detection) along the standard high-symmetry q-path. The native
+  `v3_vasp_phonon` (Γ-point DFPT) needs no extra dependency.
+- **ABINIT** (`abinit` tool; templates `a0_abinit_scf`, `a1_abinit_relax`,
+  `a2_abinit_bands`, `a2_abinit_dos`, `a3_abinit_phonon`): set
+  `DFT_FORGE_ABINIT_BIN` to the `abinit` binary (`mrgddb` and `anaddb` are
+  resolved as sibling executables in the same directory) and `DFT_FORGE_ABINIT_PP_DIR`
+  to a directory of pseudopotentials — e.g. a [PseudoDojo](http://www.pseudo-dojo.org/)
+  norm-conserving set of `<Element>.psp8` files. Pseudos are never bundled; a
+  missing binary or pseudopotential fails closed as a configuration error and
+  never produces simulated output. ABINIT works in Hartree/Bohr internally;
+  energies are converted to eV and forces to eV/Å on the way out, so the engine
+  reports the same units as QE and VASP. Local execution can be configured
+  with ABINIT alone; a QE installation is not required.
+
+  The ABINIT engine matches the same calc set: `scf`, `relax`, `vc-relax`,
+  `nscf`, `bands` (line-mode k-path via `kptbounds`, band gap), `dos`/`pdos`
+  (`prtdos 1`/`prtdos 3`), plus a **native DFPT phonon chain** — the analogue of
+  QE's `ph.x → q2r.x → matdyn.x`. The `a3_abinit_phonon` template runs
+  `relax → dfpt → anaddb`: `dfpt` runs the ABINIT response-function datasets
+  (`rfphon`) for every point of a complete q-mesh, requires all per-dataset DDBs,
+  and merges them with `mrgddb`. The electronic k-mesh must be divisible by the
+  q-mesh in each direction. `anaddb` interpolates the merged DDB onto a band
+  q-path plus a q-mesh, reporting the dispersion, phonon DOS, and
+  dynamical-stability summary (imaginary-mode detection). `spin_polarized` /
+  `magnetic_order` (FM/AFM via `nsppol 2` + `spinat`) and `supercell` are honored.
+  The phonon template uses fixed-cell relaxation and omits non-analytic LO/TO
+  corrections. Density is passed to bands/DOS nodes through `getden_filepath`;
+  phonon frequencies are read preferentially from `PHBST.nc` and converted
+  from eV to THz.
+
+  **User-reproducible link**: unlike VASP (license-restricted binary) and HPC
+  (cluster access), ABINIT is free and open source, so this engine can be run
+  end-to-end on a laptop:
+
+  ```bash
+  conda install -c conda-forge abinit
+  export DFT_FORGE_EXECUTOR=local
+  export DFT_FORGE_ABINIT_BIN=$(which abinit)
+  export DFT_FORGE_ABINIT_PP_DIR=/path/to/pseudodojo/nc/standard   # <Element>.psp8
+  ```
+
+  Then run the `a1_abinit_relax` template (Si) through the `graph.run` tool —
+  from the MCP server, or directly:
+
+  ```python
+  from dft_forge.tools.graph_tools import _graph_run
+  out = _graph_run({"template_id": "a1_abinit_relax", "inputs": {"material": "Si"}})
+  print(out["outputs"])   # energy_ev, converged, final_volume_ang3, final_structure_cif
+  # Compare against a reference using the same XC functional and converged settings.
+  ```
+
+  **Real-binary validation (2026-09-26):** all five Si templates succeeded with
+  ABINIT 10.0.3 from conda-forge (x86_64 under Rosetta on Apple Silicon): SCF,
+  variable-cell relaxation, bands, DOS/PDOS, and complete `2×2×2` DFPT →
+  `mrgddb` → `anaddb` with `PHBST.nc` and `PHDOS.nc` artifacts. Reproduce from
+  the repository root with the Python dependencies installed:
+
+  ```bash
+  python scripts/abinit_demo.py \
+    --abinit-bin /path/to/abinit \
+    --fetch-si-pseudo \
+    --out outputs/abinit-si-demo \
+    --ecut 8 --ngkpt 2 --ngqpt 2
+  ```
+
+  Choose a new output directory each time. The script fetches a checksum-pinned
+  public Si LDA tutorial pseudopotential, runs real local executables, and
+  exports a report, per-template/node JSON, raw inputs and outputs, binary and
+  pseudopotential SHA-256 provenance, and `evidence.zip` with a file manifest.
+  Use `--pp-dir /path/to/pseudos` instead of `--fetch-si-pseudo` for your own set.
+  The archive preserves execution-time paths; rerun the script in the repository
+  to regenerate them on another machine.
+
+  These settings verify software integration. Cutoff, k/q meshes and supercell
+  sizes have not been converged. The coarse-grid phonon run contains imaginary
+  frequencies and does not establish Si's dynamical stability. VASP remains
+  covered by output-format fixtures and `FakeExecutor` tests; its real binary
+  was not run in this validation.
 
 ### Verification
 - SCF convergence

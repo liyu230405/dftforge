@@ -27,7 +27,7 @@
 ├─────────────────────────────────────────────────────────┤
 │  Engine Tools       engines/ — node implementations    │
 │                     qe.py (vc-relax/scf/nscf/bands/dos) │
-│                     ...add VASP/ABINIT/LAMMPS here     │
+│                     vasp/ and abinit/; add LAMMPS here │
 ├─────────────────────────────────────────────────────────┤
 │  Compute Layer      hpc/ (runner abstraction +         │
 │                     SLURM/PBS schedulers + job scripts)│
@@ -62,6 +62,28 @@ engine.register_tool(VASPCalcTool())
 engine.templates_dir = Path("templates/")   # JSON templates reference "tool": "vasp"
 ```
 
+`VASPCalcTool` above is not hypothetical — it ships in `engines/vasp/` as a
+worked second engine (writer/parser/tool split, fail-closed POTCAR handling)
+at full parity with `engines/qe.py`: scf, relax/vc-relax, nscf, bands, dos,
+pdos and Γ-point DFPT phonons, plus spin/magnetism, charged cells and
+supercells. A third engine, `engines/abinit/`, follows the identical
+writer/parser/tool split (fail-closed pseudopotentials, single `.abi` input) —
+and because ABINIT is free and open source, its chain is the one a user can
+reproduce end-to-end on a laptop, validating the engine-agnostic claim with a
+second real link. Use either as the reference when adding LAMMPS/etc.
+
+**Fan-out inside a node (finite-displacement phonons).** The static JSON
+runtime has no dynamic node expansion — the node count is fixed at template
+authoring time. When a step needs an a-priori-unknown number of sub-runs, keep
+the fan-out *inside* one node. The VASP phonon-dispersion template
+(`v4_vasp_phonon_dispersion`: relax → `phonopy_disp` → `phonopy_bands`) does
+this: `phonopy_disp` generates the symmetry-reduced displaced supercells with
+phonopy, loops `executor.run_vasp` over each internally, collects the forces,
+and persists the force constants as a single node output; `phonopy_bands`
+reloads them and computes dispersion/DOS/stability without running VASP at all.
+phonopy is an optional, lazily-imported dependency (`engines/vasp/phonopy_support.py`)
+that fails closed when absent — the graph shape never depends on it.
+
 Cross-node data flows through `${nodes.<id>.outputs.<key>}` bindings — e.g. the `bands` node consumes the `scf` node's `stdout_file`. Upstream artifacts are linked via `ctx.upstream` (the runtime guarantees dependencies succeeded first).
 
 ## 2. HPC Layer (`dft_forge/hpc/`)
@@ -78,6 +100,8 @@ User-supplied compute (BYOC):
 Node implementations that combine domain kernels:
 
 - **`qe.py`** — `QECalcTool` supports `vc-relax`, `scf`, `nscf`, `bands`, `dos`. Each node: compile input → execute → parse → verify → emit typed outputs (raising `ToolError(category=..., repairable=...)` on failure). `QEParamRepairer` implements monotone parameter strengthening (cutoff bumps) for convergence-class failures.
+- **`vasp/`** — `VASPCalcTool` (writer/parser/tool split), full calc set + Γ-point DFPT and optional phonopy dispersion. `VASPParamRepairer` bumps `ENCUT`.
+- **`abinit/`** — `ABINITCalcTool` (writer/parser/tool split), full calc set + a **native DFPT phonon chain**: `a3_abinit_phonon` runs `relax → dfpt → anaddb`. The `dfpt` node computes every point of a complete q-mesh commensurate with the electronic k-mesh, requires every response dataset's DDB, and merges them using `mrgddb`. The `anaddb` node interpolates the merged DDB into dispersion + phonon DOS. Both auxiliary binaries resolve beside `DFT_FORGE_ABINIT_BIN`. Cross-node DDB and density artifacts flow through `ctx.upstream`; bands/DOS consume density through `getden_filepath`. Energies parse from Hartree→eV, forces Ha/Bohr→eV/Å, and `PHBST.nc` frequencies from eV→THz. The phonon template uses fixed-cell relaxation and omits non-analytic LO/TO corrections. `ABINITParamRepairer` bumps `ecut`.
 - **QE 7.x compatibility notes** (hard-won): `CELL_PARAMETERS` must be omitted when `ibrav ≠ 0`; `K_POINTS crystal` lines require the weight column; the eigenvalue XML (`<prefix>.save/data-file-schema.xml`) is namespace-less at child level and uses **Hartree** units; NSCF output has no SCF-convergence marker (verified via `End of band structure calculation` instead); lattice constants parsed from `ibrav=0` primitive cells are converted to conventional cubic form (fcc: |a₁|·√2).
 
 ## 4. Tools & MCP (`dft_forge/tools/`, `dft_forge/mcp/`)
@@ -103,8 +127,23 @@ OpenAI-compatible chat-completion provider configured via `DFT_FORGE_LLM_*` env 
 | `t1_vc_relax` | NaCl | a = 5.701 Å (PBE ≈ 5.70, exp. 5.64), E = −128.90 Ry |
 | `t2_bands` | Si | indirect gap 0.575 eV (PBE ≈ 0.6, exp. 1.17), E_F = 6.53 eV, 100 k-points on Γ-X-W-K-Γ-L-U-W-L-K\|U-X |
 
+ABINIT 10.0.3 completed local real-binary validation on 2026-09-26 using the
+conda-forge x86_64 package under Rosetta on Apple Silicon. All five Si templates
+succeeded: SCF, variable-cell relaxation, bands, DOS/PDOS, and complete `2×2×2`
+DFPT → `mrgddb` → `anaddb`, producing `PHBST.nc` and `PHDOS.nc`. See
+`scripts/abinit_demo.py` and the README command to reproduce and export a
+checksum-manifested evidence archive. Real `.abo` and anaddb/PHBST fixtures
+also exercise parsing without requiring an ABINIT installation in CI.
+
+The demo uses an LDA tutorial pseudopotential, 8 Ha cutoff and a `2×2×2`
+electronic mesh (`6×6×6` for DOS/PDOS). It validates the software chain;
+cutoff, k/q meshes and supercell sizes have not been converged. Its imaginary
+phonon frequencies are not a converged material-stability conclusion.
+VASP remains verified with real-format OUTCAR / vasprun.xml samples and
+`FakeExecutor`; its license-restricted binary has not been run here.
+
 ## Test Suite
 
 ```bash
-python -m pytest tests/ -q        # 300 tests: runtime, scheduler, hpc, engines, e2e (fake + real QE)
+python -m pytest tests/ -q        # 1000+ tests: runtime, scheduler, hpc, engines (QE/VASP/ABINIT), e2e (fake + real QE)
 ```
