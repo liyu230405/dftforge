@@ -82,10 +82,15 @@ def parse_outcar(text: str) -> ParsedVASP:
         result.total_energy_ev = float(energies[-1])
 
     # Each "aborting loop because EDIFF is reached" marks a converged
-    # electronic step; the count of ionic iterations is separate.
-    result.converged = "reached required accuracy" in text or bool(
-        re.search(r"aborting loop because EDIFF is reached", text)
-    )
+    # electronic step; the count of ionic iterations is separate. Judge
+    # electronic convergence by the *last* loop: in a multi-step relaxation
+    # earlier loops may converge while the final one hits NELM (VASP 6 prints
+    # "aborting loop EDIFF was not reached (unconverged)").
+    loops = re.findall(r"aborting loop (because EDIFF is reached|EDIFF was not reached)", text)
+    if loops:
+        result.converged = loops[-1].startswith("because")
+    else:
+        result.converged = "reached required accuracy" in text
     result.n_electronic_steps = len(
         re.findall(r"aborting loop because EDIFF is reached", text)
     ) or len(re.findall(r"Iteration\s+\d+\(\s*\d+\)", text))
@@ -145,6 +150,16 @@ def parse_vasprun(path: Path) -> ParsedVASP:
     vol = root.findall(".//calculation/structure/crystal/i[@name='volume']")
     if vol and vol[-1].text:
         result.final_volume_ang3 = float(vol[-1].text)
+
+    # Max residual force of the final ionic step; without this the relaxation
+    # force gate never fires on real runs, which always write vasprun.xml.
+    if calculations:
+        varray = calculations[-1].find("varray[@name='forces']")
+        if varray is not None:
+            norms = [sum(float(x) ** 2 for x in v.text.split()) ** 0.5
+                     for v in varray.findall("v") if v.text]
+            if norms:
+                result.max_force_ev_ang = max(norms)
 
     # vasprun.xml records convergence implicitly: an NELM-capped run leaves an
     # extra scstep beyond the required accuracy. Treat presence of a final

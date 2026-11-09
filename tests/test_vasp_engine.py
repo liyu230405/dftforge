@@ -680,3 +680,111 @@ def test_phonopy_dispersion_template_runs(tmp_path, monkeypatch):
     assert bands["stability"]["dynamically_stable_at_threshold"] is True
     assert bands["phonon_dos"]["total_dos"] == [0.0, 0.5, 0.2]
     assert recorder["distance"] == 0.01  # displacement distance flowed through
+
+
+# ── Convergence of the final electronic loop (multi-step relaxations) ─────────
+
+def test_parse_outcar_last_loop_unconverged_is_not_converged():
+    text = (
+        " free  energy   TOTEN  =  -10.80 eV\n"
+        "------------------------ aborting loop because EDIFF is reached ----\n"
+        " free  energy   TOTEN  =  -10.84 eV\n"
+        "------------------------ aborting loop EDIFF was not reached (unconverged)  ----\n"
+    )
+    assert vp.parse_outcar(text).converged is False
+
+
+def test_parse_outcar_last_loop_converged_is_converged():
+    text = (
+        "------------------------ aborting loop EDIFF was not reached (unconverged)  ----\n"
+        "------------------------ aborting loop because EDIFF is reached ----\n"
+    )
+    assert vp.parse_outcar(text).converged is True
+
+
+# ── vasprun.xml forces feed the relaxation force gate ─────────────────────────
+
+def _vasprun_with_forces(force_row: str) -> str:
+    return (
+        "<modeling><parameters><i name='NELM'>60</i></parameters>"
+        "<calculation>"
+        "<scstep><energy><i name='e_fr_energy'>-10.84</i></energy></scstep>"
+        "<energy><i name='e_fr_energy'>-10.84</i></energy>"
+        "<structure><crystal><i name='volume'>40.88</i></crystal></structure>"
+        "<varray name='forces'><v> 0.0 0.0 0.0 </v>"
+        f"<v> {force_row} </v></varray>"
+        "</calculation></modeling>"
+    )
+
+
+def test_parse_vasprun_reads_max_force(tmp_path):
+    xml = tmp_path / "vasprun.xml"
+    xml.write_text(_vasprun_with_forces("0.3 0.4 0.0"))
+    assert vp.parse_vasprun(xml).max_force_ev_ang == pytest.approx(0.5)
+
+
+def test_tool_relax_rejects_high_force_from_vasprun(tmp_path):
+    pp = _fake_pp(tmp_path, "Si")
+    class _XmlExec(FakeExecutor):
+        def __init__(self):
+            super().__init__(mode="success", stdout=_relax_outcar())
+        def run_vasp(self, workdir, *, timeout=None):
+            wd = Path(workdir)
+            (wd / "OUTCAR").write_text(_relax_outcar())  # OUTCAR alone would pass
+            (wd / "vasprun.xml").write_text(_vasprun_with_forces("0.3 0.4 0.0"))
+            return super().run_vasp(workdir, timeout=timeout)
+    tool = VASPCalcTool(executor=_XmlExec(), pp_dir=pp)
+    node = NodeRun(node_id="vc", params={"calc": "vc-relax", "material": "Si", "ediffg": -0.02})
+    with pytest.raises(ToolError) as exc:
+        tool.execute(node, _ctx(tmp_path))
+    assert exc.value.category == "verification"
+
+
+# ── Cross-check against real VASP outputs shipped with ASE's test data ───────
+
+def _ase_vasp_testdata() -> Path:
+    import ase
+    return Path(ase.__file__).parent / "test" / "testdata" / "vasp"
+
+
+_ASE_VASP = _ase_vasp_testdata()
+needs_ase_data = pytest.mark.skipif(
+    not (_ASE_VASP / "OUTCAR_example_1").is_file(),
+    reason="ASE VASP test data not installed")
+
+
+@needs_ase_data
+def test_real_outcar_energy_and_forces_match_ase(tmp_path):
+    import shutil
+    import numpy as np
+    from ase.io import read
+    ref = read(_ASE_VASP / "OUTCAR_example_1", index=-1)
+    parsed = vp.parse_outcar((_ASE_VASP / "OUTCAR_example_1").read_text())
+    assert parsed.total_energy_ev == pytest.approx(
+        ref.get_potential_energy(force_consistent=True), abs=1e-6)
+    shutil.copy(_ASE_VASP / "OUTCAR_example_1", tmp_path / "OUTCAR")
+    forces = np.array(vp.parse_forces(tmp_path))
+    assert forces.shape == ref.get_forces().shape
+    assert np.abs(forces - ref.get_forces()).max() < 1e-6
+    assert parsed.max_force_ev_ang == pytest.approx(
+        float(np.linalg.norm(ref.get_forces(), axis=1).max()), abs=1e-6)
+
+
+@needs_ase_data
+@pytest.mark.parametrize("name,expected", [
+    ("convergence_OUTCAR_y_y", True),
+    ("convergence_OUTCAR_y_n", False),  # VASP 6 "EDIFF was not reached"
+    ("convergence_OUTCAR_n_y", True),
+])
+def test_real_outcar_convergence_messages(name, expected):
+    assert vp.parse_outcar((_ASE_VASP / name).read_text()).converged is expected
+
+
+@needs_ase_data
+def test_real_vasprun_energy_matches_ase():
+    from ase.io import read
+    ref = read(_ASE_VASP / "vasprun_dfpt.xml", index=-1)
+    parsed = vp.parse_vasprun(_ASE_VASP / "vasprun_dfpt.xml")
+    assert parsed.total_energy_ev == pytest.approx(
+        ref.get_potential_energy(force_consistent=True), abs=1e-6)
+    assert parsed.converged is True
