@@ -49,7 +49,7 @@ class TestTaskRunnerRecoveryIntegration:
         pseudo_dir = tmp_path / "pseudos"
         pseudo_dir.mkdir()
         import shutil
-        src = Path("/Users/liyu/Documents/Codex/dft-forge/assets/pseudos")
+        src = Path(__file__).resolve().parents[1] / "assets" / "pseudos"
         for f in src.iterdir():
             if f.is_file():
                 shutil.copy(f, pseudo_dir / f.name)

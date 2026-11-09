@@ -34,19 +34,83 @@ class TestAnalysisCompareTool:
 
     def test_energy_math_per_atom(self):
         entries = [
-            {"label": "体系A", "energy_ry": -100.0, "natoms": 18},
-            {"label": "体系B", "energy_ry": -110.0, "natoms": 20},
+            {"label": "Si结构A", "material": "Si", "energy_ry": -100.0, "natoms": 18},
+            {"label": "Si结构B", "material": "Si", "energy_ry": -110.0, "natoms": 18},
         ]
         r = _analysis_compare({"entries": entries, "metric": "energy"})
         assert r["ok"] is True
-        # per-atom: A = -75.59 eV, B = -74.83 eV → B higher per atom
         a_pa = r["items"][0]["energy_ev_per_atom"]
         b_pa = r["items"][1]["energy_ev_per_atom"]
         assert a_pa == pytest.approx(-100.0 * 13.605693 / 18, abs=0.01)
-        assert b_pa == pytest.approx(-110.0 * 13.605693 / 20, abs=0.01)
+        assert b_pa == pytest.approx(-110.0 * 13.605693 / 18, abs=0.01)
         d = r["differences"][0]
-        assert d["lower"] == "体系B"  # total energy lower
+        assert d["lower"] == "Si结构B"
         assert d["delta_energy_ev"] == pytest.approx(-10.0 * 13.605693, abs=0.01)
+
+    def test_energy_rejects_different_atom_counts(self):
+        entries = [
+            {"label": "Si-18", "formula": "Si", "energy_ry": -100.0, "natoms": 18},
+            {"label": "Si-20", "formula": "Si", "energy_ry": -110.0, "natoms": 20},
+        ]
+        r = _analysis_compare({"entries": entries, "metric": "energy"})
+        assert r["comparable"] is False
+        assert "identical atom counts" in r["error"]
+        assert "differences" not in r
+
+    def test_energy_rejects_si_cu_total_energy_ranking(self):
+        entries = [
+            {"label": "Si", "material": "Si", "energy_ry": -15.0, "natoms": 2},
+            {"label": "Cu", "material": "Cu", "energy_ry": -80.0, "natoms": 2},
+        ]
+        r = _analysis_compare({"entries": entries, "metric": "energy"})
+        assert r["comparable"] is False
+        assert "identical elemental composition" in r["error"]
+        assert "differences" not in r
+
+    def test_energy_rejects_missing_composition_evidence(self):
+        entries = [
+            {"label": "A", "energy_ry": -10.0, "natoms": 2},
+            {"label": "B", "energy_ry": -11.0, "natoms": 2},
+        ]
+        r = _analysis_compare({"entries": entries, "metric": "energy"})
+        assert r["comparable"] is False
+        assert "formula/composition evidence" in r["error"]
+        assert "differences" not in r
+
+    def test_energy_rejects_method_profile_mismatch(self):
+        def method(ecutwfc):
+            return {
+                "pseudos": {"Si": "Si.upf"},
+                "input_dft": "PBE",
+                "effective": {
+                    "ecutwfc": ecutwfc,
+                    "ecutrho": 320,
+                    "kpoints": [4, 4, 4, 0, 0, 0],
+                    "tot_charge": 0.0,
+                },
+            }
+
+        entries = [
+            {"label": "A", "formula": "Si", "energy_ry": -10.0, "natoms": 2,
+             "method_profile": method(40)},
+            {"label": "B", "formula": "Si", "energy_ry": -11.0, "natoms": 2,
+             "method_profile": method(50)},
+        ]
+        r = _analysis_compare({"entries": entries, "metric": "energy"})
+        assert r["comparable"] is False
+        assert "method mismatch for ecutwfc" in r["error"]
+        assert "differences" not in r
+
+        entries[1]["method_profile"] = method(40)
+        compatible = _analysis_compare({"entries": entries, "metric": "energy"})
+        assert compatible["ok"] is True
+        assert compatible["differences"][0]["lower"] == "B"
+
+        entries[1].pop("method_profile")
+        missing = _analysis_compare({"entries": entries, "metric": "energy"})
+        assert missing["comparable"] is False
+        assert "method_profile is missing" in missing["error"]
+        assert "differences" not in missing
 
     def test_auto_metric_picks_band_gap(self):
         r = _analysis_compare({"entries": LEDGER_TWO_BANDS, "metric": "auto"})
@@ -129,6 +193,13 @@ class _RecordingRegistry:
         if not real_registry._tools:
             register_default_tools()
         return real_registry.list_all()
+
+    def get(self, tool_id: str):
+        from dft_forge.tools.definitions import register_default_tools
+        from dft_forge.tools.registry import registry as real_registry
+        if not real_registry._tools:
+            register_default_tools()
+        return real_registry.get(tool_id)
 
     async def call(self, tool_id: str, arguments: dict, **kwargs):
         self.calls.append({"tool": tool_id, "args": dict(arguments)})

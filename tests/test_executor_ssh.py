@@ -84,6 +84,8 @@ class FakeRemoteHost(CommandRunner):
         self.pkilled: List[str] = []
         self.submitted_scripts = {}  # script path -> text
         self.fail_substr: Optional[str] = None  # commands containing it fail
+        self.direct_transport_error: Optional[str] = None  # ssh dies, no marker
+        self.direct_omit_output = False  # remote run leaves no .out behind
 
     def _local(self, remote_path: str) -> Path:
         return self.root / remote_path.lstrip("/")
@@ -161,14 +163,18 @@ class FakeRemoteHost(CommandRunner):
 
         m = _DIRECT_RUN_RE.match(cmd)
         if m:
+            if self.direct_transport_error is not None:
+                # the ssh call itself died: no DFTFORGE_EXIT marker in stdout
+                return CommandResult(-1, stderr=self.direct_transport_error)
             code = self.direct_exit_codes.pop(0) if self.direct_exit_codes else 0
             # groups: 1=dir, 2=secs(named), 3=binary, 4=input, 5=out-stem, 6=err-stem
             out_stem, err_stem = _unq(m.group(5)), _unq(m.group(6))
             job_dir = self._local(_unq(m.group(1)))
             job_dir.mkdir(parents=True, exist_ok=True)
-            (job_dir / f"{out_stem}.out").write_text(
-                self.direct_stdout_files.get(out_stem, "JOB DONE.\n")
-            )
+            if not self.direct_omit_output:
+                (job_dir / f"{out_stem}.out").write_text(
+                    self.direct_stdout_files.get(out_stem, "JOB DONE.\n")
+                )
             (job_dir / f"{err_stem}.err").write_text("")
             return CommandResult(0, stdout=f"DFTFORGE_EXIT_{code}\n")
 
@@ -329,6 +335,57 @@ class TestDirectMode:
         wd = _make_workdir(tmp_path, input_name="si_dos.dos.in")
         res = ex.run_dos_x(wd / "si_dos.dos.in", wd)
         assert res.success
+
+    def test_direct_run_addresses_input_by_absolute_path(self, tmp_path, fake_remote):
+        # cancel() kills the remote job with `pkill -f <job dir>`; that only
+        # reaches pw.x if the process cmdline carries the job dir, which needs
+        # an absolute -in argument (a relative one after `cd` does not)
+        ex = _direct_executor(fake_remote)
+        wd = _make_workdir(tmp_path)
+        res = ex.run_pw(wd / "si_vcrelax.in", wd)
+
+        run_cmd = next(c for c in fake_remote.commands if "pw.x -in" in c)
+        m = _DIRECT_RUN_RE.match(run_cmd)
+        assert m, run_cmd
+        assert _unq(m.group(4)) == f"{res.remote_path}/si_vcrelax.in"
+
+        # the kill pattern is exactly that job dir — the invariant cancel relies on
+        handle = next(iter(ex._job_registry.values()))["handle"]
+        assert ex.cancel(handle) is True
+        assert fake_remote.pkilled[-1] == res.remote_path
+
+    def test_ssh_transport_failure_is_not_reported_as_success(self, tmp_path, fake_remote):
+        # regression: a dead ssh session left exit_code at its 0 default, so a
+        # run that never happened was reported as a successful one
+        fake_remote.direct_transport_error = "ssh: connect to host fake port 22: timed out"
+        ex = _direct_executor(fake_remote)
+        wd = _make_workdir(tmp_path)
+
+        for res in (ex.run_pw(wd / "si_vcrelax.in", wd), ex.run_bands_x(wd / "si_vcrelax.in", wd)):
+            assert not res.success
+            assert res.exit_code == -1
+            assert "transport failed" in res.error_message
+            assert "timed out" in res.error_message
+
+    def test_missing_downloaded_output_fails_loudly(self, tmp_path, fake_remote):
+        # a completed remote run always leaves <stem>.out; if the transport
+        # drops it, empty stdout must not be reported as a finished run
+        fake_remote.direct_omit_output = True
+        ex = _direct_executor(fake_remote)
+        wd = _make_workdir(tmp_path)
+        res = ex.run_dos_x(wd / "si_vcrelax.in", wd)
+
+        assert not res.success
+        assert "retrieved from remote host" in res.error_message
+
+    def test_failed_download_fails_loudly(self, tmp_path, fake_remote):
+        ex = _direct_executor(fake_remote)
+        wd = _make_workdir(tmp_path)
+        fake_remote.fail_substr = "| base64"  # only the download command matches
+        res = ex.run_pw(wd / "si_vcrelax.in", wd)
+
+        assert not res.success
+        assert "download failed" in res.error_message
 
 
 # ── Upload semantics ──────────────────────────────────────────────────────────
@@ -491,6 +548,15 @@ class TestCloudLifecycle:
         assert ex.cancel(handle) is True
         assert fake_remote.pkilled == ["/remote/ws/job5"]
         assert ex.status(handle) == JobStatus.CANCELLED
+
+    def test_cancel_direct_mode_reports_transport_failure(self, tmp_path, fake_remote):
+        # a cancel that never reached the host must not be recorded as done —
+        # the job would silently keep running on the cluster
+        ex = _direct_executor(fake_remote)
+        handle = ex.stage({"task_uuid": "job5"})
+        fake_remote.fail_substr = "pkill"
+        assert ex.cancel(handle) is False
+        assert ex._job_registry["job5"]["state"] == "staged"
 
     def test_cancel_pbs_issues_qdel(self, tmp_path, fake_remote):
         ex = SSHExecutor(

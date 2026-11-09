@@ -34,8 +34,8 @@ class NodeRun:
     attempt: int = 0
     repair_attempts: int = 0
     params: Dict[str, Any] = field(default_factory=dict)
-    # not persisted: False after load → re-resolve on resume (resolved params
-    # carry no ${} refs, so re-resolution is a no-op but keeps resume honest)
+    # Persisted so repairer mutations survive a process restart.  Legacy rows
+    # without this field are inferred conservatively by SQLiteStateStore.
     params_resolved: bool = False
     outputs: Dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
@@ -57,6 +57,7 @@ class GraphRun:
     state: RunState = RunState.CREATED
     nodes: Dict[str, NodeRun] = field(default_factory=dict)
     inputs: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 

@@ -2,8 +2,11 @@
   "template_id": "t2_bands",
   "description": "Band structure: scf -> nscf -> bands.x with cross-node verification",
   "inputs": {
+    "_parameters_locked": false,
+    "_source_lock": null,
     "material": "Si",
     "ecutwfc": null,
+    "ecutrho": null,
     "kpoints": null,
     "nbnd": null,
     "nkpoints_bands": 100,
@@ -20,8 +23,12 @@
       "tool": "qe",
       "params": {
         "calc": "scf",
+        "_source_lock": "${inputs._source_lock}",
+        "_parameters_locked": "${inputs._parameters_locked}",
         "material": "${inputs.material}",
         "ecutwfc": "${inputs.ecutwfc}",
+        "ecutrho": "${inputs.ecutrho}",
+        "nbnd": "${inputs.nbnd}",
         "kpoints": "${inputs.kpoints}",
         "structure": "${inputs.structure}"
       },
@@ -33,8 +40,11 @@
       "tool": "qe",
       "params": {
         "calc": "nscf",
+        "_source_lock": "${inputs._source_lock}",
+        "_parameters_locked": "${inputs._parameters_locked}",
         "material": "${inputs.material}",
         "ecutwfc": "${inputs.ecutwfc}",
+        "ecutrho": "${inputs.ecutrho}",
         "nbnd": "${inputs.nbnd}",
         "nkpoints_bands": "${inputs.nkpoints_bands}",
         "structure": "${inputs.structure}"
@@ -49,6 +59,8 @@
       "tool": "qe",
       "params": {
         "calc": "bands",
+        "_source_lock": "${inputs._source_lock}",
+        "_parameters_locked": "${inputs._parameters_locked}",
         "material": "${inputs.material}",
         "nkpoints_bands": "${inputs.nkpoints_bands}",
         "scf_stdout": "${nodes.scf.outputs.stdout_file}",

@@ -1,0 +1,32 @@
+{
+  "template_id": "v0_vasp_scf",
+  "description": "VASP single-point SCF energy (second engine; requires DFT_FORGE_VASP_BIN + DFT_FORGE_VASP_PP_DIR)",
+  "inputs": {
+    "material": "Si",
+    "encut": null,
+    "kpoints": null,
+    "kspacing": null,
+    "structure": null
+  },
+  "outputs": {
+    "energy_ev": "${nodes.scf.outputs.energy_ev}",
+    "converged": "${nodes.scf.outputs.converged}",
+    "natoms": "${nodes.scf.outputs.natoms}"
+  },
+  "nodes": [
+    {
+      "id": "scf",
+      "tool": "vasp",
+      "params": {
+        "calc": "scf",
+        "material": "${inputs.material}",
+        "encut": "${inputs.encut}",
+        "kpoints": "${inputs.kpoints}",
+        "kspacing": "${inputs.kspacing}",
+        "structure": "${inputs.structure}"
+      },
+      "depends_on": [],
+      "max_repair_attempts": 2
+    }
+  ]
+}

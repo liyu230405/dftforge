@@ -1,0 +1,71 @@
+{
+  "template_id": "v2_vasp_dos",
+  "description": "VASP density of states: scf (writes CHGCAR) -> dos -> pdos (LORBIT=11 on a dense mesh)",
+  "inputs": {
+    "_parameters_locked": false,
+    "material": "Si",
+    "encut": null,
+    "kpoints": null,
+    "kspacing": null,
+    "nedos": 3000,
+    "structure": null
+  },
+  "outputs": {
+    "scf_energy_ev": "${nodes.scf.outputs.energy_ev}",
+    "dos_at_fermi": "${nodes.dos.outputs.dos_at_fermi}",
+    "pdos_elements": "${nodes.pdos.outputs.elements}"
+  },
+  "nodes": [
+    {
+      "id": "scf",
+      "tool": "vasp",
+      "params": {
+        "calc": "scf",
+        "_parameters_locked": "${inputs._parameters_locked}",
+        "material": "${inputs.material}",
+        "encut": "${inputs.encut}",
+        "kpoints": "${inputs.kpoints}",
+        "kspacing": "${inputs.kspacing}",
+        "structure": "${inputs.structure}"
+      },
+      "depends_on": [],
+      "max_repair_attempts": 2
+    },
+    {
+      "id": "dos",
+      "tool": "vasp",
+      "params": {
+        "calc": "dos",
+        "_parameters_locked": "${inputs._parameters_locked}",
+        "material": "${inputs.material}",
+        "encut": "${inputs.encut}",
+        "kpoints": "${inputs.kpoints}",
+        "kspacing": "${inputs.kspacing}",
+        "nedos": "${inputs.nedos}",
+        "structure": "${inputs.structure}"
+      },
+      "depends_on": [
+        "scf"
+      ],
+      "max_repair_attempts": 1
+    },
+    {
+      "id": "pdos",
+      "tool": "vasp",
+      "params": {
+        "calc": "pdos",
+        "_parameters_locked": "${inputs._parameters_locked}",
+        "material": "${inputs.material}",
+        "encut": "${inputs.encut}",
+        "kpoints": "${inputs.kpoints}",
+        "kspacing": "${inputs.kspacing}",
+        "nedos": "${inputs.nedos}",
+        "structure": "${inputs.structure}"
+      },
+      "depends_on": [
+        "scf"
+      ],
+      "max_repair_attempts": 1
+    }
+  ]
+}

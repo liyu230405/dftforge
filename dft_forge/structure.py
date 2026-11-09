@@ -37,6 +37,8 @@ try:
 except ImportError:  # pragma: no cover
     raise ImportError("ASE is required for dft_forge.structure. Install it first.")
 
+from dft_forge.constants import ANG_TO_BOHR, BOHR_TO_ANG, qe_label_to_element
+
 try:
     from pymatgen.core import Lattice, Structure
     from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
@@ -81,15 +83,15 @@ class ValidationReport:
             "metadata": self.metadata,
         }
         if self.atoms is not None:
-            d["lattice_constant_bohr"] = float(np.linalg.norm(self.atoms.cell[0]) * 1.8897261246)
-            d["cell_volume_bohr3"] = float(abs(np.linalg.det(self.atoms.cell)) * (1.8897261246 ** 3))
+            d["lattice_constant_bohr"] = float(np.linalg.norm(self.atoms.cell[0]) * ANG_TO_BOHR)
+            d["cell_volume_bohr3"] = float(abs(np.linalg.det(self.atoms.cell)) * (ANG_TO_BOHR ** 3))
         return d
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-_BOHR = 1.8897261246
-_ANGSTROM = 1.0 / _BOHR
+_BOHR = ANG_TO_BOHR  # historical (misnamed) alias: Å → bohr factor
+_ANGSTROM = BOHR_TO_ANG
 _VALID_ELEMENT_RE = re.compile(r"^[A-Z][a-z]?(?:\d+)?$")
 _ALLOWED_ELEMENTS = {
     "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne", "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar",
@@ -190,33 +192,71 @@ def _parse_xyz(source: Union[str, Path, str]) -> Atoms:
     return frames[-1]
 
 
+def _qe_element_from_label(label: str) -> str:
+    """Backwards-compatible wrapper for the shared element-label helper."""
+    return qe_label_to_element(label)
+
+
 def _parse_qe_input(text: str) -> Atoms:
-    """Parse a subset of QE input and return an Atoms object."""
+    """Parse a QE pw.x input fragment and return an ASE Atoms object.
+
+    Honours QE unit conventions for both cards:
+    - CELL_PARAMETERS (bohr|angstrom|alat[=X]); default is bohr
+    - ATOMIC_POSITIONS (alat|bohr|angstrom|crystal|crystal_sg|cartesian);
+      default is alat
+    alat is taken from celldm(1) (bohr) or A (Å) in &SYSTEM.
+    """
     cell_params_lines: List[str] = []
     atomic_positions_lines: List[str] = []
     atomic_species: List[Tuple[str, float, str]] = []
-    cell_bohr: Optional[np.ndarray] = None
-    positions_cartesian: Optional[np.ndarray] = None
-    positions_crystal: Optional[np.ndarray] = None
+    cell_vectors_ang: Optional[np.ndarray] = None
     symbols: List[str] = []
+    cart_ang: Optional[np.ndarray] = None
+    frac: Optional[np.ndarray] = None
 
     current_section: Optional[str] = None
+    cell_unit = "bohr"
+    pos_unit = "alat"
 
-    for line in text.splitlines():
+    # alat (in bohr) from &SYSTEM: celldm(1) wins over A (given in Å).
+    alat_bohr: Optional[float] = None
+
+    def _option(header: str) -> str:
+        if "(" not in header:
+            return ""
+        token = header.split("(", 1)[1].split(")", 1)[0].strip().lower()
+        return token
+
+    for raw_line in text.splitlines():
+        line = raw_line.split("!", 1)[0].split("#", 1)[0]
         stripped = line.strip()
-        if stripped.startswith("CELL_PARAMETERS"):
-            current_section = "cell"
+        upper = stripped.upper()
+        if stripped.startswith("&"):
+            current_section = "namelist"
             continue
-        if stripped.upper().startswith("ATOMIC_POSITIONS"):
-            current_section = "positions"
-            fmt = stripped.upper().split("(")[1].rstrip(")") if "(" in stripped else "crystal"
-            continue
-        if stripped.upper().startswith("ATOMIC_SPECIES"):
-            current_section = "species"
-            continue
-        if stripped.startswith("&") or stripped in {"/", ""}:
+        if current_section == "namelist":
             if stripped == "/":
                 current_section = None
+                continue
+            m_celldm = re.search(r"celldm\s*\(\s*1\s*\)\s*=\s*([-+0-9.eEdD]+)", stripped, re.I)
+            if m_celldm:
+                alat_bohr = float(m_celldm.group(1).replace("d", "e").replace("D", "E"))
+            m_a = re.search(r"(?<![A-Za-z0-9_])A\s*=\s*([-+0-9.eEdD]+)", stripped)
+            if m_a and alat_bohr is None:
+                alat_bohr = float(m_a.group(1).replace("d", "e").replace("D", "E")) / BOHR_TO_ANG
+            continue
+        if upper.startswith("CELL_PARAMETERS"):
+            current_section = "cell"
+            cell_unit = _option(upper) or "bohr"
+            continue
+        if upper.startswith("ATOMIC_POSITIONS"):
+            current_section = "positions"
+            pos_unit = _option(upper) or "alat"
+            continue
+        if upper.startswith("ATOMIC_SPECIES"):
+            current_section = "species"
+            continue
+        if stripped == "":
             continue
 
         if current_section == "cell":
@@ -228,45 +268,71 @@ def _parse_qe_input(text: str) -> Atoms:
             if len(parts) >= 3:
                 atomic_species.append((parts[0], float(parts[1]), parts[2]))
 
+    def _alat_bohr_required(where: str) -> float:
+        if alat_bohr is None:
+            raise ValueError(
+                f"{where} uses 'alat' units but neither celldm(1) nor A is given in &SYSTEM"
+            )
+        return alat_bohr
+
     if cell_params_lines:
-        arr = np.array([list(map(float, line.split()[:3])) for line in cell_params_lines[:3]])
-        cell_bohr = arr
+        arr = np.array([list(map(float, ln.split()[:3])) for ln in cell_params_lines[:3]])
+        unit = cell_unit.replace(" ", "")
+        if unit in ("bohr", ""):
+            cell_vectors_ang = arr * BOHR_TO_ANG
+        elif unit == "angstrom":
+            cell_vectors_ang = arr
+        elif unit == "alat":
+            cell_vectors_ang = arr * _alat_bohr_required("CELL_PARAMETERS") * BOHR_TO_ANG
+        elif unit.startswith("alat="):
+            # QE 7.5 treats CELL_PARAMETERS {alat=X} exactly like {alat}:
+            # vectors are in units of celldm(1) from &SYSTEM (the =X value
+            # is ignored); verified with real pw.x (alat=1.0 and alat=2.0
+            # produce the identical unit-cell volume).
+            cell_vectors_ang = arr * _alat_bohr_required("CELL_PARAMETERS") * BOHR_TO_ANG
+        else:
+            raise ValueError(f"unsupported CELL_PARAMETERS unit: {cell_unit!r}")
 
     if atomic_positions_lines:
-        symbols = []
         coords: List[List[float]] = []
         for line in atomic_positions_lines:
             parts = line.split()
             if len(parts) >= 4:
                 symbols.append(parts[0])
                 coords.append([float(x) for x in parts[1:4]])
-        positions_crystal = np.array(coords)
+        raw = np.array(coords)
+        unit = pos_unit.replace(" ", "")
+        if unit in ("crystal", "crystal_sg"):
+            frac = raw
+        elif unit in ("bohr",):
+            cart_ang = raw * BOHR_TO_ANG
+        elif unit == "angstrom":
+            cart_ang = raw
+        elif unit in ("alat", "cartesian", ""):
+            cart_ang = raw * _alat_bohr_required("ATOMIC_POSITIONS") * BOHR_TO_ANG
+        else:
+            raise ValueError(f"unsupported ATOMIC_POSITIONS unit: {pos_unit!r}")
 
-    if len(symbols) == 0:
+    if not symbols:
         raise ValueError("QE input fragment has no ATOMIC_POSITIONS")
-
-    if positions_crystal is not None and cell_bohr is not None:
-        positions_cartesian = positions_crystal @ cell_bohr
-
-    if cell_bohr is None:
+    if cell_vectors_ang is None:
         raise ValueError("QE input fragment missing CELL_PARAMETERS")
 
-    # Build mass map from ATOMIC_SPECIES if available; otherwise approximate.
-    mass_map: Dict[str, float] = {}
-    for elem, mass, _ in atomic_species:
-        mass_map[elem] = mass
+    # QE species labels may carry suffixes (FeA/Fe1 for AFM species); the
+    # Atoms object needs real element symbols.
+    normalized = [_qe_element_from_label(sym) for sym in symbols]
 
-    # Try to normalize symbols to periodic-table elements.
-    normalized: List[str] = []
-    for sym in symbols:
-        normalized.append(_normalize_element(sym))
-
-    atoms = Atoms(
-        normalized,
-        positions=positions_cartesian if positions_cartesian is not None else np.zeros((len(normalized), 3)),
-        cell=cell_bohr,
-        pbc=True,
-    )
+    if cart_ang is not None:
+        atoms = Atoms(normalized, positions=cart_ang, cell=cell_vectors_ang, pbc=True)
+    elif frac is not None:
+        atoms = Atoms(
+            normalized,
+            scaled_positions=frac,
+            cell=cell_vectors_ang,
+            pbc=True,
+        )
+    else:
+        atoms = Atoms(normalized, cell=cell_vectors_ang, pbc=True)
     return atoms
 
 
@@ -483,6 +549,19 @@ class StructureImporter:
         if not isinstance(atoms, Atoms) or len(atoms) == 0:
             report.errors.append("Parser returned an empty or invalid structure")
             return report
+
+        # QE is always 3D-periodic: a 2D slab is modelled as a 3D cell with
+        # vacuum (and k=1 along it). When a full-rank 3D cell is present but
+        # the reader flagged pbc=False on some axes (molecules/slabs from
+        # XYZ/explicit dicts), adopt the QE convention with a warning instead
+        # of rejecting; genuinely cell-less inputs still fail below.
+        if atoms.cell is not None and np.all(np.asarray(atoms.cell).shape == (3, 3)) \
+                and abs(float(np.linalg.det(atoms.cell))) > 1e-8 and not all(atoms.pbc):
+            atoms.pbc = True
+            report.warnings.append(
+                "输入结构存在非周期方向；按 QE 约定以 3D 周期胞处理（2D 体系请保留真空层，"
+                "非周期方向 k 点取 1）"
+            )
 
         # Physical sanity BEFORE normalization: two atoms on top of each
         # other make spglib/pymatgen fail with a misleading "Invalid cell

@@ -6,6 +6,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 WHITE, GRAY, BLACK = 0, 1, 2
@@ -16,6 +17,8 @@ PARAM_REF_RE = re.compile(
     r"^\$\{(inputs|nodes)\.([A-Za-z0-9_]+)(?:\.outputs\.([A-Za-z0-9_]+))?\}$"
 )
 NODE_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
+TEMPLATE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+TEMPLATE_SUFFIXES = (".json", ".yaml", ".yml")
 
 
 def _iter_param_strings(value: Any):
@@ -228,3 +231,52 @@ def load_template(path: Path) -> GraphTemplate:
     else:
         data = json.loads(text)
     return GraphTemplate.from_dict(data)
+
+
+def load_named_template(templates_dir: Path, template_id: str) -> GraphTemplate:
+    """Load a named template without allowing path traversal or symlink escape.
+
+    ``load_template`` remains a low-level path loader for trusted callers.  Any
+    user-controlled template name must come through this resolver so the file
+    is selected only from the templates directory and its embedded identity is
+    checked against the requested name.
+    """
+    if not isinstance(template_id, str) or not TEMPLATE_ID_RE.fullmatch(template_id):
+        raise ValueError(f"unsafe template id: {template_id!r}")
+
+    root = Path(templates_dir)
+    try:
+        root = root.resolve(strict=True)
+    except OSError as exc:
+        raise FileNotFoundError(f"templates directory does not exist: {templates_dir}") from exc
+    if not root.is_dir():
+        raise ValueError(f"templates path is not a directory: {templates_dir}")
+
+    candidate = None
+    for suffix in TEMPLATE_SUFFIXES:
+        path = root / f"{template_id}{suffix}"
+        if not path.exists():
+            continue
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(f"template path is not resolvable: {path}") from exc
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"template path escapes templates directory: {path}") from exc
+        if not resolved.is_file():
+            raise ValueError(f"template path is not a file: {path}")
+        candidate = resolved
+        break
+
+    if candidate is None:
+        raise FileNotFoundError(f"template not found: {template_id}")
+
+    template = load_template(candidate)
+    if template.template_id != template_id:
+        raise ValueError(
+            f"template id mismatch: requested '{template_id}', "
+            f"file declares '{template.template_id}'"
+        )
+    return template

@@ -42,3 +42,5 @@ graphene_N_bands/
 CRASH
 *.in.tmp
 input_tmp.in
+nacl_calc/
+si_bands_calc/

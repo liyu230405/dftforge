@@ -2,10 +2,20 @@
   "template_id": "t0_scf",
   "description": "Single-point SCF energy (building block for E_ads / formation energy workflows)",
   "inputs": {
+    "_parameters_locked": false,
+    "_source_lock": null,
     "material": "Si",
     "ecutwfc": null,
+    "ecutrho": null,
+    "nbnd": null,
     "kpoints": null,
-    "structure": null
+    "structure": null,
+    "spin_polarized": null,
+    "magnetic_order": null,
+    "magnetic_element": null,
+    "initial_moment_muB": null,
+    "total_magnetization_muB": null,
+    "occupations": null
   },
   "outputs": {
     "scf_energy_ry": "${nodes.scf.outputs.energy_ry}",
@@ -16,11 +26,21 @@
       "id": "scf",
       "tool": "qe",
       "params": {
+        "_parameters_locked": "${inputs._parameters_locked}",
+        "_source_lock": "${inputs._source_lock}",
         "calc": "scf",
         "material": "${inputs.material}",
         "ecutwfc": "${inputs.ecutwfc}",
+        "ecutrho": "${inputs.ecutrho}",
+        "nbnd": "${inputs.nbnd}",
         "kpoints": "${inputs.kpoints}",
-        "structure": "${inputs.structure}"
+        "structure": "${inputs.structure}",
+        "spin_polarized": "${inputs.spin_polarized}",
+        "magnetic_order": "${inputs.magnetic_order}",
+        "magnetic_element": "${inputs.magnetic_element}",
+        "initial_moment_muB": "${inputs.initial_moment_muB}",
+        "total_magnetization_muB": "${inputs.total_magnetization_muB}",
+        "occupations": "${inputs.occupations}"
       },
       "depends_on": [],
       "max_repair_attempts": 2

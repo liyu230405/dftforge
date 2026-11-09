@@ -120,6 +120,40 @@ End final coordinates
         assert result.n_bands == 12
 
 
+class TestParseMagnetization:
+    def test_legacy_atom_magnetization_format(self):
+        stdout = """
+     atom:    1    charge:  7.0    magnetization:  2.10
+     atom:    2    charge:  7.0    magnetization: -2.10
+     total magnetization       =     0.0000 Bohr mag/cell
+     absolute magnetization    =     4.2000 Bohr mag/cell
+"""
+        result = QEParser.parse_magnetization(stdout)
+        assert result.total_magnetization_muB == pytest.approx(0.0)
+        assert result.absolute_magnetization_muB == pytest.approx(4.2)
+        assert result.atom_magnetizations_muB == pytest.approx([2.1, -2.1])
+
+    def test_qe75_uses_last_complete_per_site_block(self):
+        stdout = """
+     number of atoms/cell      =  3
+     Magnetic moment per site  (integrated on atomic sphere of radius R)
+     atom   1 (R=0.357)  charge= 14.5422  magn=  1.1000
+     atom   2 (R=0.357)  charge= 14.5422  magn= -1.1000
+     atom   3 (R=0.357)  charge= 14.5422  magn=  0.0000
+
+     Magnetic moment per site  (integrated on atomic sphere of radius R)
+     atom   1 (R=0.357)  charge= 14.5422  magn=  2.7720
+     atom   2 (R=0.357)  charge= 14.5422  magn= -2.7719
+     atom   3 (R=0.357)  charge= 14.5422  magn= -0.0001
+
+     Magnetic moment per site  (truncated output)
+     atom   1 (R=0.357)  charge= 14.5422  magn=  9.0000
+     atom   2 (R=0.357)  charge= 14.5422  magn= -9.0000
+"""
+        result = QEParser.parse_magnetization(stdout)
+        assert result.atom_magnetizations_muB == pytest.approx([2.7720, -2.7719, -0.0001])
+
+
 class TestParseDOSUnits:
     """dos.x/pdos outputs are in eV — the old ×13.6 inflation bug."""
 
@@ -191,6 +225,40 @@ class TestParseXMLEnergy:
         )
         r = QEParser.parse_xml(xml)
         assert r["total_energy_ry"] == pytest.approx(-2.0)
+
+    def test_qe_xml_cell_vectors_are_absolute_bohr_not_alat_scaled(self, tmp_path):
+        xml = self._write(
+            tmp_path,
+            '<atomic_structure nat="2" alat="4.0" bravais_index="0">'
+            '<cell><a1>4.0 0.0 0.0</a1><a2>0.0 5.0 0.0</a2>'
+            '<a3>0.0 0.0 6.0</a3></cell></atomic_structure>',
+        )
+
+        result = QEParser.parse_xml(xml)
+
+        assert result["cell"].a_bohr == pytest.approx(4.0)
+        assert result["cell"].b_bohr == pytest.approx(5.0)
+        assert result["cell"].c_bohr == pytest.approx(6.0)
+        assert result["cell"].volume_bohr3 == pytest.approx(120.0)
+
+    def test_fixed_cell_structure_preserves_nonperiodic_axes(self):
+        stdout = """
+Begin final coordinates
+ATOMIC_POSITIONS (crystal)
+C 0.0 0.0 0.5
+C 0.5 0.5 0.5
+End final coordinates
+"""
+
+        atoms = QEParser.extract_final_structure(
+            stdout,
+            fixed_cell=np.diag([2.5, 2.5, 12.0]),
+            pbc=[True, True, False],
+        )
+
+        assert atoms is not None
+        assert atoms.pbc.tolist() == [True, True, False]
+        assert atoms.cell.lengths() == pytest.approx([2.5, 2.5, 12.0])
     
     def test_energy_per_atom(self):
         stdout = """
@@ -205,3 +273,66 @@ class TestParseXMLEnergy:
         assert result.final_energy_ev_per_atom == pytest.approx(
             -31.35832936 * 13.605693122994 / 4, rel=1e-6
         )
+
+
+# ── Bands XML Fermi / gap semantics ──────────────────────────────────────────
+
+
+def _bands_xml(tmp_path, *, fermi_ha=None, degauss_ha=None, evals_per_k=((-0.4, -0.3), (-0.1, 0.2))):
+    smearing = (
+        f'<qes:smearing degauss="{degauss_ha}">mv</qes:smearing>' if degauss_ha is not None else ""
+    )
+    fermi = f"<qes:fermi_energy>{fermi_ha}</qes:fermi_energy>" if fermi_ha is not None else ""
+    ks = "".join(
+        "<qes:ks_energies><qes:eigenvalues>" + " ".join(str(v) for v in evals) + "</qes:eigenvalues></qes:ks_energies>"
+        for evals in evals_per_k
+    )
+    p = tmp_path / "bands.xml"
+    p.write_text(
+        '<?xml version="1.0"?><qes:espresso xmlns:qes="http://www.quantum-espresso.org/ns/qes/qes-1.0">'
+        f'<qes:output><qes:band_structure nks="2" nbnd="2">{ks}{smearing}</qes:band_structure>'
+        f"{fermi}</qes:output></qes:espresso>"
+    )
+    return p
+
+
+class TestParseBandsFermi:
+    def test_missing_fermi_leaves_gap_unknown(self, tmp_path):
+        # Regression: parser used to set fermi = max(eigenvalue)/2, which
+        # produced plausible-looking but fabricated VBM/CBM/gap numbers.
+        xml = _bands_xml(tmp_path, fermi_ha=None, evals_per_k=((-0.4, 0.3), (-0.2, 0.4)))
+        r = QEParser.parse_bands(xml)
+        assert r.fermi_energy_ev is None
+        assert r.band_gap_ev is None
+        assert r.gap_known is False
+
+    def test_smearing_floor_from_xml(self, tmp_path):
+        from dft_forge.parser import HA_TO_EV
+
+        # fermi at 0.0 Ha; occupied up to -0.002 Ha, cbm at +0.003 Ha
+        xml = _bands_xml(
+            tmp_path,
+            fermi_ha=0.0,
+            degauss_ha=0.005,  # floor = 2*0.005*27.21 ≈ 0.272 eV
+            evals_per_k=((-0.01, 0.003), (-0.002, 0.004)),
+        )
+        r = QEParser.parse_bands(xml)
+        assert r.smearing_resolution_ev == pytest.approx(2 * 0.005 * HA_TO_EV)
+        # path gap = 0.005 Ha ≈ 0.136 eV < 0.272 → effectively metallic
+        assert r.band_gap_ev == pytest.approx(0.005 * HA_TO_EV)
+        assert r.is_metal is True
+        assert r.gap_known is True
+
+    def test_un_smeared_gap_is_semiconductor(self, tmp_path):
+        # No smearing element: any positive path gap is reported as a gap.
+        # fermi 0; vbm = -0.2 Ha, cbm = +0.05 Ha → gap 0.25 Ha.
+        xml = _bands_xml(
+            tmp_path,
+            fermi_ha=0.0,
+            degauss_ha=None,
+            evals_per_k=((-0.3, 0.05), (-0.2, 0.05)),
+        )
+        r = QEParser.parse_bands(xml)
+        assert r.smearing_resolution_ev is None
+        assert r.band_gap_ev == pytest.approx(0.25 * 27.211386245988)
+        assert r.is_metal is False

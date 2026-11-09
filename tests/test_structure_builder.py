@@ -114,9 +114,60 @@ class TestModifications:
             assert len(r.atoms) == 9
             assert r.to_dict()["min_distance"] > MIN_DISTANCE_ANGSTROM
 
+    def test_adsorbate_height_and_site_index_are_recorded(self):
+        r = build_2d(
+            "graphene",
+            supercell="2x2",
+            adsorbate={"element": "O", "site": "top", "height": 2.25, "site_index": 1},
+        )
+        data = r.to_dict()
+        selected = data["selected_site"]
+        assert selected["height"] == pytest.approx(2.25)
+        assert selected["requested_site_index"] == 1
+        assert selected["anchor_index"] == 1
+        assert selected["site_id"] == "top:anchor-1:C"
+        assert r.atoms.positions[-1, 2] - r.atoms.positions[1, 2] == pytest.approx(2.25)
+
+    def test_hbn_top_sites_expose_distinct_anchor_metadata(self):
+        b_top = build_2d(
+            "bn", adsorbate={"element": "O", "site": "top", "site_index": 0}
+        ).to_dict()["selected_site"]
+        n_top = build_2d(
+            "bn", adsorbate={"element": "O", "site": "top", "site_index": 1}
+        ).to_dict()["selected_site"]
+        assert (b_top["anchor_element"], n_top["anchor_element"]) == ("B", "N")
+        assert b_top["site_id"] != n_top["site_id"]
+        assert b_top["anchor_position"] != n_top["anchor_position"]
+
     def test_bad_site_raises(self):
         with pytest.raises(StructureBuildError):
             build_2d("graphene", adsorbate={"element": "O", "site": "fcc4"})
+
+    def test_tool_wrapper_passes_nested_adsorbate_options(self, tmp_path):
+        from dft_forge.tools.definitions import _structure_build2d
+
+        payload = _structure_build2d(
+            {
+                "kind": "bn",
+                "adsorb": {"element": "O", "site": "top", "height": 2.1, "site_index": 1},
+                "output": str(tmp_path / "n_top.cif"),
+            }
+        )
+        assert payload["returncode"] == 0
+        selected = payload["json"]["selected_site"]
+        assert selected["height"] == pytest.approx(2.1)
+        assert selected["anchor_element"] == "N"
+        assert selected["requested_site_index"] == 1
+
+    def test_build2d_schema_accepts_site_index(self):
+        from dft_forge.tools.definitions import register_default_tools
+        from dft_forge.tools.registry import registry
+
+        register_default_tools()
+        schema = registry.get("structure.build2d").input_schema
+        site_index = schema["properties"]["adsorb"]["properties"]["site_index"]
+        assert site_index["type"] == "integer"
+        assert site_index["minimum"] == 0
 
 
 class TestSiteGeometry:

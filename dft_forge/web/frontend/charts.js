@@ -1,16 +1,40 @@
 const NS = "http://www.w3.org/2000/svg";
 const INK = "#1F1B16", INK3 = "#8A8175", HAIR = "#DDD6C8", BLUE = "#22527A", RED = "#A03D2E";
 
-export function renderCharts(container, chart) {
+export function renderCharts(container, chart, provenance = chart?.provenance) {
   container.innerHTML = "";
   if (!chart) {
     container.innerHTML = '<div class="fig-empty">完成一次计算后，能带、态密度与关键数值出现在这里</div>';
     return;
   }
+  renderProvenance(container, provenance || {});
   if (chart.metrics) renderMetrics(container, chart.metrics);
+  if (chart.convergence) renderConvergence(container, chart.convergence);
+  if (chart.chemical_potential) renderChemicalPotential(container, chart.chemical_potential);
   if (chart.bands) renderBands(container, chart.bands);
   if (chart.dos) renderDos(container, chart.dos);
   if (chart.pdos) renderPdos(container, chart.pdos);
+}
+
+function renderProvenance(container, provenance) {
+  const bar = document.createElement("div");
+  bar.className = "chart-provenance";
+  const simulated = provenance.contains_simulated === true;
+  let label = "来源未记录";
+  if (provenance.execution_class === "unknown" && simulated) {
+    label = "来源不完整 · 含模拟尝试 · 非科研结论";
+  } else if (provenance.execution_class === "simulated" || provenance.execution_class === "mixed" || simulated) {
+    label = "模拟数据 · 非科研结论";
+  } else if (provenance.execution_class === "compute") {
+    const backend = provenance.backend === "ssh" ? "远程" : provenance.backend === "local" ? "本地" : "计算";
+    label = `${backend}计算输出 · 未经独立科研验证`;
+  } else if (provenance.source_kind === "parsed") {
+    label = "解析已有文件 · 原始执行来源未记录";
+  } else if (provenance.source_kind === "user_input") {
+    label = "基于用户输入的确定性推导";
+  }
+  bar.textContent = label;
+  container.appendChild(bar);
 }
 
 function renderMetrics(container, metrics) {
@@ -30,6 +54,83 @@ function renderMetrics(container, metrics) {
 
 function fmt(v) {
   return typeof v === "number" ? (Math.abs(v) >= 1000 ? v.toFixed(1) : v.toPrecision(6)) : v;
+}
+
+function renderConvergence(container, curve) {
+  const points = (curve.points || [])
+    .filter(p => Number.isFinite(p.cost_proxy) && Number.isFinite(p.delta_mev_per_atom))
+    .sort((a, b) => a.cost_proxy - b.cost_proxy);
+  if (!points.length) return;
+  const W = 340, H = 220, ML = 44, MR = 10, MT = 16, MB = 34;
+  const minX = Math.min(...points.map(p => p.cost_proxy));
+  const maxX = Math.max(...points.map(p => p.cost_proxy));
+  const maxY = Math.max(curve.threshold_mev_per_atom || 0, ...points.map(p => p.delta_mev_per_atom), 1) * 1.12;
+  const x = v => ML + ((v - minX) / Math.max(maxX - minX, 1)) * (W - ML - MR);
+  const y = v => MT + (1 - v / maxY) * (H - MT - MB);
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "参数收敛误差曲线" });
+  svg.append(el("line", { x1: ML, y1: H - MB, x2: W - MR, y2: H - MB, stroke: INK, "stroke-width": 1 }));
+  svg.append(el("line", { x1: ML, y1: MT, x2: ML, y2: H - MB, stroke: INK, "stroke-width": 1 }));
+  const threshold = Number(curve.threshold_mev_per_atom);
+  if (Number.isFinite(threshold)) {
+    svg.append(el("line", { x1: ML, y1: y(threshold), x2: W - MR, y2: y(threshold), stroke: RED, "stroke-width": 1, "stroke-dasharray": "4 3" }));
+  }
+  svg.append(el("polyline", { points: points.map(p => `${x(p.cost_proxy).toFixed(1)},${y(p.delta_mev_per_atom).toFixed(1)}`).join(" "), fill: "none", stroke: BLUE, "stroke-width": 1.5 }));
+  for (const p of points) {
+    const circle = el("circle", { cx: x(p.cost_proxy), cy: y(p.delta_mev_per_atom), r: 3, fill: p.delta_mev_per_atom <= threshold ? BLUE : RED });
+    const title = el("title", {});
+    title.textContent = `ecut=${p.ecutwfc} Ry, k=${(p.kpoints || []).slice(0, 3).join("×")}, 误差=${p.delta_mev_per_atom.toPrecision(4)} meV/atom`;
+    circle.append(title);
+    svg.append(circle);
+  }
+  const head = document.createElement("div");
+  head.className = "chart-block";
+  head.innerHTML = `<h3>参数收敛曲线</h3><div class="chart-note">成本代理（横轴） vs 参考点误差（纵轴，meV/atom） · 红虚线阈值 ${Number.isFinite(threshold) ? threshold : "—"}</div>`;
+  head.appendChild(svg);
+  container.appendChild(head);
+}
+
+function renderChemicalPotential(container, domain) {
+  const elements = domain.elements || [];
+  const svg = el("svg", { viewBox: "0 0 340 190", role: "img", "aria-label": "化学势稳定域相图" });
+  const head = document.createElement("div");
+  head.className = "chart-block";
+  const status = domain.status === "complete" ? "竞争相约束已提供" : "竞争相集合不完整：仅作部分稳定域";
+  if (domain.dimension === 1) {
+    const elName = elements[0] || "μ";
+    const range = (domain.interval || {})[elName] || [0, 0];
+    const lo = Number(range[0]), hi = Number(range[1]);
+    const x = v => 36 + ((v - lo) / Math.max(hi - lo, 1e-12)) * 268;
+    svg.append(el("line", { x1: 36, y1: 92, x2: 304, y2: 92, stroke: HAIR, "stroke-width": 8, "stroke-linecap": "round" }));
+    svg.append(el("line", { x1: x(lo), y1: 92, x2: x(hi), y2: 92, stroke: BLUE, "stroke-width": 8, "stroke-linecap": "round" }));
+    for (const [value, label] of [[lo, "贫元素端"], [hi, "富元素端"]]) {
+      const xt = x(value);
+      svg.append(el("circle", { cx: xt, cy: 92, r: 4, fill: BLUE }));
+      const t = el("text", { x: xt, y: 72, "text-anchor": "middle", "font-size": 10, fill: INK3, "font-family": "Spline Sans Mono, monospace" });
+      t.textContent = `${label} ${value.toPrecision(4)}`;
+      svg.append(t);
+    }
+    const axis = el("text", { x: 170, y: 125, "text-anchor": "middle", "font-size": 12, fill: INK });
+    axis.textContent = `Δμ${elName} (eV)`;
+    svg.append(axis);
+    head.innerHTML = `<h3>化学势稳定区间</h3><div class="chart-note">${status}</div>`;
+  } else {
+    const points = (domain.vertices || []).map(v => [Number(v[`delta_mu_${elements[0]}_ev`]), Number(v[`delta_mu_${elements[1]}_ev`])]).filter(p => p.every(Number.isFinite));
+    if (!points.length) return;
+    const xs = points.map(p => p[0]), ys = points.map(p => p[1]);
+    const xlo = Math.min(...xs), xhi = Math.max(...xs), ylo = Math.min(...ys), yhi = Math.max(...ys);
+    const x = v => 42 + ((v - xlo) / Math.max(xhi - xlo, 1e-12)) * 250;
+    const y = v => 154 - ((v - ylo) / Math.max(yhi - ylo, 1e-12)) * 118;
+    svg.append(el("polygon", { points: points.map(p => `${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`).join(" "), fill: "#22527A22", stroke: BLUE, "stroke-width": 1.5 }));
+    const xlabel = el("text", { x: 170, y: 184, "text-anchor": "middle", "font-size": 11, fill: INK });
+    xlabel.textContent = `Δμ${elements[0] || "1"} (eV)`;
+    svg.append(xlabel);
+    const ylabel = el("text", { x: 12, y: 95, "text-anchor": "middle", "font-size": 11, fill: INK, transform: "rotate(-90 12 95)" });
+    ylabel.textContent = `Δμ${elements[1] || "2"} (eV)`;
+    svg.append(ylabel);
+    head.innerHTML = `<h3>化学势可行域</h3><div class="chart-note">${status} · ${points.length} 个顶点</div>`;
+  }
+  head.appendChild(svg);
+  container.appendChild(head);
 }
 
 function renderBands(container, bands) {

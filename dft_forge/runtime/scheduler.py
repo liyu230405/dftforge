@@ -157,7 +157,9 @@ class GraphScheduler:
                     self._cancel(run, futures)
                     return run
 
-                process_blocked(run, template)
+                blocked = process_blocked(run, template)
+                for node_id in blocked:
+                    self.store.save_node_run(run, run.nodes[node_id])
 
                 ready = find_ready_nodes(run, template)
                 slots = self.max_concurrency - len(futures)
@@ -208,10 +210,12 @@ class GraphScheduler:
         pending: Dict[asyncio.Task, str] = {}
         while True:
             if self.cancel_event.is_set():
-                self._cancel_async(run, pending)
+                await self._cancel_async(run, pending)
                 return run
 
-            process_blocked(run, template)
+            blocked = process_blocked(run, template)
+            for node_id in blocked:
+                self.store.save_node_run(run, run.nodes[node_id])
 
             ready = find_ready_nodes(run, template)
             slots = self.max_concurrency - len(pending)
@@ -221,11 +225,21 @@ class GraphScheduler:
                 pending[asyncio.create_task(self._execute_tool_async(spec, node, ctx))] = node_id
 
             if pending:
-                done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(
+                    pending,
+                    timeout=self.poll_interval,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
                 for task in done:
+                    # Cancellation before scheduler commit discards the
+                    # result, even when the worker task has already finished.
+                    if self.cancel_event.is_set():
+                        await self._cancel_async(run, pending)
+                        return run
                     node_id = pending.pop(task)
                     self._finish(run, template, node_id, task.result, notify)
-            elif not find_ready_nodes(run, template):
+
+            if not pending and not find_ready_nodes(run, template):
                 states = [n.state for n in run.nodes.values()]
                 if all(s in TERMINAL_NODE_STATES for s in states):
                     run.state = determine_run_status(states)
@@ -301,9 +315,7 @@ class GraphScheduler:
     async def _execute_tool_async(self, spec: NodeSpec, node: NodeRun, ctx: ExecutionContext) -> Dict[str, Any]:
         return await asyncio.to_thread(self._execute_tool, spec, node, ctx)
 
-    def _cancel_async(self, run: GraphRun, pending: Dict[asyncio.Task, str]) -> None:
-        for task in pending:
-            task.cancel()
+    async def _cancel_async(self, run: GraphRun, pending: Dict[asyncio.Task, str]) -> None:
         for node_id in pending.values():
             node = run.nodes[node_id]
             if node.state == NodeState.RUNNING:
@@ -311,6 +323,11 @@ class GraphScheduler:
                 self.store.save_node_run(run, node)
         if self.on_cancel:
             self._safe_on_cancel()
+        # Do not cancel the asyncio wrapper: asyncio.to_thread cancellation
+        # does not stop the underlying worker.  Waiting here consumes results
+        # and lets executor hooks terminate the actual process cleanly.
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         run.state = RunState.PAUSED
         self.store.save_run(run)
 

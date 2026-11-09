@@ -1,5 +1,6 @@
 """End-to-end tests: templates + QECalcTool through the graph runtime."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,7 @@ from dft_forge.runtime.states import NodeState, RunState
 from dft_forge.runtime.graph import load_template
 
 TEMPLATES_DIR = Path(__file__).resolve().parents[1] / "templates"
-QE_BIN = Path("/Users/liyu/Documents/Codex/2026-07-29/bang-w/work/qe-7.5/bin")
+QE_BIN = Path(os.environ.get("DFT_FORGE_QE_BIN", "/nonexistent-qe-bin"))
 HAS_QE = QE_BIN.is_dir()
 
 
@@ -85,6 +86,31 @@ class TestTimeoutRepair:
         node = NodeRun(node_id="scf", params={"ecutwfc": 45.0})
         assert repairer.repair(node, err) is True
         assert node.params["ecutwfc"] == 55.0
+
+    def test_charge_error_is_not_misrepaired_as_a_cutoff_problem(self):
+        repairer = QEParamRepairer()
+        err = ToolError(
+            "pw.x failed: electrons: charge is wrong",
+            category="execution",
+            repairable=True,
+        )
+        node = NodeRun(node_id="relax", params={"ecutwfc": 30.0, "ecutrho": 240.0})
+
+        assert repairer.repair(node, err) is False
+        assert node.params == {"ecutwfc": 30.0, "ecutrho": 240.0}
+        assert "occupation inconsistency" in (node.error or "")
+
+    def test_qe_error_snippet_accepts_separator_after_message(self):
+        from types import SimpleNamespace
+
+        result = SimpleNamespace(stdout="""
+ %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+     Error in routine electrons (1):
+     charge is wrong
+ %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+""")
+
+        assert QECalcTool._qe_error_snippet(result) == "electrons: charge is wrong"
 
 
 class TestQECalcToolErrors:

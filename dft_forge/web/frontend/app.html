@@ -61,10 +61,15 @@
             <select id="runMode"><option value="research">科研</option><option value="demo">演示</option></select>
           </label>
           <label class="run-select">精度
-            <select id="runAccuracy"><option value="balanced">均衡</option><option value="quick">快速</option><option value="precise">精细</option><option value="custom">自定义</option></select>
+            <select id="runAccuracy"><option value="balanced">智能推荐</option><option value="quick">快速</option><option value="precise">精细</option><option value="custom">自定义</option></select>
           </label>
           <button class="run-chip method-open" id="openMethod" type="button">方法参数</button>
           <span class="run-context" id="runContext">等待结构与任务</span>
+        </div>
+        <div class="mobile-panel-bar" id="mobilePanelBar" aria-label="结果面板">
+          <button type="button" data-mobile-panel="observe">观察</button>
+          <button type="button" data-mobile-panel="files">文件</button>
+          <button type="button" data-mobile-panel="evidence">证据</button>
         </div>
         <section class="dialogue" id="chat" aria-live="polite"></section>
         <form class="composer" id="form">
@@ -80,6 +85,7 @@
           <button class="panel-tab active" data-panel="observe" type="button">观察</button>
           <button class="panel-tab" data-panel="files" type="button">文件</button>
           <button class="panel-tab" data-panel="evidence" type="button">证据</button>
+          <button class="btn-fold mobile-close" id="closeMobilePanel" type="button" title="关闭结果面板">×</button>
           <button class="btn-fold" id="foldRight" type="button" title="折叠图表栏">⟩</button>
         </div>
         <section class="side-panel active" id="panelObserve">
@@ -100,7 +106,7 @@
         </div>
         </section>
         <section class="side-panel" id="panelFiles">
-          <div class="panel-toolbar"><span>会话产物</span><button id="refreshArtifacts" type="button">刷新</button></div>
+          <div class="panel-toolbar"><span>会话产物</span><span><button id="refreshArtifacts" type="button">刷新</button><button id="retryWorkspace" type="button">重试</button></span></div>
           <div class="artifact-list" id="artifactList"><div class="fig-empty">当前会话还没有文件</div></div>
         </section>
         <section class="side-panel" id="panelEvidence">
@@ -108,16 +114,20 @@
             <span class="eyebrow">REPRODUCIBILITY</span>
             <h3>可复现记录</h3>
             <p>汇总模型、计算后端、方法参数、工具调用、图运行与文件哈希。</p>
-            <button id="exportEvidence" type="button">导出记录 JSON</button>
+            <button id="exportEvidence" type="button" title="导出整会话记录，含请求文本与工具调用；分享前请检查">导出整会话记录 JSON</button>
           </div>
           <div class="run-list" id="runList"><div class="fig-empty">当前会话还没有图任务</div></div>
+          <div class="run-detail" id="runDetail" hidden></div>
           <div class="run-actions">
-            <button id="retryRun" type="button">重试失败节点</button>
-            <button id="resumeRun" type="button">恢复暂停任务</button>
+            <button id="exportRunEvidence" type="button" disabled title="导出当前任务的运行记录，不是科研有效性证明">导出此任务证据</button>
+            <button id="retryRun" type="button" disabled>重试失败节点</button>
+            <button id="resumeRun" type="button" disabled>恢复暂停任务</button>
+            <button id="stopRun" type="button" disabled>停止运行</button>
           </div>
         </section>
       </aside>
     </div>
+    <div class="workspace-notice" id="workspaceNotice" role="status" aria-live="polite" hidden></div>
   </div>
 
   <dialog id="settingsDlg" class="settings-dlg connection-dlg">
@@ -155,16 +165,21 @@
 
   <dialog id="methodDlg" class="settings-dlg method-dlg">
     <form method="dialog">
-      <div class="dialog-title"><div><span class="eyebrow">RUN REVIEW</span><h3>确认计算方法</h3></div><button type="button" class="dialog-x" id="methodClose">×</button></div>
+      <div class="dialog-title"><div><span class="eyebrow">METHOD SETTINGS</span><h3>计算方法设置</h3></div><button type="button" class="dialog-x" id="methodClose">×</button></div>
+      <p class="method-intro">发送任务后，系统结合计算目标、实际结构与赝势生成初始参数推荐。科研计算会先展示具体参数和推荐依据，确认后运行。</p>
       <div class="method-summary" id="methodSummary"></div>
+      <label class="cfg-field">精度策略<select id="methodAccuracy"><option value="balanced">智能推荐</option><option value="quick">快速</option><option value="precise">精细</option><option value="custom">自定义（留空自动推荐）</option></select></label>
       <div class="custom-method" id="customMethod" hidden>
-        <label class="cfg-field">ecutwfc (Ry)<input id="methodEcut" type="number" min="1" /></label>
-        <label class="cfg-field">k 点网格<input id="methodKpoints" placeholder="6,6,6" /></label>
-        <label class="cfg-field">空能带数 nbnd<input id="methodNbnd" type="number" min="1" /></label>
-        <label class="cfg-field">能带路径点数<input id="methodBandPoints" type="number" min="10" /></label>
+        <label class="cfg-field">ecutwfc (Ry)<input id="methodEcut" type="number" min="1" placeholder="自动推荐" /></label>
+        <label class="cfg-field">ecutrho (Ry)<input id="methodEcutrho" type="number" min="1" placeholder="按赝势与截断能自动推荐" /></label>
+        <label class="cfg-field">k 点网格<input id="methodKpoints" placeholder="自动推荐，例如 6,6,6" /></label>
+        <label class="cfg-field">能带总数 nbnd（占据 + 空带）<input id="methodNbnd" type="number" min="1" placeholder="自动推荐" /></label>
+        <label class="cfg-field">能带路径点数<input id="methodBandPoints" type="number" min="10" placeholder="自动推荐" /></label>
       </div>
-      <div class="method-warning">科研模式下，确认意味着你已检查结构、伪势适用性和收敛参数。DFT-Forge 会保留本次选择。</div>
-      <div class="cfg-actions"><button type="button" class="cfg-btn ghost" id="methodCancel">取消</button><button type="button" class="cfg-btn" id="methodConfirm">确认并运行</button></div>
+      <label class="method-check"><input id="methodConverge" type="checkbox" /><span>先做截断能与 k 点收敛扫描</span></label>
+      <p class="method-intro">收敛扫描会增加计算量，具体范围和任务数将在确认卡展示。判据为总能变化，不代表带隙或其他物性已收敛。</p>
+      <div class="method-warning">保存仅设置下一次任务的偏好；初始推荐不等于已通过收敛测试。已有确认卡仍使用生成时的设置，修改后请重新发送任务。</div>
+      <div class="cfg-actions"><button type="button" class="cfg-btn ghost" id="methodCancel">取消</button><button type="button" class="cfg-btn" id="methodConfirm">保存设置</button></div>
     </form>
   </dialog>
   <script type="module" src="/frontend/app.js?v=10"></script>

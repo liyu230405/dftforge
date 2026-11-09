@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from dft_forge.agent_loop.helpers import extract_formula
+from dft_forge.agent_loop.helpers import _ELEMENTS, extract_formula
 
 
 @dataclass
@@ -25,6 +25,9 @@ class IntentSignals:
     dopant_el: Optional[str] = None
     ads_el: Optional[str] = None
     ads_site: Optional[str] = None
+    ads_sites: List[str] = field(default_factory=list)
+    vacancy_el: Optional[str] = None
+    vacancy_charges: List[int] = field(default_factory=list)
 
     wants_analyze: bool = False
     wants_import: bool = False
@@ -39,6 +42,11 @@ class IntentSignals:
     wants_compare: bool = False
     wants_eads: bool = False
     wants_formation: bool = False
+    wants_vacancy: bool = False
+    wants_phonon: bool = False
+    wants_magnetism: bool = False
+    wants_convergence: bool = False
+    wants_chemical_potential: bool = False
     wants_2d: bool = False
     strong_analyze: bool = False
 
@@ -92,6 +100,11 @@ _INTENT_KEYWORDS: Dict[str, tuple] = {
     "wants_compare": ("对比", "比较", "区别", "差异", "差距", "compare", " vs ", "vs.", "哪个更"),
     "wants_eads": ("吸附能", "adsorption energy", "eads", "e_ads"),
     "wants_formation": ("形成能", "formation energy", "formation enthalpy", "生成能"),
+    "wants_vacancy": ("空位", "vacancy", "缺陷"),
+    "wants_phonon": ("声子", "phonon", "dfpt", "虚频", "dynamical stability"),
+    "wants_magnetism": ("磁性", "磁矩", "铁磁", "反铁磁", "ferromagnetic", "antiferromagnetic", "spin-polarized"),
+    "wants_convergence": ("收敛测试", "收敛扫描", "收敛性", "convergence test", "convergence study", "convergence scan", "ecutwfc", "截断能", "k 点收敛"),
+    "wants_chemical_potential": ("化学势", "chemical potential", "稳定区间", "convex hull", "相图"),
     "strong_analyze": ("键长", "键能", "bond", "distance", "距离", "分析", "analyze"),
 }
 
@@ -115,6 +128,109 @@ _GRAPH_TARGETS: List[tuple] = [
 
 _GENERIC_CALC_WORDS = ("算", "计算", "跑", "仿真", "simulation")
 _2D_WORDS = ("单层", "monolayer", "二维", "2d")
+
+
+def _ordered_adsorption_sites(message: str) -> List[str]:
+    """Return every explicitly requested adsorption site in message order."""
+    text = str(message or "")
+    lower = text.lower()
+    hits: List[tuple[int, str]] = []
+    patterns = {
+        "top": (r"(?<![a-z])top(?![a-z])", r"顶位", r"顶点位"),
+        "bridge": (r"(?<![a-z])bridge(?![a-z])", r"桥位", r"桥接位"),
+        "hollow": (r"(?<![a-z])hollow(?![a-z])", r"空心位", r"洞位", r"六元环"),
+    }
+    for site, site_patterns in patterns.items():
+        for pattern in site_patterns:
+            for match in re.finditer(pattern, lower):
+                hits.append((match.start(), site))
+    sites: List[str] = []
+    for _, site in sorted(hits):
+        if site not in sites:
+            sites.append(site)
+    all_three = any(key in lower for key in (
+        "三个位点", "三种位点", "三个吸附位点", "三种吸附位点",
+        "three adsorption sites", "all three sites",
+    ))
+    generic_multi = any(key in lower for key in (
+        "多位点", "不同位点", "multiple sites", "different sites",
+    ))
+    if all_three or (generic_multi and not sites):
+        for site in ("top", "bridge", "hollow"):
+            if site not in sites:
+                sites.append(site)
+    return sites
+
+
+_CHARGE_MARKER = re.compile(
+    r"(?:电荷(?:态)?|charge(?:\s*states?)?|(?<![A-Za-z])q(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+_CHARGE_LIST = re.compile(
+    r"\s*(?:=|:|为|是)?\s*"
+    r"([+−＋－-]?\s*\d+"
+    r"(?:\s*(?:[/,，、;；]|和|与|\band\b|\bor\b)\s*[+−＋－-]?\s*\d+)*)",
+    re.IGNORECASE,
+)
+_CHARGE_TOKEN = re.compile(r"([+−＋－-]?)\s*(\d+)")
+_SIGNED_CHARGE = re.compile(r"(?<![\w.])([+−＋－-])\s*(\d+)(?![\d.])")
+_SIGNED_CHARGE_SEQUENCE = re.compile(
+    r"[+−＋－-]\s*\d+"
+    r"(?:\s*(?:[/,，、;；]|和|与|\band\b|\bor\b)\s*[+−＋－-]\s*\d+)+",
+    re.IGNORECASE,
+)
+_NON_CHARGE_QUANTITY = re.compile(
+    r"(?:\beV\b|\bRy\b|化学势|chemical\s+potential|费米|fermi|势对齐|alignment|介电|dielectric)",
+    re.IGNORECASE,
+)
+
+
+def _explicit_vacancy_charges(message: str) -> List[int]:
+    """Extract explicit charge states without treating unsigned prose numbers as charge."""
+    text = str(message or "")
+    positioned: List[tuple[int, int]] = []
+    for marker in _CHARGE_MARKER.finditer(text):
+        match = _CHARGE_LIST.match(text, marker.end())
+        if not match:
+            continue
+        for token in _CHARGE_TOKEN.finditer(match.group(1)):
+            sign, magnitude = token.groups()
+            value = int(magnitude)
+            if sign in ("-", "−", "－"):
+                value = -value
+            positioned.append((match.start(1) + token.start(), value))
+    # Compact charge-state lists often omit a label: "+1/+2/-1 vacancy".
+    # Do not reinterpret signed chemical potentials, Fermi levels, alignment
+    # values, or dielectric observations as defect charge states.
+    covered: List[tuple[int, int]] = []
+    for sequence in _SIGNED_CHARGE_SEQUENCE.finditer(text):
+        covered.append(sequence.span())
+        for token in _SIGNED_CHARGE.finditer(sequence.group(0)):
+            sign, magnitude = token.groups()
+            value = int(magnitude)
+            if sign in ("-", "−", "－"):
+                value = -value
+            positioned.append((sequence.start() + token.start(), value))
+    for match in _SIGNED_CHARGE.finditer(text):
+        if any(start <= match.start() < end for start, end in covered):
+            continue
+        nearby = text[max(0, match.start() - 40):match.end() + 40]
+        if not re.search(r"空位|vacancy|缺陷", nearby, re.IGNORECASE):
+            continue
+        before = text[max(0, match.start() - 40):match.start()]
+        after = text[match.end():match.end() + 8]
+        if _NON_CHARGE_QUANTITY.search(before) or re.match(r"\s*(?:eV|Ry)\b", after, re.IGNORECASE):
+            continue
+        sign, magnitude = match.groups()
+        value = int(magnitude)
+        if sign in ("-", "−", "－"):
+            value = -value
+        positioned.append((match.start(), value))
+    charges: List[int] = []
+    for _, value in sorted(positioned):
+        if value not in charges:
+            charges.append(value)
+    return charges
 
 
 def detect_intents(message: str, ctx: Optional[Dict[str, Any]] = None) -> IntentSignals:
@@ -145,6 +261,17 @@ def detect_intents(message: str, ctx: Optional[Dict[str, Any]] = None) -> Intent
     for flag, keys in _INTENT_KEYWORDS.items():
         setattr(sig, flag, any(k in lower for k in keys))
 
+    vacancy_match = re.search(
+        r"(?<![A-Za-z])([A-Z][a-z]?)(?:原子)?\s*(?:空位|vacancy)",
+        message or "",
+        re.IGNORECASE,
+    )
+    if vacancy_match:
+        symbol = vacancy_match.group(1)
+        sig.vacancy_el = symbol[:1].upper() + symbol[1:].lower()
+    if sig.wants_vacancy and sig.wants_formation:
+        sig.vacancy_charges = _explicit_vacancy_charges(message)
+
     # flag-specific exceptions the keyword tables cannot express
     if sig.wants_generate and "build a" in lower:
         sig.wants_generate = False
@@ -172,7 +299,7 @@ def detect_intents(message: str, ctx: Optional[Dict[str, Any]] = None) -> Intent
     else:
         if re.search(r"\bbn\b", lower):
             sig.build2d_kind = "bn"
-        elif sig.wants_2d or "吸附" in message or "adsorb" in lower:
+        elif sig.wants_2d or "吸附" in message or "adsorp" in lower:
             for key, kind in _TMD_2D.items():
                 if key in lower:
                     sig.build2d_kind = kind
@@ -189,17 +316,37 @@ def detect_intents(message: str, ctx: Optional[Dict[str, Any]] = None) -> Intent
         if len(sig.dopant_el) == 1:
             sig.dopant_el = sig.dopant_el.upper()
 
-    m = re.search(r"([A-Z][a-z]?[A-Za-z0-9]*)\s*吸附", message) or re.search(r"([a-z0-9]{2,3})\s*(?:on|@)\s*\w+", lower)
+    m = re.search(r"(?<![A-Za-z])([A-Z][a-z]?[A-Za-z0-9]*)\s*吸附", message)
+    if m is None:
+        # Chinese requests also commonly put the adsorbate after the verb:
+        # "石墨烯吸附N的吸附能".  Do not substitute a default element.
+        m = re.search(r"吸附\s*([A-Z][a-z]?[A-Za-z0-9]*)", message)
+    if m is None:
+        m = re.search(r"(?<![A-Za-z])([A-Z][a-z]?)\s*(?:atom\s*)?adsorp", message, re.IGNORECASE)
+    if m is None and sig.wants_eads:
+        m = re.search(r"(?<![A-Za-z])([A-Z][a-z]?)\s*(?:原子\s*)?(?:在|于|on\b|@)", message, re.IGNORECASE)
+    if m is None:
+        m = re.search(r"\b([a-z][a-z0-9]{0,2})\b\s*(?:on|@)\s*\w+", lower)
     if m is None:
         m = re.search(r"\b(o2|n2|h2|cl2|co|oh|no|h2o|co2|nh3)\s*吸附", lower)
+    if m is None and sig.wants_eads:
+        # The species may be specified as a labelled input rather than next
+        # to the verb ("吸附物种为 N", "吸附能（O 原子）").
+        m = re.search(r"吸附物种\s*(?:是|为|:|：|=)?\s*([A-Z][a-z]?)\b", message)
+        if m is None:
+            m = re.search(r"吸附能\s*[（(]\s*([A-Z][a-z]?)\s*原子", message)
     if m:
         sig.ads_el = m.group(1)
-        if "bridge" in lower or "桥" in message:
-            sig.ads_site = "bridge"
-        elif "hollow" in lower or "洞" in message or "六元环" in message:
-            sig.ads_site = "hollow"
-        else:
-            sig.ads_site = "top"
+        # Uppercase CO/NO/OH are molecular adsorbates, not Co/No or an atom.
+        molecular = {"CO", "NO", "OH", "H2O", "CO2", "NH3", "O2", "N2", "H2", "F2", "CL2"}
+        if sig.ads_el.upper() in molecular and sig.ads_el not in _ELEMENTS:
+            sig.ads_el = sig.ads_el.upper()
+        elif len(sig.ads_el) <= 2:
+            sig.ads_el = sig.ads_el[:1].upper() + sig.ads_el[1:].lower()
+        sig.ads_sites = _ordered_adsorption_sites(message)
+        if not sig.ads_sites:
+            sig.ads_sites = ["top"]
+        sig.ads_site = sig.ads_sites[0]
 
     # If analyze is requested, do not auto-trigger submit/build unless explicitly requested
     if sig.wants_analyze:

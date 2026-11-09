@@ -138,6 +138,11 @@ class VerificationInput:
     stderr: str = ""
     xml_path: Optional[Path] = None
     job_success: bool = True
+    # Per-node requested convergence thresholds; None = verifier defaults.
+    # Without these a run that legitimately relaxed to a user-requested
+    # 1e-2 Ry/bohr was failed against the verifier's fixed 1e-3.
+    force_threshold_ry: Optional[float] = None
+    pressure_threshold_kbar: Optional[float] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 

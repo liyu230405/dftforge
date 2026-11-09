@@ -35,6 +35,62 @@ class RulePlanner:
         lower = message.lower()
         steps: List[Dict[str, Any]] = []
 
+        # These are high-level deterministic workflows.  A fallback planner
+        # should select the same registered macro as the LLM planner instead
+        # of degrading to an obsolete "unsupported" help message.
+        if sig.wants_phonon:
+            return [{
+                "tool": "workflow.phonon_dfpt",
+                "args": {"material": sig.formula_hint or sig.material_hint or "MgO", "q_grid": [2, 2, 2]},
+                "description": "运行预弛豫→SCF→ph.x→q2r.x→matdyn.x，并检查 q 网格声子虚频",
+            }]
+        if sig.wants_magnetism:
+            return [{
+                "tool": "workflow.magnetic_compare",
+                "args": {"material": sig.formula_hint or sig.material_hint or "Fe", "orders": ["NM", "FM", "AFM"]},
+                "description": "分别运行 NM/FM/AFM 的自旋极化 pw.x SCF，并比较能量和磁矩",
+            }]
+        if sig.wants_convergence:
+            return [{
+                "tool": "workflow.convergence",
+                "args": {"material": sig.formula_hint or sig.material_hint or "Si"},
+                "description": "扫描 ecutwfc/k 点并按 meV/atom 阈值选择最低成本收敛点",
+            }]
+
+        if sig.wants_vacancy and sig.wants_formation and any(
+            charge != 0 for charge in sig.vacancy_charges
+        ):
+            return [{
+                "tool": "workflow.charged_vacancy",
+                "args": {
+                    "source": sig.formula_hint or sig.material_hint or "MgO",
+                    "element": sig.vacancy_el or "O",
+                    "supercell": "2x2x2",
+                    "charges": sig.vacancy_charges,
+                },
+                "description": (
+                    "构建匹配的带电空位与本征参考超胞，逐一计算明示电荷态；"
+                    "介电常数、势对齐和有限尺寸修正必须由用户提供，不会猜测"
+                ),
+            }]
+
+        if sig.wants_vacancy and sig.wants_formation:
+            return [{
+                "tool": "workflow.neutral_vacancy",
+                "args": {
+                    "source": sig.formula_hint or sig.material_hint or "MgO",
+                    "element": sig.vacancy_el or "O",
+                    "supercell": "2x2x2",
+                },
+                "description": "构建匹配的中性空位/纯相超胞并计算形成能；化学势必须由用户显式提供",
+            }]
+
+        if sig.wants_chemical_potential:
+            return [{
+                "tool": "help", "args": {"topic": "chemical_potential"},
+                "description": "化学势扫描需要显式提供母相形成能（eV/化学式）和可用竞争相形成能，拒绝猜测这些输入。",
+            }]
+
         # ── comparison intent: session ledger first, never a dead end ──
         if sig.wants_compare:
             ledger = ctx.get("ledger") or []
@@ -43,6 +99,38 @@ class RulePlanner:
                 else "band_gap" if any(k in lower for k in ("能带", "带隙", "带结构", "band"))
                 else "auto"
             )
+            # A doped-vs-pristine comparison needs a like-sized pristine
+            # control.  Do not manufacture it with same-element dope.
+            if sig.dopant_el and sig.formula_hint and sig.graph_targets:
+                target = sig.graph_targets[0]
+                label = {"t2_bands": "能带结构", "t2_dos": "态密度", "t1_vc_relax": "结构优化"}.get(target, target)
+                return [
+                    {
+                        "tool": "structure.dope",
+                        "args": {"source": sig.formula_hint, "element": sig.dopant_el, "supercell": "2x2x2"},
+                        "description": f"构建 {sig.dopant_el} 掺杂 {sig.formula_hint} 的 2x2x2 超胞",
+                    },
+                    {
+                        "tool": "graph.run",
+                        "args": {"template_id": target, "inputs": {}},
+                        "description": f"计算掺杂体系的{label}",
+                    },
+                    {
+                        "tool": "structure.supercell",
+                        "args": {"source": sig.formula_hint, "supercell": "2x2x2"},
+                        "description": f"构建同尺寸纯 {sig.formula_hint} 对照超胞",
+                    },
+                    {
+                        "tool": "graph.run",
+                        "args": {"template_id": target, "inputs": {}},
+                        "description": f"计算纯 {sig.formula_hint} 对照的{label}",
+                    },
+                    {
+                        "tool": "analysis.compare",
+                        "args": {"use_last": 2, "metric": metric},
+                        "description": "比较同尺寸掺杂与纯体系结果",
+                    },
+                ]
             if len(ledger) >= 2:
                 return [
                     {"tool": "analysis.compare",
@@ -67,46 +155,45 @@ class RulePlanner:
         # ── composite thermochemistry intents: E_ads / formation energy ──
         # These assemble multi-calculation workflows (agent-level value-add).
         if sig.wants_eads:
-            ads_species = sig.ads_el or "O"
-            molecule_kind = _ADSORBATE_MOLECULE.get(ads_species.upper()) or _ADSORBATE_MOLECULE.get(ads_species.lower())
-            if molecule_kind is None:
-                for mk in ("co2", "h2o", "nh3", "cl2", "o2", "n2", "h2", "co"):
-                    if mk in lower.replace(" ", "").replace("-", ""):
-                        molecule_kind = mk
-                        break
-            is_single_atom = len(ads_species) <= 2 and ads_species.capitalize() in _ELEMENTS
-            if sig.build2d_kind and molecule_kind:
-                if not is_single_atom:
-                    notice = (
-                        f"分子吸附（{ads_species}）的多原子建模暂不支持；当前 E_ads 闭环支持"
-                        "单原子吸附（O/H/N/Cl，气相参考 O₂/H₂/N₂/Cl₂）。可先算原子吸附能。"
-                    )
-                    return [{"tool": "help", "args": {"topic": "eads"}, "description": notice}]
-                sc = "3x3"  # standard surface supercell for adsorption studies
-                steps_eads: List[Dict[str, Any]] = [
-                    {
-                        "tool": "structure.build2d",
-                        "args": {"kind": sig.build2d_kind, "supercell": sc,
-                                 "adsorb": {"element": ads_species, "site": sig.ads_site or "top"}},
-                        "description": f"构建吸附体系: {ads_species}@{sig.build2d_kind} {sc} 超胞({sig.ads_site or 'top'}位)",
-                    },
-                    {"tool": "graph.run", "args": {"template_id": "t0_scf", "inputs": {}},
-                     "description": "吸附体系单点能 E(surf+ads)"},
-                    {
-                        "tool": "structure.build2d",
-                        "args": {"kind": sig.build2d_kind, "supercell": sc},
-                        "description": f"构建纯表面: {sig.build2d_kind} {sc} 超胞",
-                    },
-                    {"tool": "graph.run", "args": {"template_id": "t0_scf", "inputs": {}},
-                     "description": "纯表面单点能 E(surf)"},
-                    {"tool": "structure.molecule", "args": {"kind": molecule_kind},
-                     "description": f"构建气体分子参考 {molecule_kind.upper()}"},
-                    {"tool": "graph.run", "args": {"template_id": "t0_scf", "inputs": {}},
-                     "description": "分子单点能 E(mol)"},
-                    {"tool": "thermo.eads", "args": {},
-                     "description": "计算吸附能 E_ads = E(surf+ads) − E(surf) − E(mol)"},
-                ]
-                return steps_eads
+            ads_species = sig.ads_el
+            if not ads_species:
+                return [{
+                    "tool": "help", "args": {"topic": "eads"},
+                    "description": "请明确原子吸附物种（例如 O、N 或 H）；不能把未指定的吸附物自动当作 O。",
+                }]
+            if ads_species not in _ELEMENTS:
+                return [{
+                    "tool": "help", "args": {"topic": "eads"},
+                    "description": (
+                        f"分子吸附（{ads_species}）的多原子建模暂不支持；"
+                        "当前 E_ads 闭环仅支持有同核气相参考的单原子吸附。"
+                    ),
+                }]
+            molecule_kind = _ADSORBATE_MOLECULE.get(ads_species)
+            if not molecule_kind:
+                return [{
+                    "tool": "help", "args": {"topic": "eads"},
+                    "description": f"尚无 {ads_species} 原子吸附的已定义同核气相参考，不能编造吸附能。",
+                }]
+            if not sig.build2d_kind:
+                return [{
+                    "tool": "help", "args": {"topic": "eads"},
+                    "description": "请明确吸附基底（例如石墨烯或单层 MoS2）以构建匹配的纯表面参考。",
+                }]
+            sc = "3x3"  # standard surface supercell for adsorption studies
+            return [{
+                "tool": "workflow.adsorption_scan",
+                "args": {
+                    "kind": sig.build2d_kind,
+                    "adsorbate_element": ads_species,
+                    "sites": list(sig.ads_sites),
+                    "supercell": sc,
+                },
+                "description": (
+                    f"共享纯表面和 {molecule_kind.upper()} 参考，固定晶胞松弛并比较 "
+                    f"{ads_species}@{sig.build2d_kind} 的 {', '.join(sig.ads_sites)} 吸附能"
+                ),
+            }]
 
         if sig.wants_formation and (sig.formula_hint or sig.material_hint):
             comp = sig.formula_hint or sig.material_hint

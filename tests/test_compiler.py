@@ -13,7 +13,7 @@ class TestQECompiler:
         pseudo_dir.mkdir()
         # Copy actual pseudos
         import shutil
-        src = Path("/Users/liyu/Documents/Codex/dft-forge/assets/pseudos")
+        src = Path(__file__).resolve().parents[1] / "assets" / "pseudos"
         for f in src.iterdir():
             if f.is_file():
                 shutil.copy(f, pseudo_dir / f.name)
@@ -111,7 +111,7 @@ class TestCompileSCF:
         pseudo_dir = tmp_path / "pseudos"
         pseudo_dir.mkdir()
         import shutil
-        src = Path("/Users/liyu/Documents/Codex/dft-forge/assets/pseudos")
+        src = Path(__file__).resolve().parents[1] / "assets" / "pseudos"
         for f in src.iterdir():
             if f.is_file():
                 shutil.copy(f, pseudo_dir / f.name)
@@ -124,7 +124,7 @@ class TestCompileSCF:
         assert out_file.exists()
         assert 'calculation = "scf"' in content
         assert "prefix = \"si\"" in content
-        assert "nbnd = 8" in content  # 2 atoms * 4
+        assert "nbnd = 12" in content  # 8 valence electrons: 4 occupied + 8 empty bands.
 
     def test_compile_nscf_al(self, tmp_path, pseudo_dir):
         compiler = QECompiler(pseudo_dir=pseudo_dir)
@@ -153,7 +153,7 @@ class TestCompileBandsInput:
         pseudo_dir = tmp_path / "pseudos"
         pseudo_dir.mkdir()
         import shutil
-        src = Path("/Users/liyu/Documents/Codex/dft-forge/assets/pseudos")
+        src = Path(__file__).resolve().parents[1] / "assets" / "pseudos"
         for f in src.iterdir():
             if f.is_file():
                 shutil.copy(f, pseudo_dir / f.name)
@@ -199,7 +199,7 @@ class TestCompileDOSInput:
         pseudo_dir = tmp_path / "pseudos"
         pseudo_dir.mkdir()
         import shutil
-        src = Path("/Users/liyu/Documents/Codex/dft-forge/assets/pseudos")
+        src = Path(__file__).resolve().parents[1] / "assets" / "pseudos"
         for f in src.iterdir():
             if f.is_file():
                 shutil.copy(f, pseudo_dir / f.name)
@@ -212,7 +212,7 @@ class TestCompileDOSInput:
         assert out_file.exists()
         assert 'prefix = "si"' in content
         assert "&dos" in content
-        assert "degauss = 0.05" in content
+        assert "degauss = 0.015606" in content  # 0.5 eV FWHM → Ry sigma
         assert "DeltaE = 0.01" in content
 
     def test_compile_dos_input_trailing_newline(self, tmp_path, pseudo_dir):
@@ -234,7 +234,7 @@ class TestCompileDOSInput:
         assert "Emin = -10.0" in content
         assert "Emax = 20.0" in content
         assert "DeltaE = 0.02" in content
-        assert "degauss = 0.1" in content
+        assert "degauss = 0.003121" in content  # 0.1 eV FWHM → Ry sigma
         assert "ngauss = 0" in content
 
     def test_compile_dos_input_mgo(self, tmp_path, pseudo_dir):

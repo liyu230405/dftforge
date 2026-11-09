@@ -6,6 +6,7 @@ enriches result_dict with viewer/chart/metrics payloads for the frontend.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -16,6 +17,7 @@ from dft_forge.agent_loop.helpers import (
     _viewer_payload_from_file,
 )
 from dft_forge.agent_loop.narration import compare_block
+from dft_forge.agent_loop.provenance import result_provenance, provenance_warning
 
 
 class RunState:
@@ -38,6 +40,8 @@ def handle_tool_result(
     reply_parts: List[str],
 ) -> None:
     ctx = state.ctx
+    if not isinstance(result_dict.get("provenance"), dict):
+        result_dict["provenance"] = result_provenance(tool_id, data)
 
     if tool_id == "structure.import" and data.get("ok") and data.get("success"):
         ctx["last_structure_file"] = str(state.session_dir / "structure.json")
@@ -84,13 +88,18 @@ def handle_tool_result(
             "sites": data.get("sites"),
             "natoms": data.get("natoms"),
         }
-    elif tool_id == "structure.dope" and data.get("output"):
+    elif tool_id in ("structure.dope", "structure.supercell", "structure.vacancy") and data.get("output"):
         ctx["last_structure_source"] = data.get("output")
         ctx["last_structure_file"] = data.get("output")
         ctx["last_formula"] = data.get("formula")
         state.built_structure = data.get("output")
+        labels = {
+            "structure.dope": "掺杂",
+            "structure.supercell": "未改变的超胞",
+            "structure.vacancy": "空位",
+        }
         reply_parts.append(
-            f"已构建掺杂结构: {data.get('formula')} — {data.get('description')}\n"
+            f"已构建{labels[tool_id]}结构: {data.get('formula')} — {data.get('description')}\n"
             f"原子数: {data.get('natoms')} | 最小原子间距: {data.get('min_distance')} Å\n"
             f"文件: {data.get('output')}"
         )
@@ -102,6 +111,11 @@ def handle_tool_result(
         }
     elif tool_id in ("structure.molecule", "structure.reference") and data.get("output"):
         state.built_structure = data.get("output")
+        if data.get("molecule_kind"):
+            # remembered per file so the chained SCF runs it as a molecule
+            kinds = dict(ctx.get("structure_molecule_kind") or {})
+            kinds[str(data["output"])] = data["molecule_kind"]
+            ctx["structure_molecule_kind"] = kinds
         ctx["last_structure_source"] = data.get("output")
         ctx["last_structure_file"] = data.get("output")
         ctx["last_formula"] = data.get("formula")
@@ -116,6 +130,17 @@ def handle_tool_result(
         }
     elif tool_id == "graph.run" and data.get("run_id"):
         _handle_graph_run(data, args, description, state, result_dict, reply_parts)
+    elif tool_id in {
+        "workflow.convergence", "workflow.neutral_vacancy",
+        "workflow.charged_vacancy", "workflow.adsorption_scan",
+        "thermo.chemical_potential_scan", "workflow.magnetic_compare",
+        "workflow.phonon_dfpt",
+    }:
+        _handle_scientific_workflow(tool_id, data, reply_parts, result_dict)
+        # Preserve macro result summaries even when the LLM narration drops
+        # nested formation/comparison/stability evidence.
+        if reply_parts:
+            result_dict["facts"] = reply_parts[-1]
     elif tool_id == "graph.status":
         _handle_graph_status(data, args, description, state, result_dict, reply_parts)
     elif tool_id == "input.build" and data.get("input_file"):
@@ -144,25 +169,178 @@ def handle_tool_result(
         _handle_structure_analyze(data, args, ctx, reply_parts)
     elif tool_id == "thermo.eads" and isinstance(data.get("e_ads_ev"), (int, float)):
         ev = data.get("e_ads_ev")
-        strength = "强吸附（放热）" if ev < -1.0 else ("中等吸附" if ev < -0.3 else "弱吸附/近似不吸附")
+        if ev < 0:
+            interpretation = "相对所选参考态放热（负值）"
+        elif ev > 0:
+            interpretation = "相对所选参考态吸热（正值）"
+        else:
+            interpretation = "相对所选参考态能量差为零"
         reply_parts.append(
-            f"吸附能计算完成: E_ads = {ev} eV/原子\n"
-            f"判定: {strength}" + ("（负值=放热，体系稳定）" if ev < 0 else "（正值=吸热，不稳定吸附）")
+            f"吸附能计算完成: E_ads = {ev} eV（本次吸附）\n"
+            f"判定: {interpretation}"
         )
         result_dict["metrics"] = {"e_ads_ev": ev}
     elif tool_id == "thermo.formation" and isinstance(data.get("formation_energy_ev_per_atom"), (int, float)):
         evpa = data.get("formation_energy_ev_per_atom")
-        stability = "相对单质稳定（负形成能）" if evpa < 0 else "相对单质不稳定（正形成能）"
+        if evpa < 0:
+            interpretation = "相对所选元素参考态的形成反应有利（负值）"
+        elif evpa > 0:
+            interpretation = "相对所选元素参考态的形成反应不利（正值）"
+        else:
+            interpretation = "相对所选元素参考态能量差为零"
         reply_parts.append(
             f"形成能计算完成: {data.get('formula')} E_form = {evpa} eV/原子"
-            f"（{data.get('formation_energy_ev_per_formula')} eV/化学式）\n判定: {stability}"
+            f"（{data.get('formation_energy_ev_per_formula')} eV/化学式）\n"
+            f"判定: {interpretation}；不能单凭此值判断凸包或全局热力学稳定性"
         )
+        if args.get("_method_consistent"):
+            reply_parts.append("方法一致性: 化合物与各元素参考态使用相同的赝势、泛函和截断能（执行前已核对）")
+        molecular = args.get("_molecular_refs") or {}
+        if molecular.get("o2"):
+            reply_parts.append("O₂ 参考态按三重态（自旋极化，总磁矩 2 μB）、Γ 点、固定占据计算")
         result_dict["metrics"] = {"formation_energy_ev_per_atom": evpa}
     elif tool_id == "analysis.compare" and data.get("ok"):
         reply_parts.append(compare_block(data))
         result_dict["metrics"] = {"compare": data.get("differences")}
     else:
         reply_parts.append(f"{description}: 完成")
+
+
+def _handle_scientific_workflow(
+    tool_id: str,
+    data: Dict[str, Any],
+    reply_parts: List[str],
+    result_dict: Dict[str, Any],
+) -> None:
+    """Compact narration for high-level workflow outputs."""
+    if data.get("error"):
+        reply_parts.append(f"workflow 失败：{data['error']}")
+        return
+    if tool_id == "workflow.convergence":
+        selection = data.get("selection", {}).get("selected") if data.get("selection") else None
+        if selection:
+            reply_parts.append(
+                f"收敛扫描完成：选择 ecutwfc={selection.get('ecutwfc')} Ry，"
+                f"kpoints={selection.get('kpoints')}，误差 {selection.get('delta_mev_per_atom'):.4g} meV/atom"
+            )
+            result_dict["metrics"] = {"selection": data.get("selection")}
+            if data.get("error_curve"):
+                result_dict["chart"] = {"convergence": data["error_curve"]}
+        else:
+            reply_parts.append(
+                f"收敛扫描结束：{len(data.get('points') or [])} 个参数点，"
+                f"状态={data.get('state', data.get('status', 'partial'))}"
+            )
+    elif tool_id == "workflow.neutral_vacancy":
+        formation = data.get("formation")
+        if formation:
+            reply_parts.append(f"中性空位形成能：{formation.get('formation_energy_ev')} eV")
+            result_dict["metrics"] = formation
+        else:
+            reply_parts.append("中性空位 workflow 已运行，但缺少显式化学势，未猜测形成能")
+    elif tool_id == "workflow.charged_vacancy":
+        lines = data.get("formation_lines") or []
+        status = str(data.get("status") or "partial").lower()
+        reasons = "；".join(str(reason) for reason in (data.get("blocking_reasons") or []) if reason)
+        if lines:
+            summary = []
+            for line in lines:
+                points = line.get("points") or []
+                at_vbm = next((point.get("formation_energy_ev") for point in points
+                               if point.get("fermi_level_from_vbm_ev") == 0), None)
+                if at_vbm is None:
+                    at_vbm = line.get("intercept_ev_at_vbm")
+                charge = line.get("charge")
+                charge_text = f"{charge:+d}" if isinstance(charge, int) and not isinstance(charge, bool) else str(charge)
+                value_text = f"{at_vbm:.6g} eV" if isinstance(at_vbm, (int, float)) and math.isfinite(float(at_vbm)) else "未提供"
+                summary.append(f"q={charge_text}: E_f(VBM)={value_text}")
+            state_label = "完成" if status == "complete" else "部分完成"
+            suffix = f"；阻断原因：{reasons}" if reasons else ""
+            reply_parts.append(
+                f"带电空位 workflow {state_label}：" + "；".join(summary)
+                + f"。修正模式={data.get('correction_mode')}；所有介电/势对齐项来自显式输入{suffix}。"
+            )
+            result_dict["metrics"] = {
+                "formation_lines": lines,
+                "transition_levels": data.get("transition_levels") or [],
+            }
+        else:
+            reply_parts.append(f"带电空位 workflow 未产生可归约形成能。{reasons}")
+    elif tool_id == "workflow.adsorption_scan":
+        rows = data.get("site_results") or []
+        status = str(data.get("status") or "partial").lower()
+        values = [
+            row for row in rows
+            if isinstance(row.get("e_ads_ev"), (int, float))
+            and not isinstance(row.get("e_ads_ev"), bool)
+            and math.isfinite(float(row.get("e_ads_ev")))
+        ]
+        reasons = "；".join(str(reason) for reason in (data.get("blocking_reasons") or []) if reason)
+        if values:
+            detail = "；".join(
+                f"{row.get('site_id')}: {row.get('e_ads_ev'):.6g} eV"
+                for row in values
+            )
+            best = data.get("best_site") or data.get("best_site_among_successful") or {}
+            scope = "完整排序" if status == "complete" else "成功位点中的暂定排序"
+            state_label = "完成" if status == "complete" else "部分完成"
+            # Only O2 has an explicit spin-triplet validation contract here.
+            reference_check = (
+                f"；O₂三重态验证={(data.get('reference_validation') or {}).get('verified')}"
+                if str(data.get("reference_molecule") or "").lower() == "o2" else ""
+            )
+            suffix = f"；阻断原因：{reasons}" if reasons else ""
+            reply_parts.append(
+                f"多位点吸附 workflow {state_label}（{scope}）：{detail}。"
+                f"最低候选={best.get('site_id')}{reference_check}{suffix}；仅限本次请求和成功验证的位点，不是全局构型搜索。"
+            )
+            result_dict["metrics"] = {
+                "site_results": rows, "best_site": best,
+                "reference_validation": data.get("reference_validation"),
+            }
+        else:
+            reply_parts.append(f"多位点吸附 workflow 未产生可验证的吸附能。{reasons}")
+    elif tool_id == "thermo.chemical_potential_scan":
+        reply_parts.append(
+            f"化学势扫描完成：{data.get('formula')}，"
+            f"{data.get('domain_dimension', '?')} 维可行域，状态={data.get('status', 'partial')}"
+        )
+        result_dict["metrics"] = data
+        if data.get("domain_dimension") == 1 and data.get("interval"):
+            result_dict["chart"] = {"chemical_potential": {
+                "kind": "chemical_potential",
+                "dimension": 1,
+                "elements": data.get("elements"),
+                "interval": data.get("interval"),
+                "status": data.get("status"),
+            }}
+        elif data.get("domain_dimension") == 2 and data.get("vertices"):
+            result_dict["chart"] = {"chemical_potential": {
+                "kind": "chemical_potential",
+                "dimension": 2,
+                "elements": data.get("elements"),
+                "vertices": data.get("vertices"),
+                "status": data.get("status"),
+            }}
+    elif tool_id == "workflow.magnetic_compare":
+        comp = data.get("comparison")
+        if comp:
+            status = comp.get("ground_state_status")
+            suffix = f"（磁性证据状态：{status}）" if status else ""
+            reply_parts.append(f"磁性比较完成：最低能量候选为 {comp.get('ground_state')}。{suffix}")
+            result_dict["metrics"] = comp
+        else:
+            reply_parts.append("磁性 workflow 未产生可验证的三态能量；请检查 QE 输出和磁性参数。")
+    elif tool_id == "workflow.phonon_dfpt":
+        stability = data.get("stability")
+        if stability:
+            verdict = "采样 q 点在阈值内未见显著虚频" if stability.get("dynamically_stable_at_threshold") else "采样 q 点存在虚频"
+            reply_parts.append(
+                f"声子 workflow 完成：{verdict}，最小频率 {stability.get('min_frequency_thz')} THz。"
+            )
+            result_dict["metrics"] = stability
+        else:
+            reply_parts.append("声子 workflow 未产生可验证频率；请检查 ph.x/q2r.x/matdyn.x 输出。")
 
 
 def _handle_graph_run(
@@ -175,7 +353,8 @@ def _handle_graph_run(
 ) -> None:
     ctx = state.ctx
     ctx["last_run_id"] = data.get("run_id")
-    ctx["last_execution"] = _execution_context(data, args, description)
+    provenance = result_dict["provenance"]
+    ctx["last_execution"] = _execution_context(data, args, description, provenance)
     _nodes = data.get("nodes") or {}
     lines = [f"图计算完成: {data.get('state')}  (运行ID: {data.get('run_id')})"]
     # ── session computation ledger: every finished graph run ──
@@ -194,16 +373,38 @@ def _handle_graph_run(
             {},
         )
         ledger = ctx.setdefault("ledger", [])
+        graph_inputs = args.get("inputs") or {}
+        ledger_material = graph_inputs.get("material")
+        ledger_formula = ledger_material
+        ledger_composition = None
+        structure_source = graph_inputs.get("structure")
+        if structure_source:
+            try:
+                from ase.io import read as ase_read
+
+                ledger_atoms = ase_read(str(structure_source))
+                ledger_formula = ledger_atoms.get_chemical_formula()
+                ledger_composition = {
+                    symbol: ledger_atoms.get_chemical_symbols().count(symbol)
+                    for symbol in sorted(set(ledger_atoms.get_chemical_symbols()))
+                }
+            except Exception:
+                pass
         ledger.append({
             "label": description or args.get("template_id") or "计算",
             "template": args.get("template_id"),
-            "material": (args.get("inputs") or {}).get("material"),
+            "material": ledger_material,
+            "formula": ledger_formula,
+            "composition": ledger_composition,
+            "structure": structure_source,
             "run_id": data.get("run_id"),
             "band_gap_ev": _bands_out.get("band_gap_ev"),
             "is_metal": _bands_out.get("is_metal"),
             "fermi_ev": _bands_out.get("fermi_ev"),
             "energy_ry": _scf_out.get("energy_ry"),
             "natoms": _scf_out.get("natoms") or _bands_out.get("natoms"),
+            "method_profile": _scf_out.get("method_profile") or _bands_out.get("method_profile"),
+            "provenance": provenance,
         })
         ctx["ledger"] = ledger[-20:]
     for nid, info in (data.get("nodes") or {}).items():
@@ -224,8 +425,12 @@ def _handle_graph_run(
         if info.get("state") == "succeeded" and outs.get("energy_ry") is not None:
             state.scf_energies.append({
                 "energy_ry": outs["energy_ry"],
+                "step_id": result_dict.get("step_id"), "step_index": result_dict.get("step_index"),
+                "node_id": nid, "run_id": data.get("run_id"), "graph_state": data.get("state"),
                 "natoms": outs.get("natoms"),
+                "method_profile": outs.get("method_profile"),
                 "label": f"{description}:{nid}",
+                "provenance": provenance,
             })
         # surface post-relax geometry facts directly in the reply
         an = outs.get("analysis")
@@ -241,7 +446,7 @@ def _handle_graph_run(
                     f"  键长 {pair}: {st['mean_angstrom']} Å (均值, {st['count']} 条)"
                 )
     reply_parts.append("\n".join(lines))
-    facts = _graph_facts(data)
+    facts = _graph_facts(data, provenance)
     if facts:
         result_dict["facts"] = facts
     chart = _extract_charts(data.get("nodes") or {})
@@ -255,7 +460,7 @@ def _handle_graph_run(
         result_dict["viewer"] = viewer
 
 
-def _execution_context(data: Dict[str, Any], args: Dict[str, Any], description: str) -> Dict[str, Any]:
+def _execution_context(data: Dict[str, Any], args: Dict[str, Any], description: str, provenance: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Small, durable summary used by follow-up planning (never raw stdout)."""
     outputs = data.get("outputs") if isinstance(data.get("outputs"), dict) else {}
     return {
@@ -263,6 +468,7 @@ def _execution_context(data: Dict[str, Any], args: Dict[str, Any], description: 
         "template_id": args.get("template_id") or data.get("template_id"),
         "state": data.get("state"),
         "description": description[:160],
+        "provenance": provenance or result_provenance("graph.status", data),
         "outputs": {
             k: v for k, v in outputs.items()
             if isinstance(v, (int, float, str, bool)) or v is None
@@ -270,14 +476,15 @@ def _execution_context(data: Dict[str, Any], args: Dict[str, Any], description: 
     }
 
 
-def _graph_facts(data: Dict[str, Any]) -> str:
+def _graph_facts(data: Dict[str, Any], provenance: Optional[Dict[str, Any]] = None) -> str:
     """Format headline values that must survive LLM narration."""
     out: Dict[str, Any] = {}
+    analysis_cells = []
     top = data.get("outputs") if isinstance(data.get("outputs"), dict) else {}
     for key in (
         "energy_ry", "scf_energy_ry", "a_angstrom", "volume_a3", "pressure_kbar",
         "max_force_ry_bohr", "band_gap_ev", "fermi_ev", "is_metal", "natoms",
-        "n_iterations",
+        "n_iterations", "dos_at_fermi", "pdos_elements",
     ):
         if top.get(key) is not None:
             out[key] = top[key]
@@ -285,33 +492,97 @@ def _graph_facts(data: Dict[str, Any]) -> str:
         node_out = info.get("outputs") or {}
         for key in (
             "energy_ry", "a_angstrom", "volume_a3", "pressure_kbar", "band_gap_ev",
-            "fermi_ev", "is_metal", "natoms", "n_iterations",
+            "fermi_ev", "is_metal", "natoms", "n_iterations", "dos_at_fermi", "element_dos_at_fermi",
         ):
+            if key == "energy_ry" and out.get("scf_energy_ry") is not None:
+                continue
             if node_out.get(key) is not None and key not in out:
                 out[key] = node_out[key]
         analysis = node_out.get("analysis") or {}
+        lattice_abc = _numeric_triplet(analysis.get("lattice_abc_angstrom"))
+        if lattice_abc:
+            for key, value in zip(
+                ("lattice_a_angstrom", "lattice_b_angstrom", "lattice_c_angstrom"),
+                lattice_abc,
+            ):
+                out.setdefault(key, value)
+        lattice_angles = _numeric_triplet(analysis.get("lattice_angles_deg"))
+        if lattice_angles:
+            for key, value in zip(
+                ("lattice_alpha_deg", "lattice_beta_deg", "lattice_gamma_deg"),
+                lattice_angles,
+            ):
+                out.setdefault(key, value)
+        if lattice_abc and lattice_angles:
+            analysis_cells.append((lattice_abc, lattice_angles, node_out.get("a_angstrom")))
         symmetry = analysis.get("symmetry") or {}
         conventional = symmetry.get("conventional_cell") or {}
-        if conventional.get("a_angstrom") is not None:
-            out.setdefault("conventional_a_angstrom", conventional["a_angstrom"])
+        for key in ("a_angstrom", "b_angstrom", "c_angstrom"):
+            if conventional.get(key) is not None:
+                out.setdefault(f"conventional_{key}", conventional[key])
         if symmetry.get("space_group"):
             out.setdefault("space_group", symmetry["space_group"])
     if not out:
         return ""
+    legacy_a_label = "解析晶格参数 a (Å)"
+    legacy_a = out.get("a_angstrom")
+    for lattice_abc, lattice_angles, node_a in analysis_cells:
+        candidate_a = node_a if _is_number(node_a) else legacy_a
+        if _is_near_fcc_equivalent(candidate_a, lattice_abc, lattice_angles):
+            legacy_a_label = "近 FCC 等效立方 a (Å)"
+            break
     labels = {
         "energy_ry": "总能量 (Ry)", "scf_energy_ry": "总能量 (Ry)",
-        "a_angstrom": "平衡晶格参数 a (Å)", "conventional_a_angstrom": "常规胞 a (Å)",
+        "a_angstrom": legacy_a_label,
+        "lattice_a_angstrom": "实际晶胞 a (Å)",
+        "lattice_b_angstrom": "实际晶胞 b (Å)",
+        "lattice_c_angstrom": "实际晶胞 c (Å)",
+        "lattice_alpha_deg": "实际晶胞 α (°)",
+        "lattice_beta_deg": "实际晶胞 β (°)",
+        "lattice_gamma_deg": "实际晶胞 γ (°)",
+        "conventional_a_angstrom": "常规胞 a (Å)",
+        "conventional_b_angstrom": "常规胞 b (Å)",
+        "conventional_c_angstrom": "常规胞 c (Å)",
         "volume_a3": "体积 (Å³)", "pressure_kbar": "压力 (kbar)",
         "max_force_ry_bohr": "最大力 (Ry/Bohr)", "band_gap_ev": "带隙 (eV)",
         "fermi_ev": "费米能级 (eV)", "is_metal": "是否金属", "natoms": "原子数",
         "n_iterations": "迭代次数", "space_group": "空间群",
+        "dos_at_fermi": "费米能处 DOS (states/eV/cell)",
+        "pdos_elements": "投影元素", "element_dos_at_fermi": "元素投影 DOS(EF) (states/eV/cell)",
     }
     parts = []
     for key, value in out.items():
         if isinstance(value, float):
             value = round(value, 6)
         parts.append(f"{labels.get(key, key)}={value}")
-    return "关键计算结果（来自执行输出）：" + "；".join(parts)
+    warning = provenance_warning(provenance)
+    return (warning + " · " if warning else "") + "关键计算结果（来自执行输出）：" + "；".join(parts)
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _numeric_triplet(value: Any) -> Optional[List[float]]:
+    if not isinstance(value, (list, tuple)) or len(value) < 3:
+        return None
+    if not all(_is_number(item) for item in value[:3]):
+        return None
+    return [float(item) for item in value[:3]]
+
+
+def _is_near_fcc_equivalent(
+    legacy_a: Any,
+    lattice_abc: List[float],
+    lattice_angles: List[float],
+) -> bool:
+    if not _is_number(legacy_a):
+        return False
+    if any(abs(angle - 60.0) > 2.0 for angle in lattice_angles):
+        return False
+    expected = lattice_abc[0] * math.sqrt(2.0)
+    tolerance = max(0.02, abs(expected) * 0.01)
+    return abs(float(legacy_a) - expected) <= tolerance
 
 
 def _handle_graph_status(
@@ -326,9 +597,17 @@ def _handle_graph_status(
     if data.get("error"):
         reply_parts.append(f"{description}: {data['error']}")
         return
+    if "runs" in data:
+        runs = data.get("runs") or []
+        reply_parts.append("运行记录：\n" + "\n".join(
+            f"{run.get('run_id')}: {run.get('status', run.get('state', 'unknown'))}"
+            for run in runs
+        ) if runs else "尚无图运行记录。")
+        return
     state.ctx["last_run_id"] = data.get("run_id") or args.get("run_id")
-    state.ctx["last_execution"] = _execution_context(data, args, description)
-    facts = _graph_facts(data)
+    provenance = result_dict["provenance"]
+    state.ctx["last_execution"] = _execution_context(data, args, description, provenance)
+    facts = _graph_facts(data, provenance)
     if facts:
         result_dict["facts"] = facts
     nodes = data.get("nodes") or {}
